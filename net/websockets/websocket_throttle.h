@@ -4,12 +4,19 @@
 
 #ifndef NET_WEBSOCKETS_WEBSOCKET_THROTTLE_H_
 #define NET_WEBSOCKETS_WEBSOCKET_THROTTLE_H_
+#pragma once
+
+#include <deque>
+#include <string>
 
 #include "base/hash_tables.h"
-#include "base/singleton.h"
-#include "net/socket_stream/socket_stream_throttle.h"
+
+template <typename T> struct DefaultSingletonTraits;
 
 namespace net {
+
+class SocketStream;
+class WebSocketJob;
 
 // SocketStreamThrottle for WebSocket protocol.
 // Implements the client-side requirements in the spec.
@@ -19,41 +26,33 @@ namespace net {
 //        remote host (IP address) identified by /host/, even if known by
 //        another name, wait until that connection has been established or
 //        for that connection to have failed.
-class WebSocketThrottle : public SocketStreamThrottle {
+class WebSocketThrottle {
  public:
-  virtual int OnStartOpenConnection(SocketStream* socket,
-                                    CompletionCallback* callback);
-  virtual int OnRead(SocketStream* socket, const char* data, int len,
-                     CompletionCallback* callback);
-  virtual int OnWrite(SocketStream* socket, const char* data, int len,
-                      CompletionCallback* callback);
-  virtual void OnClose(SocketStream* socket);
+  // Returns the singleton instance.
+  static WebSocketThrottle* GetInstance();
 
-  static void Init();
+  // Puts |job| in |queue_| and queues for the destination addresses
+  // of |job|.
+  // If other job is using the same destination address, set |job| waiting.
+  void PutInQueue(WebSocketJob* job);
 
- private:
-  class WebSocketState;
-  typedef std::deque<WebSocketState*> ConnectingQueue;
-  typedef base::hash_map<std::string, ConnectingQueue*> ConnectingAddressMap;
-
-  WebSocketThrottle();
-  virtual ~WebSocketThrottle();
-  friend struct DefaultSingletonTraits<WebSocketThrottle>;
-
-  // Puts |socket| in |queue_| and queues for the destination addresses
-  // of |socket|.  Also sets |state| as UserData of |socket|.
-  // If other socket is using the same destination address, set |state| waiting.
-  void PutInQueue(SocketStream* socket, WebSocketState* state);
-
-  // Removes |socket| from |queue_| and queues for the destination addresses
-  // of |socket|.  Also releases |state| from UserData of |socket|.
-  void RemoveFromQueue(SocketStream* socket, WebSocketState* state);
+  // Removes |job| from |queue_| and queues for the destination addresses
+  // of |job|.
+  void RemoveFromQueue(WebSocketJob* job);
 
   // Checks sockets waiting in |queue_| and check the socket is the front of
   // every queue for the destination addresses of |socket|.
   // If so, the socket can resume estabilshing connection, so wake up
   // the socket.
   void WakeupSocketIfNecessary();
+
+ private:
+  typedef std::deque<WebSocketJob*> ConnectingQueue;
+  typedef base::hash_map<std::string, ConnectingQueue*> ConnectingAddressMap;
+
+  WebSocketThrottle();
+  virtual ~WebSocketThrottle();
+  friend struct DefaultSingletonTraits<WebSocketThrottle>;
 
   // Key: string of host's address.  Value: queue of sockets for the address.
   ConnectingAddressMap addr_map_;

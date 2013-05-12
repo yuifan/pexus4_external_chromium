@@ -4,10 +4,13 @@
 
 #ifndef NET_BASE_DATA_URL_H_
 #define NET_BASE_DATA_URL_H_
+#pragma once
 
 #include <string>
 
 class GURL;
+
+#include "net/base/net_export.h"
 
 namespace net {
 
@@ -25,7 +28,7 @@ namespace net {
 // If <mediatype> is omitted, it defaults to text/plain;charset=US-ASCII.  As a
 // shorthand, "text/plain" can be omitted but the charset parameter supplied.
 //
-class DataURL {
+class NET_EXPORT DataURL {
  public:
   // This method can be used to parse a 'data' URL into its component pieces.
   //
@@ -35,6 +38,9 @@ class DataURL {
   //
   // If the URL is malformed, then this method will return false, and its
   // output variables will remain unchanged.  On success, true is returned.
+  //
+  // OPTIONAL: If |data| is NULL, then the <data> section will not be parsed
+  //           or validated.
   //
   static bool Parse(const GURL& url,
                     std::string* mime_type,

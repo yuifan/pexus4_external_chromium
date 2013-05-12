@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -10,11 +10,9 @@
 #include <algorithm>
 #include <vector>
 
-#include "base/logging.h"
+#include "base/memory/ref_counted.h"
 #include "base/message_loop.h"
-#include "base/platform_thread.h"
-#include "base/ref_counted.h"
-#include "base/thread.h"
+#include "base/threading/thread.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
 namespace {
@@ -47,7 +45,6 @@ class EventInjector {
   bool HandleCheck() {
     if (events_.empty())
       return false;
-    Event event = events_[0];
     return events_[0].time <= base::Time::NowFromSystemTime();
   }
 
@@ -182,12 +179,7 @@ class MessagePumpGLibTest : public testing::Test {
 }  // namespace
 
 // EventInjector is expected to always live longer than the runnable methods.
-// This lets us call NewRunnableMethod on EventInjector instances.
-template<>
-struct RunnableMethodTraits<EventInjector> {
-  void RetainCallee(EventInjector* obj) { }
-  void ReleaseCallee(EventInjector* obj) { }
-};
+DISABLE_RUNNABLE_METHOD_REFCOUNT(EventInjector);
 
 TEST_F(MessagePumpGLibTest, TestQuit) {
   // Checks that Quit works and that the basic infrastructure is working.

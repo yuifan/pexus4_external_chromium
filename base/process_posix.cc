@@ -2,12 +2,32 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "base/process.h"
+
+#include <sys/types.h>
+#include <sys/time.h>
 #include <sys/resource.h>
 
-#include "base/process.h"
 #include "base/process_util.h"
+#include "base/logging.h"
 
 namespace base {
+
+// static
+Process Process::Current() {
+  return Process(GetCurrentProcessHandle());
+}
+
+ProcessId Process::pid() const {
+  if (process_ == 0)
+    return 0;
+
+  return GetProcId(process_);
+}
+
+bool Process::is_current() const {
+  return process_ == GetCurrentProcessHandle();
+}
 
 void Process::Close() {
   process_ = 0;
@@ -38,22 +58,6 @@ bool Process::SetProcessBackgrounded(bool value) {
   return false;
 }
 #endif
-
-ProcessId Process::pid() const {
-  if (process_ == 0)
-    return 0;
-
-  return GetProcId(process_);
-}
-
-bool Process::is_current() const {
-  return process_ == GetCurrentProcessHandle();
-}
-
-// static
-Process Process::Current() {
-  return Process(GetCurrentProcessHandle());
-}
 
 int Process::GetPriority() const {
   DCHECK(process_);

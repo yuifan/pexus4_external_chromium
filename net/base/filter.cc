@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -34,23 +34,107 @@ const char kApplicationXCompress[] = "application/x-compress";
 const char kApplicationCompress[]  = "application/compress";
 const char kTextHtml[]             = "text/html";
 
+// Buffer size allocated when de-compressing data.
+const int kFilterBufSize = 32 * 1024;
+
 }  // namespace
 
+namespace net {
+
+FilterContext::~FilterContext() {
+}
+
+Filter::~Filter() {}
+
+// static
 Filter* Filter::Factory(const std::vector<FilterType>& filter_types,
                         const FilterContext& filter_context) {
-  DCHECK_GT(filter_context.GetInputStreamBufferSize(), 0);
-  if (filter_types.empty() || filter_context.GetInputStreamBufferSize() <= 0)
+  if (filter_types.empty())
     return NULL;
-
 
   Filter* filter_list = NULL;  // Linked list of filters.
   for (size_t i = 0; i < filter_types.size(); i++) {
     filter_list = PrependNewFilter(filter_types[i], filter_context,
-                                   filter_list);
+                                   kFilterBufSize, filter_list);
     if (!filter_list)
       return NULL;
   }
   return filter_list;
+}
+
+// static
+Filter* Filter::GZipFactory() {
+  return InitGZipFilter(FILTER_TYPE_GZIP, kFilterBufSize);
+}
+
+// static
+Filter* Filter::FactoryForTests(const std::vector<FilterType>& filter_types,
+                                const FilterContext& filter_context,
+                                int buffer_size) {
+  if (filter_types.empty())
+    return NULL;
+
+  Filter* filter_list = NULL;  // Linked list of filters.
+  for (size_t i = 0; i < filter_types.size(); i++) {
+    filter_list = PrependNewFilter(filter_types[i], filter_context,
+                                   buffer_size, filter_list);
+    if (!filter_list)
+      return NULL;
+  }
+  return filter_list;
+}
+
+Filter::FilterStatus Filter::ReadData(char* dest_buffer, int* dest_len) {
+  const int dest_buffer_capacity = *dest_len;
+  if (last_status_ == FILTER_ERROR)
+    return last_status_;
+  if (!next_filter_.get())
+    return last_status_ = ReadFilteredData(dest_buffer, dest_len);
+  if (last_status_ == FILTER_NEED_MORE_DATA && !stream_data_len())
+    return next_filter_->ReadData(dest_buffer, dest_len);
+
+  do {
+    if (next_filter_->last_status() == FILTER_NEED_MORE_DATA) {
+      PushDataIntoNextFilter();
+      if (FILTER_ERROR == last_status_)
+        return FILTER_ERROR;
+    }
+    *dest_len = dest_buffer_capacity;  // Reset the input/output parameter.
+    next_filter_->ReadData(dest_buffer, dest_len);
+    if (FILTER_NEED_MORE_DATA == last_status_)
+        return next_filter_->last_status();
+
+    // In the case where this filter has data internally, and is indicating such
+    // with a last_status_ of FILTER_OK, but at the same time the next filter in
+    // the chain indicated it FILTER_NEED_MORE_DATA, we have to be cautious
+    // about confusing the caller.  The API confusion can appear if we return
+    // FILTER_OK (suggesting we have more data in aggregate), but yet we don't
+    // populate our output buffer.  When that is the case, we need to
+    // alternately call our filter element, and the next_filter element until we
+    // get out of this state (by pumping data into the next filter until it
+    // outputs data, or it runs out of data and reports that it NEED_MORE_DATA.)
+  } while (FILTER_OK == last_status_ &&
+           FILTER_NEED_MORE_DATA == next_filter_->last_status() &&
+           0 == *dest_len);
+
+  if (next_filter_->last_status() == FILTER_ERROR)
+    return FILTER_ERROR;
+  return FILTER_OK;
+}
+
+bool Filter::FlushStreamBuffer(int stream_data_len) {
+  DCHECK(stream_data_len <= stream_buffer_size_);
+  if (stream_data_len <= 0 || stream_data_len > stream_buffer_size_)
+    return false;
+
+  DCHECK(stream_buffer());
+  // Bail out if there is more data in the stream buffer to be filtered.
+  if (!stream_buffer() || stream_data_len_)
+    return false;
+
+  next_stream_data_ = stream_buffer()->data();
+  stream_data_len_ = stream_data_len;
+  return true;
 }
 
 // static
@@ -105,18 +189,18 @@ void Filter::FixupEncodingTypes(
       // When viewing a .svgz file, we need to uncompress it, but we don't
       // want to do that when downloading.
       // See Firefox's nonDecodableExtensions in nsExternalHelperAppService.cpp
-      if (FILE_PATH_LITERAL(".gz" == extension) ||
-          FILE_PATH_LITERAL(".tgz" == extension) ||
-          FILE_PATH_LITERAL(".svgz") == extension)
+      if (EndsWith(extension, FILE_PATH_LITERAL(".gz"), false) ||
+          LowerCaseEqualsASCII(extension, ".tgz") ||
+          LowerCaseEqualsASCII(extension, ".svgz"))
         encoding_types->clear();
     } else {
       // When the user does not explicitly ask to download a file, if we get a
       // supported mime type, then we attempt to decompress in order to view it.
       // However, if it's not a supported mime type, then we will attempt to
       // download it, and in that case, don't decompress .gz/.tgz files.
-      if ((FILE_PATH_LITERAL(".gz" == extension) ||
-           FILE_PATH_LITERAL(".tgz") == extension) &&
-          !net::IsSupportedMimeType(mime_type))
+      if ((EndsWith(extension, FILE_PATH_LITERAL(".gz"), false) ||
+           LowerCaseEqualsASCII(extension, ".tgz")) &&
+          !IsSupportedMimeType(mime_type))
         encoding_types->clear();
     }
   }
@@ -187,11 +271,14 @@ void Filter::FixupEncodingTypes(
     // Suspicious case: Advertised dictionary, but server didn't use sdch, and
     // we're HTML tagged.
     if (encoding_types->empty()) {
-      SdchManager::SdchErrorRecovery(SdchManager::ADDED_CONTENT_ENCODING);
+      SdchManager::SdchErrorRecovery(
+          SdchManager::ADDED_CONTENT_ENCODING);
     } else if (1 == encoding_types->size()) {
-      SdchManager::SdchErrorRecovery(SdchManager::FIXED_CONTENT_ENCODING);
+      SdchManager::SdchErrorRecovery(
+          SdchManager::FIXED_CONTENT_ENCODING);
     } else {
-      SdchManager::SdchErrorRecovery(SdchManager::FIXED_CONTENT_ENCODINGS);
+      SdchManager::SdchErrorRecovery(
+          SdchManager::FIXED_CONTENT_ENCODINGS);
     }
   } else {
     // Remarkable case!?!  We advertised an SDCH dictionary, content-encoding
@@ -229,76 +316,14 @@ void Filter::FixupEncodingTypes(
   return;
 }
 
-// static
-Filter* Filter::PrependNewFilter(FilterType type_id,
-                                 const FilterContext& filter_context,
-                                 Filter* filter_list) {
-  Filter* first_filter = NULL;  // Soon to be start of chain.
-  switch (type_id) {
-    case FILTER_TYPE_GZIP_HELPING_SDCH:
-    case FILTER_TYPE_DEFLATE:
-    case FILTER_TYPE_GZIP: {
-      scoped_ptr<GZipFilter> gz_filter(new GZipFilter(filter_context));
-      if (gz_filter->InitBuffer()) {
-        if (gz_filter->InitDecoding(type_id)) {
-          first_filter = gz_filter.release();
-        }
-      }
-      break;
-    }
-    case FILTER_TYPE_SDCH:
-    case FILTER_TYPE_SDCH_POSSIBLE: {
-      scoped_ptr<SdchFilter> sdch_filter(new SdchFilter(filter_context));
-      if (sdch_filter->InitBuffer()) {
-        if (sdch_filter->InitDecoding(type_id)) {
-          first_filter = sdch_filter.release();
-        }
-      }
-      break;
-    }
-    default: {
-      break;
-    }
-  }
-
-  if (!first_filter) {
-    // Cleanup and exit, since we can't construct this filter list.
-    delete filter_list;
-    return NULL;
-  }
-
-  first_filter->next_filter_.reset(filter_list);
-  return first_filter;
-}
-
-Filter::Filter(const FilterContext& filter_context)
+Filter::Filter()
     : stream_buffer_(NULL),
       stream_buffer_size_(0),
       next_stream_data_(NULL),
       stream_data_len_(0),
       next_filter_(NULL),
-      last_status_(FILTER_NEED_MORE_DATA),
-      filter_context_(filter_context) {
+      last_status_(FILTER_NEED_MORE_DATA) {
 }
-
-Filter::~Filter() {}
-
-bool Filter::InitBuffer() {
-  int buffer_size = filter_context_.GetInputStreamBufferSize();
-  DCHECK_GT(buffer_size, 0);
-  if (buffer_size <= 0 || stream_buffer())
-    return false;
-
-  stream_buffer_ = new net::IOBuffer(buffer_size);
-
-  if (stream_buffer()) {
-    stream_buffer_size_ = buffer_size;
-    return true;
-  }
-
-  return false;
-}
-
 
 Filter::FilterStatus Filter::CopyOut(char* dest_buffer, int* dest_len) {
   int out_len;
@@ -321,70 +346,62 @@ Filter::FilterStatus Filter::CopyOut(char* dest_buffer, int* dest_len) {
   }
 }
 
-
-Filter::FilterStatus Filter::ReadFilteredData(char* dest_buffer,
-                                              int* dest_len) {
-  return Filter::FILTER_ERROR;
+// static
+Filter* Filter::InitGZipFilter(FilterType type_id, int buffer_size) {
+  scoped_ptr<GZipFilter> gz_filter(new GZipFilter());
+  gz_filter->InitBuffer(buffer_size);
+  return gz_filter->InitDecoding(type_id) ? gz_filter.release() : NULL;
 }
 
-Filter::FilterStatus Filter::ReadData(char* dest_buffer, int* dest_len) {
-  const int dest_buffer_capacity = *dest_len;
-  if (last_status_ == FILTER_ERROR)
-    return last_status_;
-  if (!next_filter_.get())
-    return last_status_ = ReadFilteredData(dest_buffer, dest_len);
-  if (last_status_ == FILTER_NEED_MORE_DATA && !stream_data_len())
-    return next_filter_->ReadData(dest_buffer, dest_len);
+// static
+Filter* Filter::InitSdchFilter(FilterType type_id,
+                               const FilterContext& filter_context,
+                               int buffer_size) {
+  scoped_ptr<SdchFilter> sdch_filter(new SdchFilter(filter_context));
+  sdch_filter->InitBuffer(buffer_size);
+  return sdch_filter->InitDecoding(type_id) ? sdch_filter.release() : NULL;
+}
 
-  do {
-    if (next_filter_->last_status() == FILTER_NEED_MORE_DATA) {
-      PushDataIntoNextFilter();
-      if (FILTER_ERROR == last_status_)
-        return FILTER_ERROR;
-    }
-    *dest_len = dest_buffer_capacity;  // Reset the input/output parameter.
-    next_filter_->ReadData(dest_buffer, dest_len);
-    if (FILTER_NEED_MORE_DATA == last_status_)
-        return next_filter_->last_status();
+// static
+Filter* Filter::PrependNewFilter(FilterType type_id,
+                                 const FilterContext& filter_context,
+                                 int buffer_size,
+                                 Filter* filter_list) {
+  scoped_ptr<Filter> first_filter;  // Soon to be start of chain.
+  switch (type_id) {
+    case FILTER_TYPE_GZIP_HELPING_SDCH:
+    case FILTER_TYPE_DEFLATE:
+    case FILTER_TYPE_GZIP:
+      first_filter.reset(InitGZipFilter(type_id, buffer_size));
+      break;
+    case FILTER_TYPE_SDCH:
+    case FILTER_TYPE_SDCH_POSSIBLE:
+      first_filter.reset(InitSdchFilter(type_id, filter_context, buffer_size));
+      break;
+    default:
+      break;
+  }
 
-    // In the case where this filter has data internally, and is indicating such
-    // with a last_status_ of FILTER_OK, but at the same time the next filter in
-    // the chain indicated it FILTER_NEED_MORE_DATA, we have to be cautious
-    // about confusing the caller.  The API confusion can appear if we return
-    // FILTER_OK (suggesting we have more data in aggregate), but yet we don't
-    // populate our output buffer.  When that is the case, we need to
-    // alternately call our filter element, and the next_filter element until we
-    // get out of this state (by pumping data into the next filter until it
-    // outputs data, or it runs out of data and reports that it NEED_MORE_DATA.)
-  } while (FILTER_OK == last_status_ &&
-           FILTER_NEED_MORE_DATA == next_filter_->last_status() &&
-           0 == *dest_len);
+  if (!first_filter.get())
+    return NULL;
 
-  if (next_filter_->last_status() == FILTER_ERROR)
-    return FILTER_ERROR;
-  return FILTER_OK;
+  first_filter->next_filter_.reset(filter_list);
+  return first_filter.release();
+}
+
+void Filter::InitBuffer(int buffer_size) {
+  DCHECK(!stream_buffer());
+  DCHECK_GT(buffer_size, 0);
+  stream_buffer_ = new IOBuffer(buffer_size);
+  stream_buffer_size_ = buffer_size;
 }
 
 void Filter::PushDataIntoNextFilter() {
-  net::IOBuffer* next_buffer = next_filter_->stream_buffer();
+  IOBuffer* next_buffer = next_filter_->stream_buffer();
   int next_size = next_filter_->stream_buffer_size();
   last_status_ = ReadFilteredData(next_buffer->data(), &next_size);
   if (FILTER_ERROR != last_status_)
     next_filter_->FlushStreamBuffer(next_size);
 }
 
-
-bool Filter::FlushStreamBuffer(int stream_data_len) {
-  DCHECK(stream_data_len <= stream_buffer_size_);
-  if (stream_data_len <= 0 || stream_data_len > stream_buffer_size_)
-    return false;
-
-  DCHECK(stream_buffer());
-  // Bail out if there is more data in the stream buffer to be filtered.
-  if (!stream_buffer() || stream_data_len_)
-    return false;
-
-  next_stream_data_ = stream_buffer()->data();
-  stream_data_len_ = stream_data_len;
-  return true;
-}
+}  // namespace net

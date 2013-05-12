@@ -4,11 +4,11 @@
 
 #ifndef NET_TOOLS_FLIP_SERVER_SIMPLE_BUFFER_H__
 #define NET_TOOLS_FLIP_SERVER_SIMPLE_BUFFER_H__
+#pragma once
 
 #include <string>
 
 #include "net/tools/flip_server/buffer_interface.h"
-#include "net/tools/flip_server/other_defines.h"
 
 namespace net {
 

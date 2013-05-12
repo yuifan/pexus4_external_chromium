@@ -1,22 +1,23 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_PATH_SERVICE_H_
 #define BASE_PATH_SERVICE_H_
-
-#include "build/build_config.h"
+#pragma once
 
 #include <string>
 
+#include "base/base_api.h"
 #include "base/base_paths.h"
+#include "build/build_config.h"
 
 class FilePath;
 
 // The path service is a global table mapping keys to file system paths.  It is
 // OK to use this service from multiple threads.
 //
-class PathService {
+class BASE_API PathService {
  public:
   // Retrieves a path to a special directory or file and places it into the
   // string pointed to by 'path'. If you ask for a directory it is guaranteed
@@ -26,11 +27,6 @@ class PathService {
   // Returns true if the directory or file was successfully retrieved. On
   // failure, 'path' will not be changed.
   static bool Get(int key, FilePath* path);
-#if defined(OS_WIN)
-  // This version, producing a wstring, is deprecated and only kept around
-  // until we can fix all callers.
-  static bool Get(int key, std::wstring* path);
-#endif
 
   // Overrides the path to a special directory or file.  This cannot be used to
   // change the value of DIR_CURRENT, but that should be obvious.  Also, if the
@@ -43,9 +39,6 @@ class PathService {
   // WARNING: Consumers of PathService::Get may expect paths to be constant
   // over the lifetime of the app, so this method should be used with caution.
   static bool Override(int key, const FilePath& path);
-
-  // Return whether a path was overridden.
-  static bool IsOverridden(int key);
 
   // To extend the set of supported keys, you can register a path provider,
   // which is just a function mirroring PathService::Get.  The ProviderFunc
@@ -64,6 +57,7 @@ class PathService {
                                int key_end);
  private:
   static bool GetFromCache(int key, FilePath* path);
+  static bool GetFromOverrides(int key, FilePath* path);
   static void AddToCache(int key, const FilePath& path);
 };
 

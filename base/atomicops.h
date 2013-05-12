@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -27,9 +27,10 @@
 
 #ifndef BASE_ATOMICOPS_H_
 #define BASE_ATOMICOPS_H_
+#pragma once
 
 #include "base/basictypes.h"
-#include "base/port.h"
+#include "build/build_config.h"
 
 namespace base {
 namespace subtle {
@@ -42,7 +43,13 @@ typedef __w64 int32 Atomic32;
 #ifdef ARCH_CPU_64_BITS
 // We need to be able to go between Atomic64 and AtomicWord implicitly.  This
 // means Atomic64 and AtomicWord should be the same type on 64-bit.
+#if defined(OS_NACL)
+// NaCl's intptr_t is not actually 64-bits on 64-bit!
+// http://code.google.com/p/nativeclient/issues/detail?id=1162
+typedef int64_t Atomic64;
+#else
 typedef intptr_t Atomic64;
+#endif
 #endif
 
 // Use AtomicWord for a machine-sized pointer.  It will use the Atomic32 or
@@ -134,8 +141,16 @@ Atomic64 Release_Load(volatile const Atomic64* ptr);
 #include "base/atomicops_internals_x86_gcc.h"
 #elif defined(COMPILER_GCC) && defined(ARCH_CPU_ARM_FAMILY)
 #include "base/atomicops_internals_arm_gcc.h"
+#elif defined(COMPILER_GCC) && defined(ARCH_CPU_MIPS_FAMILY)
+#include "base/atomicops_internals_mips_gcc.h"
 #else
 #error "Atomic operations are not supported on your platform"
+#endif
+
+// On some platforms we need additional declarations to make
+// AtomicWord compatible with our other Atomic* types.
+#if defined(OS_MACOSX) || defined(OS_OPENBSD)
+#include "base/atomicops_internals_atomicword_compat.h"
 #endif
 
 #endif  // BASE_ATOMICOPS_H_

@@ -1,20 +1,23 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_HTTP_HTTP_TRANSACTION_H_
 #define NET_HTTP_HTTP_TRANSACTION_H_
+#pragma once
 
+#include "base/string16.h"
 #include "net/base/completion_callback.h"
 #include "net/base/load_states.h"
 
 namespace net {
 
-class HttpRequestInfo;
+class BoundNetLog;
+struct HttpRequestInfo;
 class HttpResponseInfo;
 class IOBuffer;
-class LoadLog;
 class X509Certificate;
+class SSLHostInfo;
 
 // Represents a single HTTP transaction (i.e., a single request/response pair).
 // HTTP redirects are not followed and authentication challenges are not
@@ -37,10 +40,10 @@ class HttpTransaction {
   //
   // NOTE: The transaction is not responsible for deleting the callback object.
   //
-  // Profiling information for the request is saved to |load_log| if non-NULL.
+  // Profiling information for the request is saved to |net_log| if non-NULL.
   virtual int Start(const HttpRequestInfo* request_info,
                     CompletionCallback* callback,
-                    LoadLog* load_log) = 0;
+                    const BoundNetLog& net_log) = 0;
 
   // Restarts the HTTP transaction, ignoring the last error.  This call can
   // only be made after a call to Start (or RestartIgnoringLastError) failed.
@@ -59,8 +62,8 @@ class HttpTransaction {
                                      CompletionCallback* callback) = 0;
 
   // Restarts the HTTP transaction with authentication credentials.
-  virtual int RestartWithAuth(const std::wstring& username,
-                              const std::wstring& password,
+  virtual int RestartWithAuth(const string16& username,
+                              const string16& password,
                               CompletionCallback* callback) = 0;
 
   // Returns true if auth is ready to be continued. Callers should check
@@ -89,6 +92,9 @@ class HttpTransaction {
   virtual int Read(IOBuffer* buf, int buf_len,
                    CompletionCallback* callback) = 0;
 
+  // Stops further caching of this request by the HTTP cache, if there is any.
+  virtual void StopCaching() = 0;
+
   // Returns the response info for this transaction or NULL if the response
   // info is not available.
   virtual const HttpResponseInfo* GetResponseInfo() const = 0;
@@ -99,6 +105,11 @@ class HttpTransaction {
   // Returns the upload progress in bytes.  If there is no upload data,
   // zero will be returned.  This does not include the request headers.
   virtual uint64 GetUploadProgress() const = 0;
+
+  // SetSSLHostInfo sets a object which reads and writes public information
+  // about an SSL server. It's used to implement Snap Start.
+  // TODO(agl): remove this.
+  virtual void SetSSLHostInfo(SSLHostInfo*) { };
 };
 
 }  // namespace net

@@ -1,18 +1,20 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_MESSAGE_LOOP_H_
 #define BASE_MESSAGE_LOOP_H_
+#pragma once
 
 #include <queue>
 #include <string>
 
-#include "base/histogram.h"
+#include "base/base_api.h"
+#include "base/basictypes.h"
+#include "base/memory/ref_counted.h"
 #include "base/message_pump.h"
 #include "base/observer_list.h"
-#include "base/ref_counted.h"
-#include "base/scoped_ptr.h"
+#include "base/synchronization/lock.h"
 #include "base/task.h"
 
 #if defined(OS_WIN)
@@ -23,8 +25,16 @@
 #include "base/message_pump_libevent.h"
 #if !defined(OS_MACOSX)
 #include "base/message_pump_glib.h"
+typedef struct _XDisplay Display;
 #endif
 #endif
+#if defined(TOUCH_UI)
+#include "base/message_pump_glib_x_dispatch.h"
+#endif
+
+namespace base {
+class Histogram;
+}
 
 // A MessageLoop is used to process events for a particular thread.  There is
 // at most one MessageLoop instance per thread.
@@ -56,8 +66,48 @@
 // Please be SURE your task is reentrant (nestable) and all global variables
 // are stable and accessible before calling SetNestableTasksAllowed(true).
 //
-class MessageLoop : public base::MessagePump::Delegate {
+class BASE_API MessageLoop : public base::MessagePump::Delegate {
  public:
+#if defined(OS_WIN)
+  typedef base::MessagePumpWin::Dispatcher Dispatcher;
+  typedef base::MessagePumpForUI::Observer Observer;
+#elif !defined(OS_MACOSX)
+#if defined(TOUCH_UI)
+  typedef base::MessagePumpGlibXDispatcher Dispatcher;
+#else
+  typedef base::MessagePumpForUI::Dispatcher Dispatcher;
+#endif
+  typedef base::MessagePumpForUI::Observer Observer;
+#endif
+
+  // A MessageLoop has a particular type, which indicates the set of
+  // asynchronous events it may process in addition to tasks and timers.
+  //
+  // TYPE_DEFAULT
+  //   This type of ML only supports tasks and timers.
+  //
+  // TYPE_UI
+  //   This type of ML also supports native UI events (e.g., Windows messages).
+  //   See also MessageLoopForUI.
+  //
+  // TYPE_IO
+  //   This type of ML also supports asynchronous IO.  See also
+  //   MessageLoopForIO.
+  //
+  enum Type {
+    TYPE_DEFAULT,
+    TYPE_UI,
+    TYPE_IO
+  };
+
+  // Normally, it is not necessary to instantiate a MessageLoop.  Instead, it
+  // is typical to make use of the current thread's MessageLoop instance.
+  explicit MessageLoop(Type type = TYPE_DEFAULT);
+  ~MessageLoop();
+
+  // Returns the MessageLoop object for the current thread, or null if none.
+  static MessageLoop* current();
+
   static void EnableHistogrammer(bool enable_histogrammer);
 
   // A DestructionObserver is notified when the current MessageLoop is being
@@ -68,10 +118,12 @@ class MessageLoop : public base::MessagePump::Delegate {
   // NOTE: Any tasks posted to the MessageLoop during this notification will
   // not be run.  Instead, they will be deleted.
   //
-  class DestructionObserver {
+  class BASE_API DestructionObserver {
    public:
-    virtual ~DestructionObserver() {}
     virtual void WillDestroyCurrentMessageLoop() = 0;
+
+   protected:
+    virtual ~DestructionObserver();
   };
 
   // Add a DestructionObserver, which will start receiving notifications
@@ -121,7 +173,7 @@ class MessageLoop : public base::MessagePump::Delegate {
   // as the thread that calls PostDelayedTask(FROM_HERE, ), then T MUST inherit
   // from RefCountedThreadSafe<T>!
   template <class T>
-  void DeleteSoon(const tracked_objects::Location& from_here, T* object) {
+  void DeleteSoon(const tracked_objects::Location& from_here, const T* object) {
     PostNonNestableTask(from_here, new DeleteTask<T>(object));
   }
 
@@ -136,7 +188,8 @@ class MessageLoop : public base::MessagePump::Delegate {
   // PostDelayedTask(FROM_HERE, ), then T MUST inherit from
   // RefCountedThreadSafe<T>!
   template <class T>
-  void ReleaseSoon(const tracked_objects::Location& from_here, T* object) {
+  void ReleaseSoon(const tracked_objects::Location& from_here,
+                   const T* object) {
     PostNonNestableTask(from_here, new ReleaseTask<T>(object));
   }
 
@@ -158,6 +211,10 @@ class MessageLoop : public base::MessagePump::Delegate {
   //
   void Quit();
 
+  // This method is a variant of Quit, that does not wait for pending messages
+  // to be processed before returning from Run.
+  void QuitNow();
+
   // Invokes Quit on the current MessageLoop when run.  Useful to schedule an
   // arbitrary MessageLoop to Quit.
   class QuitTask : public Task {
@@ -166,31 +223,6 @@ class MessageLoop : public base::MessagePump::Delegate {
       MessageLoop::current()->Quit();
     }
   };
-
-  // A MessageLoop has a particular type, which indicates the set of
-  // asynchronous events it may process in addition to tasks and timers.
-  //
-  // TYPE_DEFAULT
-  //   This type of ML only supports tasks and timers.
-  //
-  // TYPE_UI
-  //   This type of ML also supports native UI events (e.g., Windows messages).
-  //   See also MessageLoopForUI.
-  //
-  // TYPE_IO
-  //   This type of ML also supports asynchronous IO.  See also
-  //   MessageLoopForIO.
-  //
-  enum Type {
-    TYPE_DEFAULT,
-    TYPE_UI,
-    TYPE_IO
-  };
-
-  // Normally, it is not necessary to instantiate a MessageLoop.  Instead, it
-  // is typical to make use of the current thread's MessageLoop instance.
-  explicit MessageLoop(Type type = TYPE_DEFAULT);
-  ~MessageLoop();
 
   // Returns the type passed to the constructor.
   Type type() const { return type_; }
@@ -201,9 +233,6 @@ class MessageLoop : public base::MessagePump::Delegate {
     thread_name_ = thread_name;
   }
   const std::string& thread_name() const { return thread_name_; }
-
-  // Returns the MessageLoop object for the current thread, or null if none.
-  static MessageLoop* current();
 
   // Enables or disables the recursive task processing. This happens in the case
   // of recursive message loops. Some unwanted message loop may occurs when
@@ -251,13 +280,55 @@ class MessageLoop : public base::MessagePump::Delegate {
   // Returns true if we are currently running a nested message loop.
   bool IsNested();
 
+  // A TaskObserver is an object that receives task notifications from the
+  // MessageLoop.
+  //
+  // NOTE: A TaskObserver implementation should be extremely fast!
+  class BASE_API TaskObserver {
+   public:
+    TaskObserver();
+
+    // This method is called before processing a task.
+    virtual void WillProcessTask(const Task* task) = 0;
+
+    // This method is called after processing a task.
+    virtual void DidProcessTask(const Task* task) = 0;
+
+   protected:
+    virtual ~TaskObserver();
+  };
+
+  // These functions can only be called on the same thread that |this| is
+  // running on.
+  void AddTaskObserver(TaskObserver* task_observer);
+  void RemoveTaskObserver(TaskObserver* task_observer);
+
+  // Returns true if the message loop has high resolution timers enabled.
+  // Provided for testing.
+  bool high_resolution_timers_enabled() {
 #if defined(OS_WIN)
-  typedef base::MessagePumpWin::Dispatcher Dispatcher;
-  typedef base::MessagePumpWin::Observer Observer;
-#elif !defined(OS_MACOSX)
-  typedef base::MessagePumpForUI::Dispatcher Dispatcher;
-  typedef base::MessagePumpForUI::Observer Observer;
+    return !high_resolution_timer_expiration_.is_null();
+#else
+    return true;
 #endif
+  }
+
+  // When we go into high resolution timer mode, we will stay in hi-res mode
+  // for at least 1s.
+  static const int kHighResolutionTimerModeLeaseTimeMs = 1000;
+
+  // Asserts that the MessageLoop is "idle".
+  void AssertIdle() const;
+
+#if defined(OS_WIN)
+  void set_os_modal_loop(bool os_modal_loop) {
+    os_modal_loop_ = os_modal_loop;
+  }
+
+  bool os_modal_loop() const {
+    return os_modal_loop_;
+  }
+#endif  // OS_WIN
 
   //----------------------------------------------------------------------------
  protected:
@@ -285,17 +356,17 @@ class MessageLoop : public base::MessagePump::Delegate {
 
   // This structure is copied around by value.
   struct PendingTask {
-    Task* task;                   // The task to run.
-    base::Time delayed_run_time;  // The time when the task should be run.
-    int sequence_num;             // Used to facilitate sorting by run time.
-    bool nestable;                // True if OK to dispatch from a nested loop.
-
     PendingTask(Task* task, bool nestable)
         : task(task), sequence_num(0), nestable(nestable) {
     }
 
     // Used to support sorting.
     bool operator<(const PendingTask& other) const;
+
+    Task* task;                        // The task to run.
+    base::TimeTicks delayed_run_time;  // The time when the task should be run.
+    int sequence_num;                  // Secondary sort key for run time.
+    bool nestable;                     // OK to dispatch from a nested loop.
   };
 
   class TaskQueue : public std::queue<PendingTask> {
@@ -335,18 +406,6 @@ class MessageLoop : public base::MessagePump::Delegate {
   // Called to process any delayed non-nestable tasks.
   bool ProcessNextDelayedNonNestableTask();
 
-  //----------------------------------------------------------------------------
-  // Run a work_queue_ task or new_task, and delete it (if it was processed by
-  // PostTask). If there are queued tasks, the oldest one is executed and
-  // new_task is queued. new_task is optional and can be NULL. In this NULL
-  // case, the method will run one pending task (if any exist). Returns true if
-  // it executes a task.  Queued tasks accumulate only when there is a
-  // non-nestable task currently processing, in which case the new_task is
-  // appended to the list work_queue_.  Such re-entrancy generally happens when
-  // an unrequested message pump (typical of a native dialog) is executing in
-  // the context of a task.
-  bool QueueOrRunTask(Task* new_task);
-
   // Runs the specified task and deletes it.
   void RunTask(Task* task);
 
@@ -371,11 +430,6 @@ class MessageLoop : public base::MessagePump::Delegate {
   void PostTask_Helper(const tracked_objects::Location& from_here, Task* task,
                        int64 delay_ms, bool nestable);
 
-  // base::MessagePump::Delegate methods:
-  virtual bool DoWork();
-  virtual bool DoDelayedWork(base::Time* next_delayed_work_time);
-  virtual bool DoIdleWork();
-
   // Start recording histogram info about events and action IF it was enabled
   // and IF the statistics recorder can accept a registration of our histogram.
   void StartHistogrammer();
@@ -385,8 +439,10 @@ class MessageLoop : public base::MessagePump::Delegate {
   // If message_histogram_ is NULL, this is a no-op.
   void HistogramEvent(int event);
 
-  static const LinearHistogram::DescriptionPair event_descriptions_[];
-  static bool enable_histogrammer_;
+  // base::MessagePump::Delegate methods:
+  virtual bool DoWork();
+  virtual bool DoDelayedWork(base::TimeTicks* next_delayed_work_time);
+  virtual bool DoIdleWork();
 
   Type type_;
 
@@ -396,6 +452,9 @@ class MessageLoop : public base::MessagePump::Delegate {
 
   // Contains delayed tasks, sorted by their 'delayed_run_time' property.
   DelayedTaskQueue delayed_work_queue_;
+
+  // A recent snapshot of Time::Now(), used to check delayed_work_queue_.
+  base::TimeTicks recent_time_;
 
   // A queue of non-nestable tasks that we had to defer because when it came
   // time to execute them we were in a nested message loop.  They will execute
@@ -414,21 +473,31 @@ class MessageLoop : public base::MessagePump::Delegate {
 
   std::string thread_name_;
   // A profiling histogram showing the counts of various messages and events.
-  scoped_refptr<Histogram> message_histogram_;
+  base::Histogram* message_histogram_;
 
   // A null terminated list which creates an incoming_queue of tasks that are
-  // aquired under a mutex for processing on this instance's thread. These tasks
-  // have not yet been sorted out into items for our work_queue_ vs items that
-  // will be handled by the TimerManager.
+  // acquired under a mutex for processing on this instance's thread. These
+  // tasks have not yet been sorted out into items for our work_queue_ vs
+  // items that will be handled by the TimerManager.
   TaskQueue incoming_queue_;
   // Protect access to incoming_queue_.
-  Lock incoming_queue_lock_;
+  mutable base::Lock incoming_queue_lock_;
 
   RunState* state_;
+
+#if defined(OS_WIN)
+  base::TimeTicks high_resolution_timer_expiration_;
+  // Should be set to true before calling Windows APIs like TrackPopupMenu, etc
+  // which enter a modal message loop.
+  bool os_modal_loop_;
+#endif
 
   // The next sequence number to use for delayed tasks.
   int next_sequence_num_;
 
+  ObserverList<TaskObserver> task_observers_;
+
+ private:
   DISALLOW_COPY_AND_ASSIGN(MessageLoop);
 };
 
@@ -439,7 +508,7 @@ class MessageLoop : public base::MessagePump::Delegate {
 // This class is typically used like so:
 //   MessageLoopForUI::current()->...call some method...
 //
-class MessageLoopForUI : public MessageLoop {
+class BASE_API MessageLoopForUI : public MessageLoop {
  public:
   MessageLoopForUI() : MessageLoop(TYPE_UI) {
   }
@@ -447,15 +516,30 @@ class MessageLoopForUI : public MessageLoop {
   // Returns the MessageLoopForUI of the current thread.
   static MessageLoopForUI* current() {
     MessageLoop* loop = MessageLoop::current();
+#ifdef ANDROID
+    DCHECK_EQ(static_cast<int>(MessageLoop::TYPE_UI),
+              static_cast<int>(loop->type()));
+#else
     DCHECK_EQ(MessageLoop::TYPE_UI, loop->type());
+#endif
     return static_cast<MessageLoopForUI*>(loop);
   }
 
 #if defined(OS_WIN)
-  void WillProcessMessage(const MSG& message);
   void DidProcessMessage(const MSG& message);
-  void PumpOutPendingPaintMessages();
-#endif
+#endif  // defined(OS_WIN)
+
+#if defined(USE_X11)
+  // Returns the Xlib Display that backs the MessagePump for this MessageLoop.
+  //
+  // This allows for raw access to the X11 server in situations where our
+  // abstractions do not provide enough power.
+  //
+  // Be careful how this is used. The MessagePump in general expects
+  // exclusive access to the Display. Calling things like XNextEvent() will
+  // likely break things in subtle, hard to detect, ways.
+  Display* GetDisplay();
+#endif  // defined(OS_X11)
 
 #if !defined(OS_MACOSX)
   // Please see message_pump_win/message_pump_glib for definitions of these
@@ -469,7 +553,7 @@ class MessageLoopForUI : public MessageLoop {
   base::MessagePumpForUI* pump_ui() {
     return static_cast<base::MessagePumpForUI*>(pump_.get());
   }
-#endif  // defined(OS_MACOSX)
+#endif  // !defined(OS_MACOSX)
 };
 
 // Do not add any member variables to MessageLoopForUI!  This is important b/c
@@ -485,22 +569,50 @@ COMPILE_ASSERT(sizeof(MessageLoop) == sizeof(MessageLoopForUI),
 // This class is typically used like so:
 //   MessageLoopForIO::current()->...call some method...
 //
-class MessageLoopForIO : public MessageLoop {
+class BASE_API MessageLoopForIO : public MessageLoop {
  public:
+#if defined(OS_WIN)
+  typedef base::MessagePumpForIO::IOHandler IOHandler;
+  typedef base::MessagePumpForIO::IOContext IOContext;
+  typedef base::MessagePumpForIO::IOObserver IOObserver;
+#elif defined(OS_POSIX)
+  typedef base::MessagePumpLibevent::Watcher Watcher;
+  typedef base::MessagePumpLibevent::FileDescriptorWatcher
+      FileDescriptorWatcher;
+  typedef base::MessagePumpLibevent::IOObserver IOObserver;
+
+  enum Mode {
+    WATCH_READ = base::MessagePumpLibevent::WATCH_READ,
+    WATCH_WRITE = base::MessagePumpLibevent::WATCH_WRITE,
+    WATCH_READ_WRITE = base::MessagePumpLibevent::WATCH_READ_WRITE
+  };
+
+#endif
+
   MessageLoopForIO() : MessageLoop(TYPE_IO) {
   }
 
   // Returns the MessageLoopForIO of the current thread.
   static MessageLoopForIO* current() {
     MessageLoop* loop = MessageLoop::current();
+#ifdef ANDROID
+    DCHECK_EQ(static_cast<int>(MessageLoop::TYPE_IO),
+              static_cast<int>(loop->type()));
+#else
     DCHECK_EQ(MessageLoop::TYPE_IO, loop->type());
+#endif
     return static_cast<MessageLoopForIO*>(loop);
   }
 
-#if defined(OS_WIN)
-  typedef base::MessagePumpForIO::IOHandler IOHandler;
-  typedef base::MessagePumpForIO::IOContext IOContext;
+  void AddIOObserver(IOObserver* io_observer) {
+    pump_io()->AddIOObserver(io_observer);
+  }
 
+  void RemoveIOObserver(IOObserver* io_observer) {
+    pump_io()->RemoveIOObserver(io_observer);
+  }
+
+#if defined(OS_WIN)
   // Please see MessagePumpWin for definitions of these methods.
   void RegisterIOHandler(HANDLE file_handle, IOHandler* handler);
   bool WaitForIOCompletion(DWORD timeout, IOHandler* filter);
@@ -512,22 +624,17 @@ class MessageLoopForIO : public MessageLoop {
   }
 
 #elif defined(OS_POSIX)
-  typedef base::MessagePumpLibevent::Watcher Watcher;
-  typedef base::MessagePumpLibevent::FileDescriptorWatcher
-      FileDescriptorWatcher;
-
-  enum Mode {
-    WATCH_READ = base::MessagePumpLibevent::WATCH_READ,
-    WATCH_WRITE = base::MessagePumpLibevent::WATCH_WRITE,
-    WATCH_READ_WRITE = base::MessagePumpLibevent::WATCH_READ_WRITE
-  };
-
   // Please see MessagePumpLibevent for definition.
   bool WatchFileDescriptor(int fd,
                            bool persistent,
                            Mode mode,
                            FileDescriptorWatcher *controller,
                            Watcher *delegate);
+
+ private:
+  base::MessagePumpLibevent* pump_io() {
+    return static_cast<base::MessagePumpLibevent*>(pump_.get());
+  }
 #endif  // defined(OS_POSIX)
 };
 

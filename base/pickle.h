@@ -1,16 +1,18 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_PICKLE_H__
 #define BASE_PICKLE_H__
+#pragma once
 
 #include <string>
 
+#include "base/base_api.h"
 #include "base/basictypes.h"
+#include "base/gtest_prod_util.h"
 #include "base/logging.h"
 #include "base/string16.h"
-#include "testing/gtest/include/gtest/gtest_prod.h"
 
 // This class provides facilities for basic binary value packing and unpacking.
 //
@@ -29,10 +31,8 @@
 // space is controlled by the header_size parameter passed to the Pickle
 // constructor.
 //
-class Pickle {
+class BASE_API Pickle {
  public:
-  virtual ~Pickle();
-
   // Initialize a Pickle object using the default header size.
   Pickle();
 
@@ -50,12 +50,13 @@ class Pickle {
   // Initializes a Pickle as a deep copy of another Pickle.
   Pickle(const Pickle& other);
 
+  virtual ~Pickle();
+
   // Performs a deep copy.
   Pickle& operator=(const Pickle& other);
 
   // Returns the size of the Pickle's data.
-  int size() const { return static_cast<int>(header_size_ +
-                                             header_->payload_size); }
+  size_t size() const { return header_size_ + header_->payload_size; }
 
   // Returns the data for this Pickle.
   const void* data() const { return header_; }
@@ -68,10 +69,10 @@ class Pickle {
   bool ReadInt(void** iter, int* result) const;
   bool ReadLong(void** iter, long* result) const;
   bool ReadSize(void** iter, size_t* result) const;
+  bool ReadUInt16(void** iter, uint16* result) const;
   bool ReadUInt32(void** iter, uint32* result) const;
   bool ReadInt64(void** iter, int64* result) const;
   bool ReadUInt64(void** iter, uint64* result) const;
-  bool ReadIntPtr(void** iter, intptr_t* result) const;
   bool ReadString(void** iter, std::string* result) const;
   bool ReadWString(void** iter, std::wstring* result) const;
   bool ReadString16(void** iter, string16* result) const;
@@ -98,6 +99,9 @@ class Pickle {
   bool WriteSize(size_t value) {
     return WriteBytes(&value, sizeof(value));
   }
+  bool WriteUInt16(uint16 value) {
+    return WriteBytes(&value, sizeof(value));
+  }
   bool WriteUInt32(uint32 value) {
     return WriteBytes(&value, sizeof(value));
   }
@@ -105,9 +109,6 @@ class Pickle {
     return WriteBytes(&value, sizeof(value));
   }
   bool WriteUInt64(uint64 value) {
-    return WriteBytes(&value, sizeof(value));
-  }
-  bool WriteIntPtr(intptr_t value) {
     return WriteBytes(&value, sizeof(value));
   }
   bool WriteString(const std::string& value);
@@ -147,12 +148,12 @@ class Pickle {
   // to the Pickle constructor.
   template <class T>
   T* headerT() {
-    DCHECK(sizeof(T) == header_size_);
+    DCHECK_EQ(header_size_, sizeof(T));
     return static_cast<T*>(header_);
   }
   template <class T>
   const T* headerT() const {
-    DCHECK(sizeof(T) == header_size_);
+    DCHECK_EQ(header_size_, sizeof(T));
     return static_cast<const T*>(header_);
   }
 
@@ -180,10 +181,12 @@ class Pickle {
   // Returns the address of the byte immediately following the currently valid
   // header + payload.
   char* end_of_payload() {
+    // We must have a valid header_.
     return payload() + payload_size();
   }
   const char* end_of_payload() const {
-    return payload() + payload_size();
+    // This object may be invalid.
+    return header_ ? payload() + payload_size() : NULL;
   }
 
   size_t capacity() const {
@@ -235,9 +238,10 @@ class Pickle {
   size_t capacity_;
   size_t variable_buffer_offset_;  // IF non-zero, then offset to a buffer.
 
-  FRIEND_TEST(PickleTest, Resize);
-  FRIEND_TEST(PickleTest, FindNext);
-  FRIEND_TEST(PickleTest, IteratorHasRoom);
+  FRIEND_TEST_ALL_PREFIXES(PickleTest, Resize);
+  FRIEND_TEST_ALL_PREFIXES(PickleTest, FindNext);
+  FRIEND_TEST_ALL_PREFIXES(PickleTest, FindNextWithIncompleteHeader);
+  FRIEND_TEST_ALL_PREFIXES(PickleTest, IteratorHasRoom);
 };
 
 #endif  // BASE_PICKLE_H__

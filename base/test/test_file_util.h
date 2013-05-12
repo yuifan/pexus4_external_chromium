@@ -1,9 +1,10 @@
-// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_TEST_TEST_FILE_UTIL_H_
 #define BASE_TEST_TEST_FILE_UTIL_H_
+#pragma once
 
 // File utility functions used only by tests.
 
@@ -30,6 +31,23 @@ bool EvictFileFromSystemCache(const FilePath& file);
 // state of the destination is unknown.
 bool CopyRecursiveDirNoCache(const FilePath& source_dir,
                              const FilePath& dest_dir);
+
+#if defined(OS_WIN)
+// Returns true if the volume supports Alternate Data Streams.
+bool VolumeSupportsADS(const FilePath& path);
+
+// Returns true if the ZoneIdentifier is correctly set to "Internet" (3).
+// Note that this function must be called from the same process as
+// the one that set the zone identifier.  I.e. don't use it in UI/automation
+// based tests.
+bool HasInternetZoneIdentifier(const FilePath& full_path);
+#endif  // defined(OS_WIN)
+
+// In general it's not reliable to convert a FilePath to a wstring and we use
+// string16 elsewhere for Unicode strings, but in tests it is frequently
+// convenient to be able to compare paths to literals like L"foobar".
+std::wstring FilePathAsWString(const FilePath& path);
+FilePath WStringAsFilePath(const std::wstring& path);
 
 }  // namespace file_util
 

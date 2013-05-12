@@ -1,20 +1,21 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "base/message_loop.h"
 #include "base/observer_list.h"
 #include "base/observer_list_threadsafe.h"
-#include "base/platform_thread.h"
-#include "base/ref_counted.h"
+
+#include <vector>
+
+#include "base/memory/ref_counted.h"
+#include "base/message_loop.h"
+#include "base/threading/platform_thread.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
+using base::PlatformThread;
 using base::Time;
 
 namespace {
-
-class ObserverListTest : public testing::Test {
-};
 
 class Foo {
  public:
@@ -107,8 +108,8 @@ class AddRemoveThread : public PlatformThread::Delegate,
 
   void ThreadMain() {
     loop_ = new MessageLoop();  // Fire up a message loop.
-    loop_->PostTask(FROM_HERE,
-      factory_->NewRunnableMethod(&AddRemoveThread::AddTask));
+    loop_->PostTask(
+        FROM_HERE, factory_->NewRunnableMethod(&AddRemoveThread::AddTask));
     loop_->Run();
     //LOG(ERROR) << "Loop 0x" << std::hex << loop_ << " done. " <<
     //    count_observes_ << ", " << count_addtask_;
@@ -123,7 +124,7 @@ class AddRemoveThread : public PlatformThread::Delegate,
     count_addtask_++;
 
     if ((Time::Now() - start_).InMilliseconds() > kThreadRunTime) {
-      LOG(INFO) << "DONE!";
+      VLOG(1) << "DONE!";
       return;
     }
 
@@ -171,8 +172,6 @@ class AddRemoveThread : public PlatformThread::Delegate,
 
   ScopedRunnableMethodFactory<AddRemoveThread>* factory_;
 };
-
-}  // namespace
 
 TEST(ObserverListTest, BasicTest) {
   ObserverList<Foo> observer_list;
@@ -226,6 +225,46 @@ TEST(ObserverListThreadSafeTest, BasicTest) {
   EXPECT_EQ(d.total, -10);
 }
 
+class FooRemover : public Foo {
+ public:
+  explicit FooRemover(ObserverListThreadSafe<Foo>* list) : list_(list) {}
+  virtual ~FooRemover() {}
+
+  void AddFooToRemove(Foo* foo) {
+    foos_.push_back(foo);
+  }
+
+  virtual void Observe(int x) {
+    std::vector<Foo*> tmp;
+    tmp.swap(foos_);
+    for (std::vector<Foo*>::iterator it = tmp.begin();
+         it != tmp.end(); ++it) {
+      list_->RemoveObserver(*it);
+    }
+  }
+
+ private:
+  const scoped_refptr<ObserverListThreadSafe<Foo> > list_;
+  std::vector<Foo*> foos_;
+};
+
+TEST(ObserverListThreadSafeTest, RemoveMultipleObservers) {
+  MessageLoop loop;
+  scoped_refptr<ObserverListThreadSafe<Foo> > observer_list(
+      new ObserverListThreadSafe<Foo>);
+
+  FooRemover a(observer_list);
+  Adder b(1);
+
+  observer_list->AddObserver(&a);
+  observer_list->AddObserver(&b);
+
+  a.AddFooToRemove(&a);
+  a.AddFooToRemove(&b);
+
+  observer_list->Notify(&Foo::Observe, 1);
+  loop.RunAllPending();
+}
 
 // A test driver for a multi-threaded notification loop.  Runs a number
 // of observer threads, each of which constantly adds/removes itself
@@ -250,7 +289,7 @@ static void ThreadSafeObserverHarness(int num_threads,
   observer_list->AddObserver(&b);
 
   AddRemoveThread* threaded_observer[kMaxThreads];
-  PlatformThreadHandle threads[kMaxThreads];
+  base::PlatformThreadHandle threads[kMaxThreads];
   for (int index = 0; index < num_threads; index++) {
     threaded_observer[index] = new AddRemoveThread(observer_list.get(), false);
     EXPECT_TRUE(PlatformThread::Create(0,
@@ -304,3 +343,50 @@ TEST(ObserverListTest, Existing) {
   FOR_EACH_OBSERVER(Foo, observer_list, Observe(1));
   EXPECT_EQ(1, b.adder.total);
 }
+
+class AddInClearObserve : public Foo {
+ public:
+  explicit AddInClearObserve(ObserverList<Foo>* list)
+      : list_(list), added_(false), adder_(1) {}
+
+  virtual void Observe(int /* x */) {
+    list_->Clear();
+    list_->AddObserver(&adder_);
+    added_ = true;
+  }
+
+  bool added() const { return added_; }
+  const Adder& adder() const { return adder_; }
+
+ private:
+  ObserverList<Foo>* const list_;
+
+  bool added_;
+  Adder adder_;
+};
+
+TEST(ObserverListTest, ClearNotifyAll) {
+  ObserverList<Foo> observer_list;
+  AddInClearObserve a(&observer_list);
+
+  observer_list.AddObserver(&a);
+
+  FOR_EACH_OBSERVER(Foo, observer_list, Observe(1));
+  EXPECT_TRUE(a.added());
+  EXPECT_EQ(1, a.adder().total)
+      << "Adder should observe once and have sum of 1.";
+}
+
+TEST(ObserverListTest, ClearNotifyExistingOnly) {
+  ObserverList<Foo> observer_list(ObserverList<Foo>::NOTIFY_EXISTING_ONLY);
+  AddInClearObserve a(&observer_list);
+
+  observer_list.AddObserver(&a);
+
+  FOR_EACH_OBSERVER(Foo, observer_list, Observe(1));
+  EXPECT_TRUE(a.added());
+  EXPECT_EQ(0, a.adder().total)
+      << "Adder should not observe, so sum should still be 0.";
+}
+
+}  // namespace

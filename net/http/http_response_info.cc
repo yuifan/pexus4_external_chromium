@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,6 +7,11 @@
 #include "base/logging.h"
 #include "base/pickle.h"
 #include "base/time.h"
+#include "net/base/auth.h"
+#include "net/base/io_buffer.h"
+#include "net/base/net_errors.h"
+#include "net/base/ssl_cert_request_info.h"
+#include "net/base/x509_certificate.h"
 #include "net/http/http_response_headers.h"
 
 using base::Time;
@@ -17,7 +22,10 @@ namespace net {
 // serialized HttpResponseInfo.
 enum {
   // The version of the response info used when persisting response info.
-  RESPONSE_INFO_VERSION = 1,
+  RESPONSE_INFO_VERSION = 2,
+
+  // The minimum version supported for deserializing response info.
+  RESPONSE_INFO_MINIMUM_VERSION = 1,
 
   // We reserve up to 8 bits for the version number.
   RESPONSE_INFO_VERSION_MASK = 0xFF,
@@ -41,16 +49,57 @@ enum {
   // This bit is set if the response was received via SPDY.
   RESPONSE_INFO_WAS_SPDY = 1 << 13,
 
+  // This bit is set if the request has NPN negotiated.
+  RESPONSE_INFO_WAS_NPN = 1 << 14,
+
+  // This bit is set if the request was fetched via an explicit proxy.
+  RESPONSE_INFO_WAS_PROXY = 1 << 15,
+
   // TODO(darin): Add other bits to indicate alternate request methods.
   // For now, we don't support storing those.
 };
 
 HttpResponseInfo::HttpResponseInfo()
     : was_cached(false),
-      was_fetched_via_spdy(false) {
+      was_fetched_via_spdy(false),
+      was_npn_negotiated(false),
+      was_fetched_via_proxy(false) {
+}
+
+HttpResponseInfo::HttpResponseInfo(const HttpResponseInfo& rhs)
+    : was_cached(rhs.was_cached),
+      was_fetched_via_spdy(rhs.was_fetched_via_spdy),
+      was_npn_negotiated(rhs.was_npn_negotiated),
+      was_fetched_via_proxy(rhs.was_fetched_via_proxy),
+      socket_address(rhs.socket_address),
+      request_time(rhs.request_time),
+      response_time(rhs.response_time),
+      auth_challenge(rhs.auth_challenge),
+      cert_request_info(rhs.cert_request_info),
+      ssl_info(rhs.ssl_info),
+      headers(rhs.headers),
+      vary_data(rhs.vary_data),
+      metadata(rhs.metadata) {
 }
 
 HttpResponseInfo::~HttpResponseInfo() {
+}
+
+HttpResponseInfo& HttpResponseInfo::operator=(const HttpResponseInfo& rhs) {
+  was_cached = rhs.was_cached;
+  was_fetched_via_spdy = rhs.was_fetched_via_spdy;
+  was_npn_negotiated = rhs.was_npn_negotiated;
+  was_fetched_via_proxy = rhs.was_fetched_via_proxy;
+  socket_address = rhs.socket_address;
+  request_time = rhs.request_time;
+  response_time = rhs.response_time;
+  auth_challenge = rhs.auth_challenge;
+  cert_request_info = rhs.cert_request_info;
+  ssl_info = rhs.ssl_info;
+  headers = rhs.headers;
+  vary_data = rhs.vary_data;
+  metadata = rhs.metadata;
+  return *this;
 }
 
 bool HttpResponseInfo::InitFromPickle(const Pickle& pickle,
@@ -62,7 +111,8 @@ bool HttpResponseInfo::InitFromPickle(const Pickle& pickle,
   if (!pickle.ReadInt(&iter, &flags))
     return false;
   int version = flags & RESPONSE_INFO_VERSION_MASK;
-  if (version != RESPONSE_INFO_VERSION) {
+  if (version < RESPONSE_INFO_MINIMUM_VERSION ||
+      version > RESPONSE_INFO_VERSION) {
     DLOG(ERROR) << "unexpected response info version: " << version;
     return false;
   }
@@ -85,8 +135,12 @@ bool HttpResponseInfo::InitFromPickle(const Pickle& pickle,
 
   // read ssl-info
   if (flags & RESPONSE_INFO_HAS_CERT) {
-    ssl_info.cert =
-        X509Certificate::CreateFromPickle(pickle, &iter);
+    // Version 1 only serialized only the end-entity certificate,
+    // while subsequent versions include the entire chain.
+    X509Certificate::PickleType type = (version == 1) ?
+        X509Certificate::PICKLETYPE_SINGLE_CERTIFICATE :
+        X509Certificate::PICKLETYPE_CERTIFICATE_CHAIN;
+    ssl_info.cert = X509Certificate::CreateFromPickle(pickle, &iter, type);
   }
   if (flags & RESPONSE_INFO_HAS_CERT_STATUS) {
     int cert_status;
@@ -107,7 +161,23 @@ bool HttpResponseInfo::InitFromPickle(const Pickle& pickle,
       return false;
   }
 
+  // Read socket_address.  This was not always present in the response info,
+  // so we don't fail if it can't be read.  If additional fields are added in
+  // a future version, then they must only be read if this operation succeeds.
+  std::string socket_address_host;
+  if (pickle.ReadString(&iter, &socket_address_host)) {
+    // If the host was written, we always expect the port to follow.
+    uint16 socket_address_port;
+    if (!pickle.ReadUInt16(&iter, &socket_address_port))
+      return false;
+    socket_address = HostPortPair(socket_address_host, socket_address_port);
+  }
+
   was_fetched_via_spdy = (flags & RESPONSE_INFO_WAS_SPDY) != 0;
+
+  was_npn_negotiated = (flags & RESPONSE_INFO_WAS_NPN) != 0;
+
+  was_fetched_via_proxy = (flags & RESPONSE_INFO_WAS_PROXY) != 0;
 
   *response_truncated = (flags & RESPONSE_INFO_TRUNCATED) ? true : false;
 
@@ -118,18 +188,23 @@ void HttpResponseInfo::Persist(Pickle* pickle,
                                bool skip_transient_headers,
                                bool response_truncated) const {
   int flags = RESPONSE_INFO_VERSION;
-  if (ssl_info.cert) {
+  if (ssl_info.is_valid()) {
     flags |= RESPONSE_INFO_HAS_CERT;
     flags |= RESPONSE_INFO_HAS_CERT_STATUS;
+    if (ssl_info.security_bits != -1)
+      flags |= RESPONSE_INFO_HAS_SECURITY_BITS;
+    // TODO(wtc): we should persist ssl_info.connection_status.
   }
-  if (ssl_info.security_bits != -1)
-    flags |= RESPONSE_INFO_HAS_SECURITY_BITS;
   if (vary_data.is_valid())
     flags |= RESPONSE_INFO_HAS_VARY_DATA;
   if (response_truncated)
     flags |= RESPONSE_INFO_TRUNCATED;
   if (was_fetched_via_spdy)
     flags |= RESPONSE_INFO_WAS_SPDY;
+  if (was_npn_negotiated)
+    flags |= RESPONSE_INFO_WAS_NPN;
+  if (was_fetched_via_proxy)
+    flags |= RESPONSE_INFO_WAS_PROXY;
 
   pickle->WriteInt(flags);
   pickle->WriteInt64(request_time.ToInternalValue());
@@ -149,15 +224,18 @@ void HttpResponseInfo::Persist(Pickle* pickle,
 
   headers->Persist(pickle, persist_options);
 
-  if (ssl_info.cert) {
+  if (ssl_info.is_valid()) {
     ssl_info.cert->Persist(pickle);
     pickle->WriteInt(ssl_info.cert_status);
+    if (ssl_info.security_bits != -1)
+      pickle->WriteInt(ssl_info.security_bits);
   }
-  if (ssl_info.security_bits != -1)
-    pickle->WriteInt(ssl_info.security_bits);
 
   if (vary_data.is_valid())
     vary_data.Persist(pickle);
+
+  pickle->WriteString(socket_address.host());
+  pickle->WriteUInt16(socket_address.port());
 }
 
 }  // namespace net

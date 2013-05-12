@@ -1,13 +1,14 @@
-// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_BASE_HOST_RESOLVER_PROC_H_
 #define NET_BASE_HOST_RESOLVER_PROC_H_
+#pragma once
 
 #include <string>
 
-#include "base/ref_counted.h"
+#include "base/memory/ref_counted.h"
 #include "net/base/address_family.h"
 
 namespace net {
@@ -27,20 +28,25 @@ class HostResolverProc : public base::RefCountedThreadSafe<HostResolverProc> {
 
   // Resolves |host| to an address list, restricting the results to addresses
   // in |address_family|. If successful returns OK and fills |addrlist| with
-  // a list of socket addresses. Otherwise returns a network error code.
+  // a list of socket addresses. Otherwise returns a network error code, and
+  // fills |os_error| with a more specific error if it was non-NULL.
   virtual int Resolve(const std::string& host,
                       AddressFamily address_family,
-                      AddressList* addrlist) = 0;
+                      HostResolverFlags host_resolver_flags,
+                      AddressList* addrlist,
+                      int* os_error) = 0;
 
  protected:
   friend class base::RefCountedThreadSafe<HostResolverProc>;
 
-  virtual ~HostResolverProc() {}
+  virtual ~HostResolverProc();
 
   // Asks the fallback procedure (if set) to do the resolve.
   int ResolveUsingPrevious(const std::string& host,
                            AddressFamily address_family,
-                           AddressList* addrlist);
+                           HostResolverFlags host_resolver_flags,
+                           AddressList* addrlist,
+                           int* os_error);
 
  private:
   friend class HostResolverImpl;
@@ -75,10 +81,13 @@ class HostResolverProc : public base::RefCountedThreadSafe<HostResolverProc> {
 // Resolves |host| to an address list, using the system's default host resolver.
 // (i.e. this calls out to getaddrinfo()). If successful returns OK and fills
 // |addrlist| with a list of socket addresses. Otherwise returns a
-// network error code.
+// network error code, and fills |os_error| with a more specific errir if it
+// was non-NULL.
 int SystemHostResolverProc(const std::string& host,
                            AddressFamily address_family,
-                           AddressList* addrlist);
+                           HostResolverFlags host_resolver_flags,
+                           AddressList* addrlist,
+                           int* os_error);
 
 }  // namespace net
 

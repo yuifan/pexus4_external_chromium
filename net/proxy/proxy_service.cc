@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -10,41 +10,91 @@
 #include "base/logging.h"
 #include "base/message_loop.h"
 #include "base/string_util.h"
+#include "base/values.h"
 #include "googleurl/src/gurl.h"
-#include "net/base/load_log.h"
 #include "net/base/net_errors.h"
+#include "net/base/net_log.h"
 #include "net/base/net_util.h"
 #include "net/proxy/init_proxy_resolver.h"
+#include "net/proxy/multi_threaded_proxy_resolver.h"
 #include "net/proxy/proxy_config_service_fixed.h"
+#include "net/proxy/proxy_resolver.h"
+#include "net/proxy/proxy_resolver_js_bindings.h"
+#ifndef ANDROID
+#include "net/proxy/proxy_resolver_v8.h"
+#endif
 #include "net/proxy/proxy_script_fetcher.h"
+#include "net/proxy/sync_host_resolver_bridge.h"
+#include "net/url_request/url_request_context.h"
+
 #if defined(OS_WIN)
 #include "net/proxy/proxy_config_service_win.h"
 #include "net/proxy/proxy_resolver_winhttp.h"
 #elif defined(OS_MACOSX)
 #include "net/proxy/proxy_config_service_mac.h"
 #include "net/proxy/proxy_resolver_mac.h"
-#elif defined(OS_LINUX)
+#elif defined(OS_LINUX) && !defined(OS_CHROMEOS)
 #include "net/proxy/proxy_config_service_linux.h"
 #endif
-#include "net/proxy/proxy_resolver.h"
-#include "net/proxy/proxy_resolver_js_bindings.h"
-#include "net/proxy/proxy_resolver_v8.h"
-#include "net/proxy/single_threaded_proxy_resolver.h"
-#include "net/url_request/url_request_context.h"
 
 using base::TimeDelta;
 using base::TimeTicks;
 
 namespace net {
 
-static const size_t kMaxNumLoadLogEntries = 100;
+namespace {
 
-// Config getter that fails every time.
-class ProxyConfigServiceNull : public ProxyConfigService {
+const size_t kMaxNumNetLogEntries = 100;
+const size_t kDefaultNumPacThreads = 4;
+
+// When the IP address changes we don't immediately re-run proxy auto-config.
+// Instead, we  wait for |kNumMillisToStallAfterNetworkChanges| before
+// attempting to re-valuate proxy auto-config.
+//
+// During this time window, any resolve requests sent to the ProxyService will
+// be queued. Once we have waited the required amount of them, the proxy
+// auto-config step will be run, and the queued requests resumed.
+//
+// The reason we play this game is that our signal for detecting network
+// changes (NetworkChangeNotifier) may fire *before* the system's networking
+// dependencies are fully configured. This is a problem since it means if
+// we were to run proxy auto-config right away, it could fail due to spurious
+// DNS failures. (see http://crbug.com/50779 for more details.)
+//
+// By adding the wait window, we give things a chance to get properly set up.
+// Now by the time we run the proxy-autoconfig there is a lower chance of
+// getting transient DNS / connect failures.
+//
+// Admitedly this is a hack. Ideally we would have NetworkChangeNotifier
+// deliver a reliable signal indicating that the network has changed AND is
+// ready for action... But until then, we can reduce the likelihood of users
+// getting wedged because of proxy detection failures on network switch.
+//
+// The obvious downside to this strategy is it introduces an additional
+// latency when switching networks. This delay shouldn't be too disruptive
+// assuming network switches are infrequent and user initiated. However if
+// NetworkChangeNotifier delivers network changes more frequently this could
+// cause jankiness. (NetworkChangeNotifier broadcasts a change event when ANY
+// interface goes up/down. So in theory if the non-primary interface were
+// hopping on and off wireless networks our constant delayed reconfiguration
+// could add noticeable jank.)
+//
+// The specific hard-coded wait time below is arbitrary.
+// Basically I ran some experiments switching between wireless networks on
+// a Linux Ubuntu (Lucid) laptop, and experimentally found this timeout fixes
+// things. It is entirely possible that the value is insuficient for other
+// setups.
+const int64 kNumMillisToStallAfterNetworkChanges = 2000;
+
+// Config getter that always returns direct settings.
+class ProxyConfigServiceDirect : public ProxyConfigService {
  public:
   // ProxyConfigService implementation:
-  virtual int GetProxyConfig(ProxyConfig* config) {
-    return ERR_NOT_IMPLEMENTED;
+  virtual void AddObserver(Observer* observer) {}
+  virtual void RemoveObserver(Observer* observer) {}
+  virtual ConfigAvailability GetLatestProxyConfig(ProxyConfig* config) {
+    *config = ProxyConfig::CreateDirect();
+    return CONFIG_VALID;
   }
 };
 
@@ -58,7 +108,7 @@ class ProxyResolverNull : public ProxyResolver {
                              ProxyInfo* results,
                              CompletionCallback* callback,
                              RequestHandle* request,
-                             LoadLog* load_log) {
+                             const BoundNetLog& net_log) {
     return ERR_NOT_IMPLEMENTED;
   }
 
@@ -66,13 +116,141 @@ class ProxyResolverNull : public ProxyResolver {
     NOTREACHED();
   }
 
- private:
-  virtual int SetPacScript(const GURL& /*pac_url*/,
-                           const std::string& /*pac_bytes*/,
-                           CompletionCallback* /*callback*/) {
+  virtual void CancelSetPacScript() {
+    NOTREACHED();
+  }
+
+  virtual int SetPacScript(
+      const scoped_refptr<ProxyResolverScriptData>& /*script_data*/,
+      CompletionCallback* /*callback*/) {
     return ERR_NOT_IMPLEMENTED;
   }
 };
+
+// ProxyResolver that simulates a PAC script which returns
+// |pac_string| for every single URL.
+class ProxyResolverFromPacString : public ProxyResolver {
+ public:
+  ProxyResolverFromPacString(const std::string& pac_string)
+      : ProxyResolver(false /*expects_pac_bytes*/),
+        pac_string_(pac_string) {}
+
+  virtual int GetProxyForURL(const GURL& url,
+                             ProxyInfo* results,
+                             CompletionCallback* callback,
+                             RequestHandle* request,
+                             const BoundNetLog& net_log) {
+    results->UsePacString(pac_string_);
+    return OK;
+  }
+
+  virtual void CancelRequest(RequestHandle request) {
+    NOTREACHED();
+  }
+
+  virtual void CancelSetPacScript() {
+    NOTREACHED();
+  }
+
+  virtual int SetPacScript(
+      const scoped_refptr<ProxyResolverScriptData>& pac_script,
+      CompletionCallback* callback) {
+    return OK;
+  }
+
+ private:
+  const std::string pac_string_;
+};
+
+#ifndef ANDROID
+// This factory creates V8ProxyResolvers with appropriate javascript bindings.
+class ProxyResolverFactoryForV8 : public ProxyResolverFactory {
+ public:
+  // |async_host_resolver|, |io_loop| and |net_log| must remain
+  // valid for the duration of our lifetime.
+  // |async_host_resolver| will only be operated on |io_loop|.
+  ProxyResolverFactoryForV8(HostResolver* async_host_resolver,
+                            MessageLoop* io_loop,
+                            NetLog* net_log)
+      : ProxyResolverFactory(true /*expects_pac_bytes*/),
+        async_host_resolver_(async_host_resolver),
+        io_loop_(io_loop),
+        net_log_(net_log) {
+  }
+
+  virtual ProxyResolver* CreateProxyResolver() {
+    // Create a synchronous host resolver wrapper that operates
+    // |async_host_resolver_| on |io_loop_|.
+    SyncHostResolverBridge* sync_host_resolver =
+        new SyncHostResolverBridge(async_host_resolver_, io_loop_);
+
+    ProxyResolverJSBindings* js_bindings =
+        ProxyResolverJSBindings::CreateDefault(sync_host_resolver, net_log_);
+
+    // ProxyResolverV8 takes ownership of |js_bindings|.
+    return new ProxyResolverV8(js_bindings);
+  }
+
+ private:
+  HostResolver* const async_host_resolver_;
+  MessageLoop* io_loop_;
+  NetLog* net_log_;
+};
+#endif
+
+// Creates ProxyResolvers using a platform-specific implementation.
+class ProxyResolverFactoryForSystem : public ProxyResolverFactory {
+ public:
+  ProxyResolverFactoryForSystem()
+      : ProxyResolverFactory(false /*expects_pac_bytes*/) {}
+
+  virtual ProxyResolver* CreateProxyResolver() {
+    DCHECK(IsSupported());
+#if defined(OS_WIN)
+    return new ProxyResolverWinHttp();
+#elif defined(OS_MACOSX)
+    return new ProxyResolverMac();
+#else
+    NOTREACHED();
+    return NULL;
+#endif
+  }
+
+  static bool IsSupported() {
+#if defined(OS_WIN) || defined(OS_MACOSX)
+    return true;
+#else
+    return false;
+#endif
+  }
+};
+
+// NetLog parameter to describe a proxy configuration change.
+class ProxyConfigChangedNetLogParam : public NetLog::EventParameters {
+ public:
+  ProxyConfigChangedNetLogParam(const ProxyConfig& old_config,
+                                const ProxyConfig& new_config)
+      : old_config_(old_config),
+        new_config_(new_config) {
+  }
+
+  virtual Value* ToValue() const {
+    DictionaryValue* dict = new DictionaryValue();
+    // The "old_config" is optional -- the first notification will not have
+    // any "previous" configuration.
+    if (old_config_.is_valid())
+      dict->Set("old_config", old_config_.ToValue());
+    dict->Set("new_config", new_config_.ToValue());
+    return dict;
+  }
+
+ private:
+  const ProxyConfig old_config_;
+  const ProxyConfig new_config_;
+  DISALLOW_COPY_AND_ASSIGN(ProxyConfigChangedNetLogParam);
+};
+
+}  // namespace
 
 // ProxyService::PacRequest ---------------------------------------------------
 
@@ -83,7 +261,7 @@ class ProxyService::PacRequest
              const GURL& url,
              ProxyInfo* results,
              CompletionCallback* user_callback,
-             LoadLog* load_log)
+             const BoundNetLog& net_log)
       : service_(service),
         user_callback_(user_callback),
         ALLOW_THIS_IN_INITIALIZER_LIST(io_callback_(
@@ -92,7 +270,7 @@ class ProxyService::PacRequest
         url_(url),
         resolve_job_(NULL),
         config_id_(ProxyConfig::INVALID_ID),
-        load_log_(load_log) {
+        net_log_(net_log) {
     DCHECK(user_callback);
   }
 
@@ -101,10 +279,12 @@ class ProxyService::PacRequest
     DCHECK(!was_cancelled());
     DCHECK(!is_started());
 
+    DCHECK(service_->config_.is_valid());
+
     config_id_ = service_->config_.id();
 
     return resolver()->GetProxyForURL(
-        url_, results_, &io_callback_, &resolve_job_, load_log_);
+        url_, results_, &io_callback_, &resolve_job_, net_log_);
   }
 
   bool is_started() const {
@@ -129,7 +309,7 @@ class ProxyService::PacRequest
   }
 
   void Cancel() {
-    LoadLog::AddEvent(load_log_, LoadLog::TYPE_CANCELLED);
+    net_log_.AddEvent(NetLog::TYPE_CANCELLED, NULL);
 
     if (is_started())
       CancelResolveJob();
@@ -139,7 +319,7 @@ class ProxyService::PacRequest
     user_callback_ = NULL;
     results_ = NULL;
 
-    LoadLog::EndEvent(load_log_, LoadLog::TYPE_PROXY_SERVICE);
+    net_log_.EndEvent(NetLog::TYPE_PROXY_SERVICE, NULL);
   }
 
   // Returns true if Cancel() has been called.
@@ -158,10 +338,10 @@ class ProxyService::PacRequest
     resolve_job_ = NULL;
     config_id_ = ProxyConfig::INVALID_ID;
 
-    return service_->DidFinishResolvingProxy(results_, result_code, load_log_);
+    return service_->DidFinishResolvingProxy(results_, result_code, net_log_);
   }
 
-  LoadLog* load_log() const { return load_log_; }
+  BoundNetLog* net_log() { return &net_log_; }
 
  private:
   friend class base::RefCounted<ProxyService::PacRequest>;
@@ -192,73 +372,132 @@ class ProxyService::PacRequest
   GURL url_;
   ProxyResolver::RequestHandle resolve_job_;
   ProxyConfig::ID config_id_;  // The config id when the resolve was started.
-  scoped_refptr<LoadLog> load_log_;
+  BoundNetLog net_log_;
 };
 
 // ProxyService ---------------------------------------------------------------
 
 ProxyService::ProxyService(ProxyConfigService* config_service,
                            ProxyResolver* resolver,
-                           NetworkChangeNotifier* network_change_notifier)
-    : config_service_(config_service),
-      resolver_(resolver),
+                           NetLog* net_log)
+    : resolver_(resolver),
       next_config_id_(1),
-      should_use_proxy_resolver_(false),
       ALLOW_THIS_IN_INITIALIZER_LIST(init_proxy_resolver_callback_(
           this, &ProxyService::OnInitProxyResolverComplete)),
-      network_change_notifier_(network_change_notifier) {
-  // Register to receive network change notifications.
-  if (network_change_notifier_)
-    network_change_notifier_->AddObserver(this);
+      current_state_(STATE_NONE) ,
+      net_log_(net_log),
+      stall_proxy_auto_config_delay_(
+          base::TimeDelta::FromMilliseconds(
+              kNumMillisToStallAfterNetworkChanges)) {
+  NetworkChangeNotifier::AddIPAddressObserver(this);
+  ResetConfigService(config_service);
+}
+
+#ifndef ANDROID
+// static
+ProxyService* ProxyService::CreateUsingV8ProxyResolver(
+    ProxyConfigService* proxy_config_service,
+    size_t num_pac_threads,
+    ProxyScriptFetcher* proxy_script_fetcher,
+    HostResolver* host_resolver,
+    NetLog* net_log) {
+  DCHECK(proxy_config_service);
+  DCHECK(proxy_script_fetcher);
+  DCHECK(host_resolver);
+
+  if (num_pac_threads == 0)
+    num_pac_threads = kDefaultNumPacThreads;
+
+  ProxyResolverFactory* sync_resolver_factory =
+      new ProxyResolverFactoryForV8(
+          host_resolver,
+          MessageLoop::current(),
+          net_log);
+
+  ProxyResolver* proxy_resolver =
+      new MultiThreadedProxyResolver(sync_resolver_factory, num_pac_threads);
+
+  ProxyService* proxy_service =
+      new ProxyService(proxy_config_service, proxy_resolver, net_log);
+
+  // Configure PAC script downloads to be issued using |proxy_script_fetcher|.
+  proxy_service->SetProxyScriptFetcher(proxy_script_fetcher);
+
+  return proxy_service;
+}
+#endif
+
+// static
+ProxyService* ProxyService::CreateUsingSystemProxyResolver(
+    ProxyConfigService* proxy_config_service,
+    size_t num_pac_threads,
+    NetLog* net_log) {
+  DCHECK(proxy_config_service);
+
+  if (!ProxyResolverFactoryForSystem::IsSupported()) {
+    LOG(WARNING) << "PAC support disabled because there is no "
+                    "system implementation";
+    return CreateWithoutProxyResolver(proxy_config_service, net_log);
+  }
+
+  if (num_pac_threads == 0)
+    num_pac_threads = kDefaultNumPacThreads;
+
+  ProxyResolver* proxy_resolver = new MultiThreadedProxyResolver(
+      new ProxyResolverFactoryForSystem(), num_pac_threads);
+
+  return new ProxyService(proxy_config_service, proxy_resolver, net_log);
 }
 
 // static
-ProxyService* ProxyService::Create(
+ProxyService* ProxyService::CreateWithoutProxyResolver(
     ProxyConfigService* proxy_config_service,
-    bool use_v8_resolver,
-    URLRequestContext* url_request_context,
-    NetworkChangeNotifier* network_change_notifier,
-    MessageLoop* io_loop) {
-  ProxyResolver* proxy_resolver;
-
-  if (use_v8_resolver) {
-    // Send javascript errors and alerts to LOG(INFO).
-    HostResolver* host_resolver = url_request_context->host_resolver();
-    ProxyResolverJSBindings* js_bindings =
-        ProxyResolverJSBindings::CreateDefault(host_resolver, io_loop);
-
-    proxy_resolver = new ProxyResolverV8(js_bindings);
-  } else {
-    proxy_resolver = CreateNonV8ProxyResolver();
-  }
-
-  // Wrap the (synchronous) ProxyResolver implementation in a single-threaded
-  // runner. This will dispatch requests to a threadpool of size 1.
-  proxy_resolver = new SingleThreadedProxyResolver(proxy_resolver);
-
-  ProxyService* proxy_service = new ProxyService(
-      proxy_config_service, proxy_resolver, network_change_notifier);
-
-  if (proxy_resolver->expects_pac_bytes()) {
-    // Configure PAC script downloads to be issued using |url_request_context|.
-    DCHECK(url_request_context);
-    proxy_service->SetProxyScriptFetcher(
-        ProxyScriptFetcher::Create(url_request_context));
-  }
-
-  return proxy_service;
+    NetLog* net_log) {
+  return new ProxyService(proxy_config_service,
+                          new ProxyResolverNull(),
+                          net_log);
 }
 
 // static
 ProxyService* ProxyService::CreateFixed(const ProxyConfig& pc) {
-  return Create(new ProxyConfigServiceFixed(pc), false, NULL, NULL, NULL);
+  // TODO(eroman): This isn't quite right, won't work if |pc| specifies
+  //               a PAC script.
+  return CreateUsingSystemProxyResolver(new ProxyConfigServiceFixed(pc),
+                                        0, NULL);
 }
 
 // static
-ProxyService* ProxyService::CreateNull() {
-  // Use a configuration fetcher and proxy resolver which always fail.
-  return new ProxyService(new ProxyConfigServiceNull,
-                          new ProxyResolverNull,
+ProxyService* ProxyService::CreateFixed(const std::string& proxy) {
+  net::ProxyConfig proxy_config;
+  proxy_config.proxy_rules().ParseFromString(proxy);
+  return ProxyService::CreateFixed(proxy_config);
+}
+
+// static
+ProxyService* ProxyService::CreateDirect() {
+  return CreateDirectWithNetLog(NULL);
+}
+
+ProxyService* ProxyService::CreateDirectWithNetLog(NetLog* net_log) {
+  // Use direct connections.
+  return new ProxyService(new ProxyConfigServiceDirect, new ProxyResolverNull,
+                          net_log);
+}
+
+// static
+ProxyService* ProxyService::CreateFixedFromPacResult(
+    const std::string& pac_string) {
+
+  // We need the settings to contain an "automatic" setting, otherwise the
+  // ProxyResolver dependency we give it will never be used.
+  scoped_ptr<ProxyConfigService> proxy_config_service(
+      new ProxyConfigServiceFixed(ProxyConfig::CreateAutoDetect()));
+
+  scoped_ptr<ProxyResolver> proxy_resolver(
+      new ProxyResolverFromPacString(pac_string));
+
+  return new ProxyService(proxy_config_service.release(),
+                          proxy_resolver.release(),
                           NULL);
 }
 
@@ -266,35 +505,37 @@ int ProxyService::ResolveProxy(const GURL& raw_url,
                                ProxyInfo* result,
                                CompletionCallback* callback,
                                PacRequest** pac_request,
-                               LoadLog* load_log) {
+                               const BoundNetLog& net_log) {
+  DCHECK(CalledOnValidThread());
   DCHECK(callback);
 
-  LoadLog::BeginEvent(load_log, LoadLog::TYPE_PROXY_SERVICE);
+  net_log.BeginEvent(NetLog::TYPE_PROXY_SERVICE, NULL);
+
+  config_service_->OnLazyPoll();
+  if (current_state_ == STATE_NONE)
+    ApplyProxyConfigIfAvailable();
 
   // Strip away any reference fragments and the username/password, as they
   // are not relevant to proxy resolution.
   GURL url = SimplifyUrlForRequest(raw_url);
 
-  // Check if the request can be completed right away. This is the case when
-  // using a direct connection, or when the config is bad.
-  UpdateConfigIfOld(load_log);
+  // Check if the request can be completed right away. (This is the case when
+  // using a direct connection for example).
   int rv = TryToCompleteSynchronously(url, result);
   if (rv != ERR_IO_PENDING)
-    return DidFinishResolvingProxy(result, rv, load_log);
+    return DidFinishResolvingProxy(result, rv, net_log);
 
-  scoped_refptr<PacRequest> req =
-      new PacRequest(this, url, result, callback, load_log);
+  scoped_refptr<PacRequest> req(
+      new PacRequest(this, url, result, callback, net_log));
 
-  bool resolver_is_ready = !IsInitializingProxyResolver();
-
-  if (resolver_is_ready) {
+  if (current_state_ == STATE_READY) {
     // Start the resolve request.
     rv = req->Start();
     if (rv != ERR_IO_PENDING)
       return req->QueryDidComplete(rv);
   } else {
-    LoadLog::BeginEvent(req->load_log(),
-        LoadLog::TYPE_PROXY_SERVICE_WAITING_FOR_INIT_PAC);
+    req->net_log()->BeginEvent(NetLog::TYPE_PROXY_SERVICE_WAITING_FOR_INIT_PAC,
+                               NULL);
   }
 
   DCHECK_EQ(ERR_IO_PENDING, rv);
@@ -310,61 +551,25 @@ int ProxyService::ResolveProxy(const GURL& raw_url,
 
 int ProxyService::TryToCompleteSynchronously(const GURL& url,
                                              ProxyInfo* result) {
+  DCHECK_NE(STATE_NONE, current_state_);
+
+  if (current_state_ != STATE_READY)
+    return ERR_IO_PENDING;  // Still initializing.
+
+  DCHECK_NE(config_.id(), ProxyConfig::INVALID_ID);
+
+  if (config_.HasAutomaticSettings())
+    return ERR_IO_PENDING;  // Must submit the request to the proxy resolver.
+
+  // Use the manual proxy settings.
+  config_.proxy_rules().Apply(url, result);
   result->config_id_ = config_.id();
-
-  DCHECK(config_.id() != ProxyConfig::INVALID_ID);
-
-  if (should_use_proxy_resolver_ || IsInitializingProxyResolver()) {
-    // May need to go through ProxyResolver for this.
-    return ERR_IO_PENDING;
-  }
-
-  if (!config_.proxy_rules.empty()) {
-    ApplyProxyRules(url, config_.proxy_rules, result);
-    return OK;
-  }
-
-  // otherwise, we have no proxy config
-  result->UseDirect();
   return OK;
 }
 
-void ProxyService::ApplyProxyRules(const GURL& url,
-                                   const ProxyConfig::ProxyRules& proxy_rules,
-                                   ProxyInfo* result) {
-  DCHECK(!proxy_rules.empty());
-
-  if (ShouldBypassProxyForURL(url)) {
-    result->UseDirect();
-    return;
-  }
-
-  switch (proxy_rules.type) {
-    case ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY:
-      result->UseProxyServer(proxy_rules.single_proxy);
-      break;
-    case ProxyConfig::ProxyRules::TYPE_PROXY_PER_SCHEME: {
-      const ProxyServer* entry = proxy_rules.MapUrlSchemeToProxy(url.scheme());
-      if (entry) {
-        result->UseProxyServer(*entry);
-      } else {
-        // We failed to find a matching proxy server for the current URL
-        // scheme. Default to direct.
-        result->UseDirect();
-      }
-      break;
-    }
-    default:
-      result->UseDirect();
-      NOTREACHED();
-      break;
-  }
-}
-
 ProxyService::~ProxyService() {
-  // Unregister to receive network change notifications.
-  if (network_change_notifier_)
-    network_change_notifier_->RemoveObserver(this);
+  NetworkChangeNotifier::RemoveIPAddressObserver(this);
+  config_service_->RemoveObserver(this);
 
   // Cancel any inprogress requests.
   for (PendingRequests::iterator it = pending_requests_.begin();
@@ -382,14 +587,15 @@ void ProxyService::SuspendAllPendingRequests() {
     if (req->is_started()) {
       req->CancelResolveJob();
 
-      LoadLog::BeginEvent(req->load_log(),
-          LoadLog::TYPE_PROXY_SERVICE_WAITING_FOR_INIT_PAC);
+      req->net_log()->BeginEvent(
+          NetLog::TYPE_PROXY_SERVICE_WAITING_FOR_INIT_PAC, NULL);
     }
   }
 }
 
-void ProxyService::ResumeAllPendingRequests() {
-  DCHECK(!IsInitializingProxyResolver());
+void ProxyService::SetReady() {
+  DCHECK(!init_proxy_resolver_.get());
+  current_state_ = STATE_READY;
 
   // Make a copy in case |this| is deleted during the synchronous completion
   // of one of the requests. If |this| is deleted then all of the PacRequest
@@ -401,8 +607,8 @@ void ProxyService::ResumeAllPendingRequests() {
        ++it) {
     PacRequest* req = it->get();
     if (!req->is_started() && !req->was_cancelled()) {
-      LoadLog::EndEvent(req->load_log(),
-          LoadLog::TYPE_PROXY_SERVICE_WAITING_FOR_INIT_PAC);
+      req->net_log()->EndEvent(NetLog::TYPE_PROXY_SERVICE_WAITING_FOR_INIT_PAC,
+                               NULL);
 
       // Note that we re-check for synchronous completion, in case we are
       // no longer using a ProxyResolver (can happen if we fell-back to manual).
@@ -411,46 +617,68 @@ void ProxyService::ResumeAllPendingRequests() {
   }
 }
 
+void ProxyService::ApplyProxyConfigIfAvailable() {
+  DCHECK_EQ(STATE_NONE, current_state_);
+
+  config_service_->OnLazyPoll();
+
+  // If we have already fetched the configuration, start applying it.
+  if (fetched_config_.is_valid()) {
+    InitializeUsingLastFetchedConfig();
+    return;
+  }
+
+  // Otherwise we need to first fetch the configuration.
+  current_state_ = STATE_WAITING_FOR_PROXY_CONFIG;
+
+  // Retrieve the current proxy configuration from the ProxyConfigService.
+  // If a configuration is not available yet, we will get called back later
+  // by our ProxyConfigService::Observer once it changes.
+  ProxyConfig config;
+  ProxyConfigService::ConfigAvailability availability =
+      config_service_->GetLatestProxyConfig(&config);
+  if (availability != ProxyConfigService::CONFIG_PENDING)
+    OnProxyConfigChanged(config, availability);
+}
+
 void ProxyService::OnInitProxyResolverComplete(int result) {
+  DCHECK_EQ(STATE_WAITING_FOR_INIT_PROXY_RESOLVER, current_state_);
   DCHECK(init_proxy_resolver_.get());
-  DCHECK(config_.MayRequirePACResolver());
-  DCHECK(!should_use_proxy_resolver_);
+  DCHECK(fetched_config_.HasAutomaticSettings());
   init_proxy_resolver_.reset();
 
-  should_use_proxy_resolver_ = result == OK;
-
   if (result != OK) {
-    LOG(INFO) << "Failed configuring with PAC script, falling-back to manual "
-                 "proxy servers.";
+    VLOG(1) << "Failed configuring with PAC script, falling-back to manual "
+               "proxy servers.";
+    config_ = fetched_config_;
+    config_.ClearAutomaticSettings();
   }
+
+  config_.set_id(fetched_config_.id());
 
   // Resume any requests which we had to defer until the PAC script was
   // downloaded.
-  ResumeAllPendingRequests();
+  SetReady();
 }
 
 int ProxyService::ReconsiderProxyAfterError(const GURL& url,
                                             ProxyInfo* result,
                                             CompletionCallback* callback,
                                             PacRequest** pac_request,
-                                            LoadLog* load_log) {
+                                            const BoundNetLog& net_log) {
+  DCHECK(CalledOnValidThread());
+
   // Check to see if we have a new config since ResolveProxy was called.  We
   // want to re-run ResolveProxy in two cases: 1) we have a new config, or 2) a
   // direct connection failed and we never tried the current config.
 
   bool re_resolve = result->config_id_ != config_.id();
-  if (!re_resolve) {
-    UpdateConfig(load_log);
-    if (result->config_id_ != config_.id()) {
-      // A new configuration!
-      re_resolve = true;
-    }
-  }
+
   if (re_resolve) {
     // If we have a new config or the config was never tried, we delete the
     // list of bad proxies and we try again.
     proxy_retry_info_.clear();
-    return ResolveProxy(url, result, callback, pac_request, load_log);
+    return ResolveProxy(url, result, callback, pac_request, net_log);
   }
 
   // We don't have new proxy settings to try, try to fallback to the next proxy
@@ -463,6 +691,7 @@ int ProxyService::ReconsiderProxyAfterError(const GURL& url,
 }
 
 void ProxyService::CancelPacRequest(PacRequest* req) {
+  DCHECK(CalledOnValidThread());
   DCHECK(req);
   req->Cancel();
   RemovePendingRequest(req);
@@ -483,65 +712,94 @@ void ProxyService::RemovePendingRequest(PacRequest* req) {
 
 int ProxyService::DidFinishResolvingProxy(ProxyInfo* result,
                                           int result_code,
-                                          LoadLog* load_log) {
+                                          const BoundNetLog& net_log) {
   // Log the result of the proxy resolution.
   if (result_code == OK) {
-    // When full logging is enabled, dump the proxy list.
-    if (LoadLog::IsUnbounded(load_log)) {
-      LoadLog::AddString(
-          load_log,
-          std::string("Resolved proxy list: ") + result->ToPacString());
+    // When logging all events is enabled, dump the proxy list.
+    if (net_log.IsLoggingAllEvents()) {
+      net_log.AddEvent(
+          NetLog::TYPE_PROXY_SERVICE_RESOLVED_PROXY_LIST,
+          make_scoped_refptr(new NetLogStringParameter(
+              "pac_string", result->ToPacString())));
     }
+    result->DeprioritizeBadProxies(proxy_retry_info_);
   } else {
-    LoadLog::AddErrorCode(load_log, result_code);
+    net_log.AddEvent(
+        NetLog::TYPE_PROXY_SERVICE_RESOLVED_PROXY_LIST,
+        make_scoped_refptr(new NetLogIntegerParameter(
+            "net_error", result_code)));
+
+    // Fall-back to direct when the proxy resolver fails. This corresponds
+    // with a javascript runtime error in the PAC script.
+    //
+    // This implicit fall-back to direct matches Firefox 3.5 and
+    // Internet Explorer 8. For more information, see:
+    //
+    // http://www.chromium.org/developers/design-documents/proxy-settings-fallback
+    result->UseDirect();
+    result_code = OK;
   }
 
-  // Clean up the results list.
-  if (result_code == OK)
-    result->DeprioritizeBadProxies(proxy_retry_info_);
-
-  LoadLog::EndEvent(load_log, LoadLog::TYPE_PROXY_SERVICE);
+  net_log.EndEvent(NetLog::TYPE_PROXY_SERVICE, NULL);
   return result_code;
 }
 
 void ProxyService::SetProxyScriptFetcher(
     ProxyScriptFetcher* proxy_script_fetcher) {
-  if (init_proxy_resolver_.get()) {
-    // We need to be careful to first cancel |init_proxy_resolver_|, since it
-    // holds a pointer to the old proxy script fetcher we are about to delete.
-
-    DCHECK(IsInitializingProxyResolver());
-    init_proxy_resolver_.reset();
-    proxy_script_fetcher_.reset(proxy_script_fetcher);
-
-    // Restart the initialization, using the new proxy script fetcher.
-    StartInitProxyResolver();
-  } else {
-    proxy_script_fetcher_.reset(proxy_script_fetcher);
-  }
+  DCHECK(CalledOnValidThread());
+  State previous_state = ResetProxyConfig(false);
+  proxy_script_fetcher_.reset(proxy_script_fetcher);
+  if (previous_state != STATE_NONE)
+    ApplyProxyConfigIfAvailable();
 }
 
 ProxyScriptFetcher* ProxyService::GetProxyScriptFetcher() const {
+  DCHECK(CalledOnValidThread());
   return proxy_script_fetcher_.get();
+}
+
+ProxyService::State ProxyService::ResetProxyConfig(bool reset_fetched_config) {
+  DCHECK(CalledOnValidThread());
+  State previous_state = current_state_;
+
+  proxy_retry_info_.clear();
+  init_proxy_resolver_.reset();
+  SuspendAllPendingRequests();
+  config_ = ProxyConfig();
+  if (reset_fetched_config)
+    fetched_config_ = ProxyConfig();
+  current_state_ = STATE_NONE;
+
+  return previous_state;
 }
 
 void ProxyService::ResetConfigService(
     ProxyConfigService* new_proxy_config_service) {
+  DCHECK(CalledOnValidThread());
+  State previous_state = ResetProxyConfig(true);
+
+  // Release the old configuration service.
+  if (config_service_.get())
+    config_service_->RemoveObserver(this);
+
+  // Set the new configuration service.
   config_service_.reset(new_proxy_config_service);
-  UpdateConfig(NULL);
+  config_service_->AddObserver(this);
+
+  if (previous_state != STATE_NONE)
+    ApplyProxyConfigIfAvailable();
 }
 
 void ProxyService::PurgeMemory() {
+  DCHECK(CalledOnValidThread());
   if (resolver_.get())
     resolver_->PurgeMemory();
 }
 
 void ProxyService::ForceReloadProxyConfig() {
-  // Mark the current configuration as being un-initialized, then force it to
-  // start updating (normally this would happen lazily during the next
-  // call to ResolveProxy()).
-  config_.set_id(ProxyConfig::INVALID_ID);
-  UpdateConfig(NULL);
+  DCHECK(CalledOnValidThread());
+  ResetProxyConfig(false);
+  ApplyProxyConfigIfAvailable();
 }
 
 // static
@@ -550,10 +808,18 @@ ProxyConfigService* ProxyService::CreateSystemProxyConfigService(
 #if defined(OS_WIN)
   return new ProxyConfigServiceWin();
 #elif defined(OS_MACOSX)
-  return new ProxyConfigServiceMac();
+  return new ProxyConfigServiceMac(io_loop);
+#elif defined(OS_CHROMEOS)
+  NOTREACHED() << "ProxyConfigService for ChromeOS should be created in "
+               << "profile_io_data.cc::CreateProxyConfigService.";
+  return NULL;
+#elif defined(ANDROID)
+  NOTREACHED() << "ProxyConfigService for Android should be created in "
+               << "WebCache.cpp: WebCache::WebCache";
+  return NULL;
 #elif defined(OS_LINUX)
-  ProxyConfigServiceLinux* linux_config_service
-      = new ProxyConfigServiceLinux();
+  ProxyConfigServiceLinux* linux_config_service =
+      new ProxyConfigServiceLinux();
 
   // Assume we got called from the UI loop, which runs the default
   // glib main loop, so the current thread is where we should be
@@ -578,204 +844,84 @@ ProxyConfigService* ProxyService::CreateSystemProxyConfigService(
 #endif
 }
 
-// static
-ProxyResolver* ProxyService::CreateNonV8ProxyResolver() {
-#if defined(OS_WIN)
-  return new ProxyResolverWinHttp();
-#elif defined(OS_MACOSX)
-  return new ProxyResolverMac();
-#else
-  LOG(WARNING) << "PAC support disabled because there is no fallback "
-                  "non-V8 implementation";
-  return new ProxyResolverNull();
-#endif
-}
-
-void ProxyService::UpdateConfig(LoadLog* load_log) {
-  bool is_first_update = !config_has_been_initialized();
-
-  ProxyConfig latest;
-
-  // Fetch the proxy settings.
-  TimeTicks start_time = TimeTicks::Now();
-  LoadLog::BeginEvent(load_log,
-      LoadLog::TYPE_PROXY_SERVICE_POLL_CONFIG_SERVICE_FOR_CHANGES);
-  int rv = config_service_->GetProxyConfig(&latest);
-  LoadLog::EndEvent(load_log,
-      LoadLog::TYPE_PROXY_SERVICE_POLL_CONFIG_SERVICE_FOR_CHANGES);
-  TimeTicks end_time = TimeTicks::Now();
-
-  // Record how long the call to config_service_->GetConfig() above took.
-  // On some setups of Windows, we have reports that querying the system
-  // proxy settings can take multiple seconds (http://crbug.com/12189).
-  UMA_HISTOGRAM_CUSTOM_TIMES("Net.ProxyPollConfigurationTime",
-                             end_time - start_time,
-                             TimeDelta::FromMilliseconds(1),
-                             TimeDelta::FromSeconds(30),
-                             50);
-
-  if (rv != OK) {
-    if (is_first_update) {
-      // Default to direct-connection if the first fetch fails.
-      LOG(INFO) << "Failed initial proxy configuration fetch.";
-      SetConfig(ProxyConfig());
-    }
-    return;
+void ProxyService::OnProxyConfigChanged(
+    const ProxyConfig& config,
+    ProxyConfigService::ConfigAvailability availability) {
+  // Retrieve the current proxy configuration from the ProxyConfigService.
+  // If a configuration is not available yet, we will get called back later
+  // by our ProxyConfigService::Observer once it changes.
+  ProxyConfig effective_config;
+  switch (availability) {
+    case ProxyConfigService::CONFIG_PENDING:
+      // ProxyConfigService implementors should never pass CONFIG_PENDING.
+      NOTREACHED() << "Proxy config change with CONFIG_PENDING availability!";
+      return;
+    case ProxyConfigService::CONFIG_VALID:
+      effective_config = config;
+      break;
+    case ProxyConfigService::CONFIG_UNSET:
+      effective_config = ProxyConfig::CreateDirect();
+      break;
   }
-  config_last_update_time_ = TimeTicks::Now();
 
-  if (!is_first_update && latest.Equals(config_))
-    return;
+  // Emit the proxy settings change to the NetLog stream.
+  if (net_log_) {
+    scoped_refptr<NetLog::EventParameters> params(
+        new ProxyConfigChangedNetLogParam(fetched_config_, effective_config));
+    net_log_->AddEntry(net::NetLog::TYPE_PROXY_CONFIG_CHANGED,
+                       base::TimeTicks::Now(),
+                       NetLog::Source(),
+                       NetLog::PHASE_NONE,
+                       params);
+  }
 
-  SetConfig(latest);
+  // Set the new configuration as the most recently fetched one.
+  fetched_config_ = effective_config;
+  fetched_config_.set_id(1);  // Needed for a later DCHECK of is_valid().
+
+  InitializeUsingLastFetchedConfig();
 }
 
-void ProxyService::SetConfig(const ProxyConfig& config) {
-  config_ = config;
+void ProxyService::InitializeUsingLastFetchedConfig() {
+  ResetProxyConfig(false);
+
+  DCHECK(fetched_config_.is_valid());
 
   // Increment the ID to reflect that the config has changed.
-  config_.set_id(next_config_id_++);
+  fetched_config_.set_id(next_config_id_++);
 
-  // Reset state associated with latest config.
-  proxy_retry_info_.clear();
-
-  // Cancel any PAC fetching / ProxyResolver::SetPacScript() which was
-  // in progress for the previous configuration.
-  init_proxy_resolver_.reset();
-  should_use_proxy_resolver_ = false;
+  if (!fetched_config_.HasAutomaticSettings()) {
+    config_ = fetched_config_;
+    SetReady();
+    return;
+  }
 
   // Start downloading + testing the PAC scripts for this new configuration.
-  if (config_.MayRequirePACResolver()) {
-    // Since InitProxyResolver will be playing around with the proxy resolver
-    // as it tests the parsing of various PAC scripts, make sure there is
-    // nothing in-flight in |resolver_|. These paused requests are resumed by
-    // OnInitProxyResolverComplete().
-    SuspendAllPendingRequests();
-
-    // Calls OnInitProxyResolverComplete() on completion.
-    StartInitProxyResolver();
-  }
-}
-
-void ProxyService::StartInitProxyResolver() {
-  DCHECK(!init_proxy_resolver_.get());
+  current_state_ = STATE_WAITING_FOR_INIT_PROXY_RESOLVER;
 
   init_proxy_resolver_.reset(
-      new InitProxyResolver(resolver_.get(), proxy_script_fetcher_.get()));
+      new InitProxyResolver(resolver_.get(), proxy_script_fetcher_.get(),
+                            net_log_));
 
-  init_proxy_resolver_log_ = new LoadLog(kMaxNumLoadLogEntries);
+  // If we changed networks recently, we should delay running proxy auto-config.
+  base::TimeDelta wait_delay =
+      stall_proxy_autoconfig_until_ - base::TimeTicks::Now();
 
   int rv = init_proxy_resolver_->Init(
-      config_, &init_proxy_resolver_callback_, init_proxy_resolver_log_);
+      fetched_config_, wait_delay, &config_, &init_proxy_resolver_callback_);
 
   if (rv != ERR_IO_PENDING)
     OnInitProxyResolverComplete(rv);
 }
 
-void ProxyService::UpdateConfigIfOld(LoadLog* load_log) {
-  // The overhead of calling ProxyConfigService::GetProxyConfig is very low.
-  const TimeDelta kProxyConfigMaxAge = TimeDelta::FromSeconds(5);
-
-  // Periodically check for a new config.
-  if (!config_has_been_initialized() ||
-      (TimeTicks::Now() - config_last_update_time_) > kProxyConfigMaxAge)
-    UpdateConfig(load_log);
-}
-
-bool ProxyService::ShouldBypassProxyForURL(const GURL& url) {
-  std::string url_domain = url.scheme();
-  if (!url_domain.empty())
-    url_domain += "://";
-
-  url_domain += url.host();
-  // This isn't superfluous; GURL case canonicalization doesn't hit the embedded
-  // percent-encoded characters.
-  StringToLowerASCII(&url_domain);
-
-  // TODO(eroman): use GetHostAndPort().
-  std::string url_domain_and_port = url_domain + ":"
-      + IntToString(url.EffectiveIntPort());
-
-  if (config_.proxy_bypass_local_names && IsLocalName(url))
-    return true;
-
-  for(std::vector<std::string>::const_iterator i = config_.proxy_bypass.begin();
-      i != config_.proxy_bypass.end(); ++i) {
-    std::string bypass_url_domain = *i;
-
-    // The proxy server bypass list can contain entities with http/https
-    // If no scheme is specified then it indicates that all schemes are
-    // allowed for the current entry. For matching this we just use
-    // the protocol scheme of the url passed in.
-    size_t scheme_colon = bypass_url_domain.find("://");
-    if (scheme_colon == std::string::npos) {
-      std::string bypass_url_domain_with_scheme = url.scheme();
-      scheme_colon = bypass_url_domain_with_scheme.length();
-      bypass_url_domain_with_scheme += "://";
-      bypass_url_domain_with_scheme += bypass_url_domain;
-
-      bypass_url_domain = bypass_url_domain_with_scheme;
-    }
-    std::string* url_compare_reference = &url_domain;
-    size_t port_colon = bypass_url_domain.rfind(":");
-    if (port_colon > scheme_colon) {
-      // If our match pattern includes a colon followed by a digit,
-      // and either it's preceded by ']' (IPv6 with port)
-      // or has no other colon (IPv4),
-      // then match against <domain>:<port>.
-      // TODO(sdoyon): straighten this out, in particular the IPv6 brackets,
-      // and do the parsing in ProxyConfig when we do the CIDR matching
-      // mentioned below.
-      std::string::const_iterator domain_begin =
-          bypass_url_domain.begin() + scheme_colon + 3;  // after ://
-      std::string::const_iterator port_iter =
-          bypass_url_domain.begin() + port_colon;
-      std::string::const_iterator end = bypass_url_domain.end();
-      if ((port_iter + 1) < end && IsAsciiDigit(*(port_iter + 1)) &&
-          (*(port_iter - 1) == ']' ||
-           std::find(domain_begin, port_iter, ':') == port_iter))
-        url_compare_reference = &url_domain_and_port;
-    }
-
-    StringToLowerASCII(&bypass_url_domain);
-
-    if (MatchPatternASCII(*url_compare_reference, bypass_url_domain))
-      return true;
-
-    // Some systems (the Mac, for example) allow CIDR-style specification of
-    // proxy bypass for IP-specified hosts (e.g.  "10.0.0.0/8"; see
-    // http://www.tcd.ie/iss/internet/osx_proxy.php for a real-world example).
-    // That's kinda cool so we'll provide that for everyone.
-    // TODO(avi): implement here. See: http://crbug.com/9835.
-    // IP addresses ought to be canonicalized for comparison (whether
-    // with CIDR, port, or IP address alone).
-  }
-
-  return false;
-}
-
-// This matches IE's interpretation of the
-// "Bypass proxy server for local addresses" settings checkbox. Fully
-// qualified domain names or IP addresses are considered non-local,
-// regardless of what they map to.
-//
-// static
-bool ProxyService::IsLocalName(const GURL& url) {
-  const std::string& host = url.host();
-  if (host == "127.0.0.1" || host == "[::1]")
-    return true;
-  return host.find('.') == std::string::npos;
-}
-
 void ProxyService::OnIPAddressChanged() {
-  DCHECK(network_change_notifier_);
+  // See the comment block by |kNumMillisToStallAfterNetworkChanges| for info.
+  stall_proxy_autoconfig_until_ =
+      base::TimeTicks::Now() + stall_proxy_auto_config_delay_;
 
-  // Mark the current configuration as being un-initialized.
-  //
-  // This will force us to re-fetch the configuration (and re-run all of
-  // the initialization steps) on the next ResolveProxy() request, as part
-  // of UpdateConfigIfOld().
-  config_.set_id(ProxyConfig::INVALID_ID);
+  State previous_state = ResetProxyConfig(false);
+  if (previous_state != STATE_NONE)
+    ApplyProxyConfigIfAvailable();
 }
 
 SyncProxyServiceHelper::SyncProxyServiceHelper(MessageLoop* io_message_loop,
@@ -790,11 +936,11 @@ SyncProxyServiceHelper::SyncProxyServiceHelper(MessageLoop* io_message_loop,
 
 int SyncProxyServiceHelper::ResolveProxy(const GURL& url,
                                          ProxyInfo* proxy_info,
-                                         LoadLog* load_log) {
+                                         const BoundNetLog& net_log) {
   DCHECK(io_message_loop_ != MessageLoop::current());
 
   io_message_loop_->PostTask(FROM_HERE, NewRunnableMethod(
-      this, &SyncProxyServiceHelper::StartAsyncResolve, url, load_log));
+      this, &SyncProxyServiceHelper::StartAsyncResolve, url, net_log));
 
   event_.Wait();
 
@@ -805,11 +951,11 @@ int SyncProxyServiceHelper::ResolveProxy(const GURL& url,
 }
 
 int SyncProxyServiceHelper::ReconsiderProxyAfterError(
-    const GURL& url, ProxyInfo* proxy_info, LoadLog* load_log) {
+    const GURL& url, ProxyInfo* proxy_info, const BoundNetLog& net_log) {
   DCHECK(io_message_loop_ != MessageLoop::current());
 
   io_message_loop_->PostTask(FROM_HERE, NewRunnableMethod(
-      this, &SyncProxyServiceHelper::StartAsyncReconsider, url, load_log));
+      this, &SyncProxyServiceHelper::StartAsyncReconsider, url, net_log));
 
   event_.Wait();
 
@@ -819,19 +965,21 @@ int SyncProxyServiceHelper::ReconsiderProxyAfterError(
   return result_;
 }
 
+SyncProxyServiceHelper::~SyncProxyServiceHelper() {}
+
 void SyncProxyServiceHelper::StartAsyncResolve(const GURL& url,
-                                               LoadLog* load_log) {
+                                               const BoundNetLog& net_log) {
   result_ = proxy_service_->ResolveProxy(
-      url, &proxy_info_, &callback_, NULL, load_log);
+      url, &proxy_info_, &callback_, NULL, net_log);
   if (result_ != net::ERR_IO_PENDING) {
     OnCompletion(result_);
   }
 }
 
 void SyncProxyServiceHelper::StartAsyncReconsider(const GURL& url,
-                                                  LoadLog* load_log) {
+                                                  const BoundNetLog& net_log) {
   result_ = proxy_service_->ReconsiderProxyAfterError(
-      url, &proxy_info_, &callback_, NULL, load_log);
+      url, &proxy_info_, &callback_, NULL, net_log);
   if (result_ != net::ERR_IO_PENDING) {
     OnCompletion(result_);
   }

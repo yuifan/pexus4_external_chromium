@@ -1,40 +1,52 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "base/scoped_ptr.h"
+#include "base/memory/ref_counted.h"
 #include "base/task.h"
-
 #include "testing/gtest/include/gtest/gtest.h"
 
 namespace {
 
-class HelperObject {
+class CancelInDestructor : public base::RefCounted<CancelInDestructor> {
  public:
-  HelperObject() : next_number_(0) { }
-  int GetNextNumber() { return ++next_number_; }
-  void GetNextNumberArg(int* number) { *number = GetNextNumber(); }
+  CancelInDestructor() : cancelable_task_(NULL) {}
+
+  void Start() {
+    if (cancelable_task_) {
+      ADD_FAILURE();
+      return;
+    }
+    AddRef();
+    cancelable_task_ = NewRunnableMethod(
+        this, &CancelInDestructor::NeverIssuedCallback);
+    Release();
+  }
+
+  CancelableTask* cancelable_task() {
+    return cancelable_task_;
+  }
 
  private:
-  int next_number_;
+  friend class base::RefCounted<CancelInDestructor>;
+
+  ~CancelInDestructor() {
+    if (cancelable_task_)
+      cancelable_task_->Cancel();
+  }
+
+  void NeverIssuedCallback() { NOTREACHED(); }
+
+  CancelableTask* cancelable_task_;
 };
 
+TEST(TaskTest, TestCancelInDestructor) {
+  // Intentionally not using a scoped_refptr for cancel_in_destructor.
+  CancelInDestructor* cancel_in_destructor = new CancelInDestructor();
+  cancel_in_destructor->Start();
+  CancelableTask* cancelable_task = cancel_in_destructor->cancelable_task();
+  ASSERT_TRUE(cancelable_task);
+  delete cancelable_task;
+}
+
 }  // namespace
-
-TEST(Task, OneArg) {
-  HelperObject obj;
-  scoped_ptr<Callback1<int*>::Type> callback(
-      NewCallback(&obj, &HelperObject::GetNextNumberArg));
-
-  int number = 0;
-  callback->Run(&number);
-  EXPECT_EQ(number, 1);
-}
-
-TEST(Task, ReturnValue) {
-  HelperObject obj;
-  scoped_ptr<CallbackWithReturnValue<int>::Type> callback(
-      NewCallbackWithReturnValue(&obj, &HelperObject::GetNextNumber));
-
-  EXPECT_EQ(callback->Run(), 1);
-}

@@ -1,9 +1,11 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.  Use of this
-// source code is governed by a BSD-style license that can be found in the
-// LICENSE file.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
 
 #ifndef NET_FTP_FTP_CTRL_RESPONSE_BUFFER_H_
 #define NET_FTP_FTP_CTRL_RESPONSE_BUFFER_H_
+#pragma once
 
 #include <queue>
 #include <string>
@@ -16,7 +18,8 @@ namespace net {
 struct FtpCtrlResponse {
   static const int kInvalidStatusCode;
 
-  FtpCtrlResponse() : status_code(kInvalidStatusCode) {}
+  FtpCtrlResponse();
+  ~FtpCtrlResponse();
 
   int status_code;                 // Three-digit status code.
   std::vector<std::string> lines;  // Response lines, without CRLFs.
@@ -24,8 +27,8 @@ struct FtpCtrlResponse {
 
 class FtpCtrlResponseBuffer {
  public:
-  FtpCtrlResponseBuffer() : multiline_(false) {
-  }
+  FtpCtrlResponseBuffer();
+  ~FtpCtrlResponseBuffer();
 
   // Called when data is received from the control socket. Returns error code.
   int ConsumeData(const char* data, int data_length);
@@ -36,20 +39,11 @@ class FtpCtrlResponseBuffer {
 
   // Returns the next response. It is an error to call this function
   // unless ResponseAvailable returns true.
-  FtpCtrlResponse PopResponse() {
-    FtpCtrlResponse result = responses_.front();
-    responses_.pop();
-    return result;
-  }
+  FtpCtrlResponse PopResponse();
 
  private:
   struct ParsedLine {
-    ParsedLine()
-        : has_status_code(false),
-          is_multiline(false),
-          is_complete(false),
-          status_code(FtpCtrlResponse::kInvalidStatusCode) {
-    }
+    ParsedLine();
 
     // Indicates that this line begins with a valid 3-digit status code.
     bool has_status_code;

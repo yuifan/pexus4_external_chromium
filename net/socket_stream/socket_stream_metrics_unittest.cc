@@ -1,18 +1,21 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "base/basictypes.h"
-#include "base/histogram.h"
+#include "base/metrics/histogram.h"
 #include "googleurl/src/gurl.h"
 #include "net/socket_stream/socket_stream_metrics.h"
 #include "testing/gtest/include/gtest/gtest.h"
 #include "testing/platform_test.h"
 
+using base::Histogram;
+using base::StatisticsRecorder;
+
 namespace net {
 
 TEST(SocketStreamMetricsTest, Initialize) {
-  if (!StatisticsRecorder::WasStarted()) {
+  if (!StatisticsRecorder::IsActive()) {
     // Create the recorder if not yet started, as SocketStreamMetrics
     // relys on the StatisticsRecorder to be present. This is useful when
     // tests are run with --gtest_filter='SocketStreamMetricsTest*'.
@@ -22,7 +25,7 @@ TEST(SocketStreamMetricsTest, Initialize) {
 }
 
 TEST(SocketStreamMetricsTest, ProtocolType) {
-  scoped_refptr<Histogram> histogram;
+  Histogram* histogram;
 
   // First we'll preserve the original values. We need to do this
   // as histograms can get affected by other tests. In particular,
@@ -54,7 +57,7 @@ TEST(SocketStreamMetricsTest, ProtocolType) {
 }
 
 TEST(SocketStreamMetricsTest, ConnectionType) {
-  scoped_refptr<Histogram> histogram;
+  Histogram* histogram;
 
   // First we'll preserve the original values.
   Histogram::SampleSet original;
@@ -88,7 +91,7 @@ TEST(SocketStreamMetricsTest, ConnectionType) {
 }
 
 TEST(SocketStreamMetricsTest, OtherNumbers) {
-  scoped_refptr<Histogram> histogram;
+  Histogram* histogram;
 
   // First we'll preserve the original values.
   int64 original_received_bytes = 0;

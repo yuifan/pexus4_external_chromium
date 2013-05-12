@@ -1,36 +1,43 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_SOCKET_SSL_CLIENT_SOCKET_MAC_H_
 #define NET_SOCKET_SSL_CLIENT_SOCKET_MAC_H_
+#pragma once
 
 #include <Security/Security.h>
 
 #include <string>
 #include <vector>
 
-#include "base/scoped_ptr.h"
+#include "base/memory/scoped_ptr.h"
 #include "net/base/cert_verify_result.h"
 #include "net/base/completion_callback.h"
+#include "net/base/host_port_pair.h"
+#include "net/base/net_log.h"
 #include "net/base/ssl_config_service.h"
 #include "net/socket/ssl_client_socket.h"
 
 namespace net {
 
 class CertVerifier;
-class LoadLog;
+class ClientSocketHandle;
+class SingleRequestCertVerifier;
 
 // An SSL client socket implemented with Secure Transport.
 class SSLClientSocketMac : public SSLClientSocket {
  public:
-  // Takes ownership of the transport_socket, which may already be connected.
-  // The given hostname will be compared with the name(s) in the server's
-  // certificate during the SSL handshake. ssl_config specifies the SSL
-  // settings.
-  SSLClientSocketMac(ClientSocket* transport_socket,
-                     const std::string& hostname,
-                     const SSLConfig& ssl_config);
+  // Takes ownership of the |transport_socket|, which must already be connected.
+  // The hostname specified in |host_and_port| will be compared with the name(s)
+  // in the server's certificate during the SSL handshake.  If SSL client
+  // authentication is requested, the host_and_port field of SSLCertRequestInfo
+  // will be populated with |host_and_port|.  |ssl_config| specifies
+  // the SSL settings.
+  SSLClientSocketMac(ClientSocketHandle* transport_socket,
+                     const HostPortPair& host_and_port,
+                     const SSLConfig& ssl_config,
+                     CertVerifier* cert_verifier);
   ~SSLClientSocketMac();
 
   // SSLClientSocket methods:
@@ -39,11 +46,21 @@ class SSLClientSocketMac : public SSLClientSocket {
   virtual NextProtoStatus GetNextProto(std::string* proto);
 
   // ClientSocket methods:
-  virtual int Connect(CompletionCallback* callback, LoadLog* load_log);
+  virtual int Connect(CompletionCallback* callback
+#ifdef ANDROID
+                      , bool wait_for_connect
+#endif
+                     );
   virtual void Disconnect();
   virtual bool IsConnected() const;
   virtual bool IsConnectedAndIdle() const;
-  virtual int GetPeerName(struct sockaddr* name, socklen_t* namelen);
+  virtual int GetPeerAddress(AddressList* address) const;
+  virtual int GetLocalAddress(IPEndPoint* address) const;
+  virtual const BoundNetLog& NetLog() const;
+  virtual void SetSubresourceSpeculation();
+  virtual void SetOmniboxSpeculation();
+  virtual bool WasEverUsed() const;
+  virtual bool UsingTCPFastOpen() const;
 
   // Socket methods:
   virtual int Read(IOBuffer* buf, int buf_len, CompletionCallback* callback);
@@ -52,6 +69,9 @@ class SSLClientSocketMac : public SSLClientSocket {
   virtual bool SetSendBufferSize(int32 size);
 
  private:
+  bool completed_handshake() const {
+    return next_handshake_state_ == STATE_COMPLETED_HANDSHAKE;
+  }
   // Initializes the SSLContext.  Returns a net error code.
   int InitializeSSLContext();
 
@@ -66,10 +86,15 @@ class SSLClientSocketMac : public SSLClientSocket {
 
   int DoPayloadRead();
   int DoPayloadWrite();
-  int DoHandshakeStart();
+  int DoHandshake();
   int DoVerifyCert();
   int DoVerifyCertComplete(int result);
-  int DoHandshakeFinish();
+  int DoCompletedRenegotiation(int result);
+
+  void DidCompleteRenegotiation();
+  int DidCompleteHandshake();
+
+  int SetClientCert();
 
   static OSStatus SSLReadCallback(SSLConnectionRef connection,
                                   void* data,
@@ -82,8 +107,8 @@ class SSLClientSocketMac : public SSLClientSocket {
   CompletionCallbackImpl<SSLClientSocketMac> transport_read_callback_;
   CompletionCallbackImpl<SSLClientSocketMac> transport_write_callback_;
 
-  scoped_ptr<ClientSocket> transport_;
-  std::string hostname_;
+  scoped_ptr<ClientSocketHandle> transport_;
+  HostPortPair host_and_port_;
   SSLConfig ssl_config_;
 
   CompletionCallback* user_connect_callback_;
@@ -100,20 +125,38 @@ class SSLClientSocketMac : public SSLClientSocket {
 
   enum State {
     STATE_NONE,
-    STATE_HANDSHAKE_START,
+    STATE_HANDSHAKE,
     STATE_VERIFY_CERT,
     STATE_VERIFY_CERT_COMPLETE,
-    STATE_HANDSHAKE_FINISH,
+    STATE_COMPLETED_RENEGOTIATION,
+    STATE_COMPLETED_HANDSHAKE,
+    // After the handshake, the socket remains in the
+    // STATE_COMPLETED_HANDSHAKE state until renegotiation is requested by
+    // the server. When renegotiation is requested, the state machine
+    // restarts at STATE_HANDSHAKE, advances through to
+    // STATE_VERIFY_CERT_COMPLETE, and then continues to
+    // STATE_COMPLETED_RENEGOTIATION. After STATE_COMPLETED_RENEGOTIATION
+    // has been processed, it goes back to STATE_COMPLETED_HANDSHAKE and
+    // will remain there until the server requests renegotiation again.
+    // During the initial handshake, STATE_COMPLETED_RENEGOTIATION is
+    // skipped.
   };
   State next_handshake_state_;
 
   scoped_refptr<X509Certificate> server_cert_;
-  scoped_ptr<CertVerifier> verifier_;
+  CertVerifier* const cert_verifier_;
+  scoped_ptr<SingleRequestCertVerifier> verifier_;
   CertVerifyResult server_cert_verify_result_;
 
-  bool completed_handshake_;
-  bool handshake_interrupted_;
+  // The initial handshake has already completed, and the current handshake
+  // is server-initiated renegotiation.
+  bool renegotiating_;
+  bool client_cert_requested_;
   SSLContextRef ssl_context_;
+
+  // During a renegotiation, the amount of application data read following
+  // the handshake's completion.
+  size_t bytes_read_after_renegotiation_;
 
   // These buffers hold data retrieved from/sent to the underlying transport
   // before it's fed to the SSL engine.
@@ -125,7 +168,7 @@ class SSLClientSocketMac : public SSLClientSocket {
   scoped_refptr<IOBuffer> read_io_buf_;
   scoped_refptr<IOBuffer> write_io_buf_;
 
-  scoped_refptr<LoadLog> load_log_;
+  BoundNetLog net_log_;
 };
 
 }  // namespace net

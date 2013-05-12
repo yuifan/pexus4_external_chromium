@@ -1,9 +1,10 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2009-2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_DISK_CACHE_SPARSE_CONTROL_H_
 #define NET_DISK_CACHE_SPARSE_CONTROL_H_
+#pragma once
 
 #include <string>
 #include <vector>
@@ -39,18 +40,17 @@ class SparseControl {
     kGetRangeOperation
   };
 
-  explicit SparseControl(EntryImpl* entry)
-      : entry_(entry), child_(NULL), operation_(kNoOperation), init_(false),
-        child_map_(child_data_.bitmap, kNumSparseBits, kNumSparseBits / 32),
-        ALLOW_THIS_IN_INITIALIZER_LIST(
-            child_callback_(this, &SparseControl::OnChildIOCompleted)),
-        user_callback_(NULL) {}
+  explicit SparseControl(EntryImpl* entry);
   ~SparseControl();
 
   // Initializes the object for the current entry. If this entry already stores
   // sparse data, or can be used to do it, it updates the relevant information
   // on disk and returns net::OK. Otherwise it returns a net error code.
   int Init();
+
+  // Performs a quick test to see if the entry is sparse or not, without
+  // generating disk IO (so the answer provided is only a best effort).
+  bool CouldBeSparse() const;
 
   // Performs an actual sparse read or write operation for this entry. |op| is
   // the operation to perform, |offset| is the desired sparse offset, |buf| and
@@ -146,7 +146,7 @@ class SparseControl {
   void DoAbortCallbacks();
 
   EntryImpl* entry_;  // The sparse entry.
-  Entry* child_;  // The current child entry.
+  EntryImpl* child_;  // The current child entry.
   SparseOperation operation_;
   bool pending_;  // True if any child IO operation returned pending.
   bool finished_;

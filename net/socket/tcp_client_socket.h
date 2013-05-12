@@ -4,6 +4,7 @@
 
 #ifndef NET_SOCKET_TCP_CLIENT_SOCKET_H_
 #define NET_SOCKET_TCP_CLIENT_SOCKET_H_
+#pragma once
 
 #include "build/build_config.h"
 
@@ -21,6 +22,13 @@ typedef TCPClientSocketWin TCPClientSocket;
 #elif defined(OS_POSIX)
 typedef TCPClientSocketLibevent TCPClientSocket;
 #endif
+
+// Enable/disable experimental TCP FastOpen option.
+// Not thread safe.  Must be called during initialization/startup only.
+void set_tcp_fastopen_enabled(bool value);
+
+// Check if the TCP FastOpen option is enabled.
+bool is_tcp_fastopen_enabled();
 
 }  // namespace net
 

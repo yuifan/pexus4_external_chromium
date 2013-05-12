@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 //
@@ -30,9 +30,11 @@
 
 #ifndef BASE_JSON_JSON_READER_H_
 #define BASE_JSON_JSON_READER_H_
+#pragma once
 
 #include <string>
 
+#include "base/base_api.h"
 #include "base/basictypes.h"
 
 // Chromium and Chromium OS check out gtest to different places, so we're
@@ -45,7 +47,7 @@ class Value;
 
 namespace base {
 
-class JSONReader {
+class BASE_API JSONReader {
  public:
   // A struct to hold a JS token.
   class Token {
@@ -68,6 +70,11 @@ class JSONReader {
     Token(Type t, const wchar_t* b, int len)
       : type(t), begin(b), length(len) {}
 
+    // Get the character that's one past the end of this token.
+    wchar_t NextChar() {
+      return *(begin + length);
+    }
+
     Type type;
 
     // A pointer into JSONReader::json_pos_ that's the beginning of this token.
@@ -75,14 +82,22 @@ class JSONReader {
 
     // End should be one char past the end of the token.
     int length;
-
-    // Get the character that's one past the end of this token.
-    wchar_t NextChar() {
-      return *(begin + length);
-    }
   };
 
-  // Error messages that can be returned.
+  // Error codes during parsing.
+  enum JsonParseError {
+    JSON_NO_ERROR = 0,
+    JSON_BAD_ROOT_ELEMENT_TYPE,
+    JSON_INVALID_ESCAPE,
+    JSON_SYNTAX_ERROR,
+    JSON_TRAILING_COMMA,
+    JSON_TOO_MUCH_NESTING,
+    JSON_UNEXPECTED_DATA_AFTER_ROOT,
+    JSON_UNSUPPORTED_ENCODING,
+    JSON_UNQUOTED_DICTIONARY_KEY,
+  };
+
+  // String versions of parse error codes.
   static const char* kBadRootElementType;
   static const char* kInvalidEscape;
   static const char* kSyntaxError;
@@ -100,17 +115,26 @@ class JSONReader {
   // objects and arrays even though this goes against the RFC.
   static Value* Read(const std::string& json, bool allow_trailing_comma);
 
-  // Reads and parses |json| like Read(). |error_message_out| is optional. If
-  // specified and NULL is returned, |error_message_out| will be populated with
-  // a string describing the error. Otherwise, |error_message_out| is
-  // unmodified.
+  // Reads and parses |json| like Read(). |error_code_out| and |error_msg_out|
+  // are optional. If specified and NULL is returned, they will be populated
+  // an error code and a formatted error message (including error location if
+  // appropriate). Otherwise, they will be unmodified.
   static Value* ReadAndReturnError(const std::string& json,
                                    bool allow_trailing_comma,
-                                   std::string* error_message_out);
+                                   int* error_code_out,
+                                   std::string* error_msg_out);
 
-  // Returns the error message if the last call to JsonToValue() failed. If the
-  // last call did not fail, returns a valid empty string.
-  std::string error_message() { return error_message_; }
+  // Converts a JSON parse error code into a human readable message.
+  // Returns an empty string if error_code is JSON_NO_ERROR.
+  static std::string ErrorCodeToString(JsonParseError error_code);
+
+  // Returns the error code if the last call to JsonToValue() failed.
+  // Returns JSON_NO_ERROR otherwise.
+  JsonParseError error_code() const { return error_code_; }
+
+  // Converts error_code_ to a human-readable string, including line and column
+  // numbers if appropriate.
+  std::string GetErrorMessage() const;
 
   // Reads and parses |json|, returning a Value. The caller owns the returned
   // instance. If |json| is not a properly formed JSON string, returns NULL and
@@ -123,13 +147,11 @@ class JSONReader {
                      bool allow_trailing_comma);
 
  private:
-  static std::string FormatErrorMessage(int line, int column,
-                                        const char* description);
-
-  DISALLOW_COPY_AND_ASSIGN(JSONReader);
-
   FRIEND_TEST(JSONReaderTest, Reading);
   FRIEND_TEST(JSONReaderTest, ErrorMessages);
+
+  static std::string FormatErrorMessage(int line, int column,
+                                        const std::string& description);
 
   // Recursively build Value.  Returns NULL if we don't have a valid JSON
   // string.  If |is_root| is true, we verify that the root element is either
@@ -170,9 +192,9 @@ class JSONReader {
   // Checks if |json_pos_| matches str.
   bool NextStringMatch(const std::wstring& str);
 
-  // Creates the error message that will be returned to the caller. The current
+  // Sets the error code that will be returned to the caller. The current
   // line and column are determined and added into the final message.
-  void SetErrorMessage(const char* description, const wchar_t* error_pos);
+  void SetErrorCode(const JsonParseError error, const wchar_t* error_pos);
 
   // Pointer to the starting position in the input string.
   const wchar_t* start_pos_;
@@ -186,8 +208,12 @@ class JSONReader {
   // A parser flag that allows trailing commas in objects and arrays.
   bool allow_trailing_comma_;
 
-  // Contains the error message for the last call to JsonToValue(), if any.
-  std::string error_message_;
+  // Contains the error code for the last call to JsonToValue(), if any.
+  JsonParseError error_code_;
+  int error_line_;
+  int error_col_;
+
+  DISALLOW_COPY_AND_ASSIGN(JSONReader);
 };
 
 }  // namespace base

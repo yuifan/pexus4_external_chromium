@@ -1,47 +1,52 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_URL_REQUEST_URL_REQUEST_H_
 #define NET_URL_REQUEST_URL_REQUEST_H_
+#pragma once
 
 #include <map>
 #include <string>
 #include <vector>
 
-#include "base/leak_tracker.h"
-#include "base/linked_list.h"
-#include "base/linked_ptr.h"
+#include "base/debug/leak_tracker.h"
 #include "base/logging.h"
-#include "base/ref_counted.h"
-#include "base/scoped_ptr.h"
+#include "base/memory/linked_ptr.h"
+#include "base/memory/ref_counted.h"
+#include "base/string16.h"
+#include "base/threading/non_thread_safe.h"
 #include "googleurl/src/gurl.h"
-#include "net/base/load_log.h"
+#include "net/base/completion_callback.h"
 #include "net/base/load_states.h"
+#include "net/base/net_export.h"
+#include "net/base/net_log.h"
 #include "net/base/request_priority.h"
+#include "net/http/http_request_headers.h"
 #include "net/http/http_response_info.h"
-#include "net/url_request/request_tracker.h"
 #include "net/url_request/url_request_status.h"
 
 namespace base {
 class Time;
 }  // namespace base
 
-namespace net {
-class IOBuffer;
-class SSLCertRequestInfo;
-class UploadData;
-class X509Certificate;
-}  // namespace net
-
 class FilePath;
-class URLRequestContext;
-class URLRequestJob;
 
 // This stores the values of the Set-Cookie headers received during the request.
 // Each item in the vector corresponds to a Set-Cookie: line received,
 // excluding the "Set-Cookie:" part.
 typedef std::vector<std::string> ResponseCookies;
+
+namespace net {
+
+class CookieOptions;
+class HostPortPair;
+class IOBuffer;
+class SSLCertRequestInfo;
+class UploadData;
+class URLRequestContext;
+class URLRequestJob;
+class X509Certificate;
 
 //-----------------------------------------------------------------------------
 // A class  representing the asynchronous load of a data stream from an URL.
@@ -54,8 +59,23 @@ typedef std::vector<std::string> ResponseCookies;
 //
 // NOTE: All usage of all instances of this class should be on the same thread.
 //
-class URLRequest {
+class NET_EXPORT URLRequest : public base::NonThreadSafe {
  public:
+  // Callback function implemented by protocol handlers to create new jobs.
+  // The factory may return NULL to indicate an error, which will cause other
+  // factories to be queried.  If no factory handles the request, then the
+  // default job will be used.
+  typedef URLRequestJob* (ProtocolFactory)(URLRequest* request,
+                                           const std::string& scheme);
+
+  // HTTP request/response header IDs (via some preprocessor fun) for use with
+  // SetRequestHeaderById and GetResponseHeaderById.
+  enum {
+#define HTTP_ATOM(x) HTTP_ ## x,
+#include "net/http/http_atom_list.h"
+#undef HTTP_ATOM
+  };
+
   // Derive from this class and add your own data members to associate extra
   // information with a URLRequest. Use GetUserData(key) and SetUserData()
   class UserData {
@@ -64,16 +84,9 @@ class URLRequest {
     virtual ~UserData() {}
   };
 
-  // Callback function implemented by protocol handlers to create new jobs.
-  // The factory may return NULL to indicate an error, which will cause other
-  // factories to be queried.  If no factory handles the request, then the
-  // default job will be used.
-  typedef URLRequestJob* (ProtocolFactory)(URLRequest* request,
-                                           const std::string& scheme);
-
   // This class handles network interception.  Use with
   // (Un)RegisterRequestInterceptor.
-  class Interceptor {
+  class NET_EXPORT Interceptor {
   public:
     virtual ~Interceptor() {}
 
@@ -89,9 +102,7 @@ class URLRequest {
     // the delegate never sees the original redirect response, instead the
     // response produced by the intercept job will be returned.
     virtual URLRequestJob* MaybeInterceptRedirect(URLRequest* request,
-                                                  const GURL& location) {
-      return NULL;
-    }
+                                                  const GURL& location);
 
     // Called after having received a final response, but prior to the
     // the request delegate being informed of the response. This is also
@@ -101,9 +112,7 @@ class URLRequest {
     // continue. If a new job is provided, the delegate never sees the original
     // response, instead the response produced by the intercept job will be
     // returned.
-    virtual URLRequestJob* MaybeInterceptResponse(URLRequest* request) {
-      return NULL;
-    }
+    virtual URLRequestJob* MaybeInterceptResponse(URLRequest* request);
   };
 
   // The delegate's methods are called from the message loop of the thread
@@ -112,8 +121,8 @@ class URLRequest {
   //
   // The callbacks will be called in the following order:
   //   Start()
-  //    - OnCertificateRequested* (zero or one call, if the SSL server
-  //      requests a client certificate for authentication)
+  //    - OnCertificateRequested* (zero or more calls, if the SSL server and/or
+  //      SSL proxy requests a client certificate for authentication)
   //    - OnSSLCertificateError* (zero or one call, if the SSL server's
   //      certificate has an error)
   //    - OnReceivedRedirect* (zero or more calls, for the number of redirects)
@@ -129,7 +138,7 @@ class URLRequest {
   // if an error occurred, or if the IO is just pending.  When Read() returns
   // true with zero bytes read, it indicates the end of the response.
   //
-  class Delegate {
+  class NET_EXPORT Delegate {
    public:
     virtual ~Delegate() {}
 
@@ -151,8 +160,7 @@ class URLRequest {
     // deferring redirect.
     virtual void OnReceivedRedirect(URLRequest* request,
                                     const GURL& new_url,
-                                    bool* defer_redirect) {
-    }
+                                    bool* defer_redirect);
 
     // Called when we receive an authentication failure.  The delegate should
     // call request->SetAuth() with the user's credentials once it obtains them,
@@ -160,9 +168,7 @@ class URLRequest {
     // When it does so, the request will be reissued, restarting the sequence
     // of On* callbacks.
     virtual void OnAuthRequired(URLRequest* request,
-                                net::AuthChallengeInfo* auth_info) {
-      request->CancelAuth();
-    }
+                                AuthChallengeInfo* auth_info);
 
     // Called when we receive an SSL CertificateRequest message for client
     // authentication.  The delegate should call
@@ -171,21 +177,30 @@ class URLRequest {
     // handshake without a client certificate.
     virtual void OnCertificateRequested(
         URLRequest* request,
-        net::SSLCertRequestInfo* cert_request_info) {
-      request->ContinueWithCertificate(NULL);
-    }
+        SSLCertRequestInfo* cert_request_info);
 
     // Called when using SSL and the server responds with a certificate with
     // an error, for example, whose common name does not match the common name
     // we were expecting for that host.  The delegate should either do the
     // safe thing and Cancel() the request or decide to proceed by calling
-    // ContinueDespiteLastError().  cert_error is a net::ERR_* error code
+    // ContinueDespiteLastError().  cert_error is a ERR_* error code
     // indicating what's wrong with the certificate.
     virtual void OnSSLCertificateError(URLRequest* request,
                                        int cert_error,
-                                       net::X509Certificate* cert) {
-      request->Cancel();
-    }
+                                       X509Certificate* cert);
+
+    // Called when reading cookies. |blocked_by_policy| is true if access to
+    // cookies was denied due to content settings. This method will never be
+    // invoked when LOAD_DO_NOT_SEND_COOKIES is specified.
+    virtual void OnGetCookies(URLRequest* request, bool blocked_by_policy);
+
+    // Called when a cookie is set. |blocked_by_policy| is true if the cookie
+    // was rejected due to content settings. This method will never be invoked
+    // when LOAD_DO_NOT_SAVE_COOKIES is specified.
+    virtual void OnSetCookie(URLRequest* request,
+                             const std::string& cookie_line,
+                             const CookieOptions& options,
+                             bool blocked_by_policy);
 
     // After calling Start(), the delegate will receive an OnResponseStarted
     // callback when the request has completed.  If an error occurred, the
@@ -247,12 +262,22 @@ class URLRequest {
   // Returns true if the url can be handled by URLRequest. False otherwise.
   // The function returns true for invalid urls because URLRequest knows how
   // to handle those.
+  // NOTE: This will also return true for URLs that are handled by
+  // ProtocolFactories that only work for requests that are scoped to a
+  // Profile.
   static bool IsHandledURL(const GURL& url);
+
+  // Allow access to file:// on ChromeOS for tests.
+  static void AllowFileAccess();
+  static bool IsFileAccessAllowed();
 
   // The original url is the url used to initialize the request, and it may
   // differ from the url if the request was redirected.
-  const GURL& original_url() const { return original_url_; }
-  const GURL& url() const { return url_; }
+  const GURL& original_url() const { return url_chain_.front(); }
+  // The chain of urls traversed by this request.  If the request had no
+  // redirects, this vector will contain one element.
+  const std::vector<GURL>& url_chain() const { return url_chain_; }
+  const GURL& url() const { return url_chain_.back(); }
 
   // The URL that should be consulted for the third-party cookie blocking
   // policy.
@@ -292,19 +317,36 @@ class URLRequest {
   //
   // When uploading data, bytes_len must be non-zero.
   // When uploading a file range, length must be non-zero. If length
-  // exceeds the end-of-file, the upload is clipped at end-of-file.
-  void AppendBytesToUpload(const char* bytes, int bytes_len);
+  // exceeds the end-of-file, the upload is clipped at end-of-file. If the
+  // expected modification time is provided (non-zero), it will be used to
+  // check if the underlying file has been changed or not. The granularity of
+  // the time comparison is 1 second since time_t precision is used in WebKit.
+  void AppendBytesToUpload(const char* bytes, int bytes_len);  // takes a copy
   void AppendFileRangeToUpload(const FilePath& file_path,
-                               uint64 offset, uint64 length);
+                               uint64 offset, uint64 length,
+                               const base::Time& expected_modification_time);
   void AppendFileToUpload(const FilePath& file_path) {
-    AppendFileRangeToUpload(file_path, 0, kuint64max);
+    AppendFileRangeToUpload(file_path, 0, kuint64max, base::Time());
   }
 
+  // Indicates that the request body should be sent using chunked transfer
+  // encoding. This method may only be called before Start() is called.
+  void EnableChunkedUpload();
+
+  // Appends the given bytes to the request's upload data to be sent
+  // immediately via chunked transfer encoding. When all data has been sent,
+  // call MarkEndOfChunks() to indicate the end of upload data.
+  //
+  // This method may be called only after calling EnableChunkedUpload().
+  void AppendChunkToUpload(const char* bytes,
+                           int bytes_len,
+                           bool is_last_chunk);
+
   // Set the upload data directly.
-  void set_upload(net::UploadData* upload);
+  void set_upload(UploadData* upload);
 
   // Get the upload data directly.
-  net::UploadData* get_upload();
+  UploadData* get_upload();
 
   // Returns true if the request has a non-empty message body to upload.
   bool has_upload() const;
@@ -316,20 +358,17 @@ class URLRequest {
   void SetExtraRequestHeaderByName(const std::string& name,
                                    const std::string& value, bool overwrite);
 
-  // Sets all extra request headers, from a \r\n-delimited string.  Any extra
-  // request headers set by other methods are overwritten by this method.  This
-  // method may only be called before Start() is called.  It is an error to
-  // call it later.
-  //
-  // Note: \r\n is only used to separate the headers in the string if there
-  // are multiple headers.  The last header in the string must not be followed
-  // by \r\n.
-  void SetExtraRequestHeaders(const std::string& headers);
+  // Sets all extra request headers.  Any extra request headers set by other
+  // methods are overwritten by this method.  This method may only be called
+  // before Start() is called.  It is an error to call it later.
+  void SetExtraRequestHeaders(const HttpRequestHeaders& headers);
 
-  const std::string& extra_request_headers() { return extra_request_headers_; }
+  const HttpRequestHeaders& extra_request_headers() const {
+    return extra_request_headers_;
+  }
 
   // Returns the current load state for the request.
-  net::LoadState GetLoadState() const;
+  LoadState GetLoadState() const;
 
   // Returns the current upload progress in bytes.
   uint64 GetUploadProgress() const;
@@ -362,17 +401,33 @@ class URLRequest {
   // Indicate if this response was fetched from disk cache.
   bool was_cached() const { return response_info_.was_cached; }
 
-  // Returns true if the URLRequest was delivered with SPDY.
+  // True if response could use alternate protocol. However, browser will
+  // ignore the alternate protocol if spdy is not enabled.
   bool was_fetched_via_spdy() const {
     return response_info_.was_fetched_via_spdy;
   }
 
+  // Returns true if the URLRequest was delivered after NPN is negotiated,
+  // using either SPDY or HTTP.
+  bool was_npn_negotiated() const {
+    return response_info_.was_npn_negotiated;
+  }
+
+  // Returns true if the URLRequest was delivered through a proxy.
+  bool was_fetched_via_proxy() const {
+    return response_info_.was_fetched_via_proxy;
+  }
+
+  // Returns the host and port that the content was fetched from.  See
+  // http_response_info.h for caveats relating to cached content.
+  HostPortPair GetSocketAddress() const;
+
   // Get all response headers, as a HttpResponseHeaders object.  See comments
   // in HttpResponseHeaders class as to the format of the data.
-  net::HttpResponseHeaders* response_headers() const;
+  HttpResponseHeaders* response_headers() const;
 
   // Get the SSL connection info.
-  const net::SSLInfo& ssl_info() const {
+  const SSLInfo& ssl_info() const {
     return response_info_.ssl_info;
   }
 
@@ -396,9 +451,9 @@ class URLRequest {
   int GetResponseCode();
 
   // Get the HTTP response info in its entirety.
-  const net::HttpResponseInfo& response_info() const { return response_info_; }
+  const HttpResponseInfo& response_info() const { return response_info_; }
 
-  // Access the net::LOAD_* flags modifying this request (see load_flags.h).
+  // Access the LOAD_* flags modifying this request (see load_flags.h).
   int load_flags() const { return load_flags_; }
   void set_load_flags(int flags) { load_flags_ = flags; }
 
@@ -406,10 +461,11 @@ class URLRequest {
   // and the response has not yet been called).
   bool is_pending() const { return is_pending_; }
 
-  // Returns the error status of the request.  This value is 0 if there is no
-  // error.  Otherwise, it is a value defined by the operating system (e.g., an
-  // error code returned by GetLastError() on windows).
+  // Returns the error status of the request.
   const URLRequestStatus& status() const { return status_; }
+
+  // Returns a globally unique identifier for this request.
+  uint64 identifier() const { return identifier_; }
 
   // This method is called to start the request.  The delegate will receive
   // a OnResponseStarted callback when the request is started.
@@ -419,7 +475,8 @@ class URLRequest {
   // cancel the request.  This method may be called many times, and it has
   // no effect once the response has completed.  It is guaranteed that no
   // methods of the delegate will be called after the request has been
-  // cancelled, including during the call to Cancel itself.
+  // cancelled, except that this may call the delegate's OnReadCompleted()
+  // during the call to Cancel itself.
   void Cancel();
 
   // Cancels the request and sets the error to |os_error| (see net_error_list.h
@@ -430,7 +487,7 @@ class URLRequest {
   // for values) and attaches |ssl_info| as the SSLInfo for that request.  This
   // is useful to attach a certificate and certificate error to a canceled
   // request.
-  void SimulateSSLError(int os_error, const net::SSLInfo& ssl_info);
+  void SimulateSSLError(int os_error, const SSLInfo& ssl_info);
 
   // Read initiates an asynchronous read from the response, and must only
   // be called after the OnResponseStarted callback is received with a
@@ -454,7 +511,14 @@ class URLRequest {
   //
   // If a read error occurs, Read returns false and the request->status
   // will be set to an error.
-  bool Read(net::IOBuffer* buf, int max_bytes, int *bytes_read);
+  bool Read(IOBuffer* buf, int max_bytes, int* bytes_read);
+
+  // If this request is being cached by the HTTP cache, stop subsequent caching.
+  // Note that this method has no effect on other (simultaneous or not) requests
+  // for the same resource. The typical example is a request that results in
+  // the data being stored to disk (downloaded instead of rendered) so we don't
+  // want to store it twice.
+  void StopCaching();
 
   // This method may be called to follow a redirect that was deferred in
   // response to an OnReceivedRedirect call.
@@ -464,47 +528,38 @@ class URLRequest {
   // OnAuthRequired() callback (and only then).
   // SetAuth will reissue the request with the given credentials.
   // CancelAuth will give up and display the error page.
-  void SetAuth(const std::wstring& username, const std::wstring& password);
+  void SetAuth(const string16& username, const string16& password);
   void CancelAuth();
 
   // This method can be called after the user selects a client certificate to
   // instruct this URLRequest to continue with the request with the
   // certificate.  Pass NULL if the user doesn't have a client certificate.
-  void ContinueWithCertificate(net::X509Certificate* client_cert);
+  void ContinueWithCertificate(X509Certificate* client_cert);
 
   // This method can be called after some error notifications to instruct this
   // URLRequest to ignore the current error and continue with the request.  To
   // cancel the request instead, call Cancel().
   void ContinueDespiteLastError();
 
-  // HTTP request/response header IDs (via some preprocessor fun) for use with
-  // SetRequestHeaderById and GetResponseHeaderById.
-  enum {
-#define HTTP_ATOM(x) HTTP_ ## x,
-#include "net/http/http_atom_list.h"
-#undef HTTP_ATOM
-  };
-
-  // Returns true if performance profiling should be enabled on the
-  // URLRequestJob serving this request.
-  bool enable_profiling() const { return enable_profiling_; }
-
-  void set_enable_profiling(bool profiling) { enable_profiling_ = profiling; }
-
   // Used to specify the context (cookie store, cache) for this request.
-  URLRequestContext* context();
+  URLRequestContext* context() const;
   void set_context(URLRequestContext* context);
 
-  net::LoadLog* load_log() { return load_log_; }
+  const BoundNetLog& net_log() const { return net_log_; }
 
   // Returns the expected content size if available
   int64 GetExpectedContentSize() const;
 
   // Returns the priority level for this request.
-  net::RequestPriority priority() const { return priority_; }
-  void set_priority(net::RequestPriority priority) {
-    DCHECK_GE(priority, net::HIGHEST);
-    DCHECK_LE(priority, net::LOWEST);
+  RequestPriority priority() const { return priority_; }
+  void set_priority(RequestPriority priority) {
+#ifdef ANDROID
+    DCHECK_GE(static_cast<int>(priority), static_cast<int>(HIGHEST));
+    DCHECK_LT(static_cast<int>(priority), static_cast<int>(NUM_PRIORITIES));
+#else
+    DCHECK_GE(priority, HIGHEST);
+    DCHECK_LT(priority, NUM_PRIORITIES);
+#endif
     priority_ = priority;
   }
 
@@ -519,7 +574,7 @@ class URLRequest {
   // Allow the URLRequestJob class to set our status too
   void set_status(const URLRequestStatus& value) { status_ = value; }
 
-  // Allow the URLRequestJob to redirect this request.  Returns net::OK if
+  // Allow the URLRequestJob to redirect this request.  Returns OK if
   // successful, otherwise an error code is returned.
   int Redirect(const GURL& location, int http_status_code);
 
@@ -531,18 +586,27 @@ class URLRequest {
   void ResponseStarted();
 
   // Allow an interceptor's URLRequestJob to restart this request.
-  // Should only be called if the original job has not started a resposne.
+  // Should only be called if the original job has not started a response.
   void Restart();
 
  private:
   friend class URLRequestJob;
-  friend class RequestTracker<URLRequest>;
+  typedef std::map<const void*, linked_ptr<UserData> > UserDataMap;
+
+  void StartInternal();
+
+  // Resumes or blocks a request paused by the NetworkDelegate::OnBeforeRequest
+  // handler. If |blocked| is true, the request is blocked and an error page is
+  // returned indicating so. This should only be called after Start is called
+  // and OnBeforeRequest returns true (signalling that the request should be
+  // paused).
+  void BeforeRequestComplete(int error);
 
   void StartJob(URLRequestJob* job);
 
   // Restarting involves replacing the current job with a new one such as what
   // happens when following a HTTP redirect.
-  void RestartWithJob(URLRequestJob *job);
+  void RestartWithJob(URLRequestJob* job);
   void PrepareToRestart();
 
   // Detaches the job from this request in preparation for this object going
@@ -552,33 +616,24 @@ class URLRequest {
 
   // Cancels the request and set the error and ssl info for this request to the
   // passed values.
-  void DoCancel(int os_error, const net::SSLInfo& ssl_info);
-
-  // Discard headers which have meaning in POST (Content-Length, Content-Type,
-  // Origin).
-  static std::string StripPostSpecificHeaders(const std::string& headers);
-
-  // Gets the goodies out of this that we want to show the user later on the
-  // chrome://net-internals/ page.
-  void GetInfoForTracker(
-      RequestTracker<URLRequest>::RecentRequestInfo* info) const;
+  void DoCancel(int os_error, const SSLInfo& ssl_info);
 
   // Contextual information used for this request (can be NULL). This contains
   // most of the dependencies which are shared between requests (disk cache,
-  // cookie store, socket poool, etc.)
+  // cookie store, socket pool, etc.)
   scoped_refptr<URLRequestContext> context_;
 
   // Tracks the time spent in various load states throughout this request.
-  scoped_refptr<net::LoadLog> load_log_;
+  BoundNetLog net_log_;
 
   scoped_refptr<URLRequestJob> job_;
-  scoped_refptr<net::UploadData> upload_;
-  GURL url_;
-  GURL original_url_;
+  scoped_refptr<UploadData> upload_;
+  std::vector<GURL> url_chain_;
   GURL first_party_for_cookies_;
+  GURL delegate_redirect_url_;
   std::string method_;  // "GET", "POST", etc. Should be all uppercase.
   std::string referrer_;
-  std::string extra_request_headers_;
+  HttpRequestHeaders extra_request_headers_;
   int load_flags_;  // Flags indicating the request type for the load;
                     // expected values are LOAD_* enums above.
 
@@ -590,7 +645,7 @@ class URLRequest {
   URLRequestStatus status_;
 
   // The HTTP response info, lazily initialized.
-  net::HttpResponseInfo response_info_;
+  HttpResponseInfo response_info_;
 
   // Tells us whether the job is outstanding. This is true from the time
   // Start() is called to the time we dispatch RequestComplete and indicates
@@ -598,11 +653,7 @@ class URLRequest {
   bool is_pending_;
 
   // Externally-defined data accessible by key
-  typedef std::map<const void*, linked_ptr<UserData> > UserDataMap;
   UserDataMap user_data_;
-
-  // Whether to enable performance profiling on the job serving this request.
-  bool enable_profiling_;
 
   // Number of times we're willing to redirect.  Used to guard against
   // infinite redirects.
@@ -614,12 +665,20 @@ class URLRequest {
 
   // The priority level for this request.  Objects like ClientSocketPool use
   // this to determine which URLRequest to allocate sockets to first.
-  net::RequestPriority priority_;
+  RequestPriority priority_;
 
-  RequestTracker<URLRequest>::Node request_tracker_node_;
-  base::LeakTracker<URLRequest> leak_tracker_;
+  // A globally unique identifier for this request.
+  const uint64 identifier_;
+
+  base::debug::LeakTracker<URLRequest> leak_tracker_;
+
+  // Callback passed to the network delegate to notify us when a blocked request
+  // is ready to be resumed or canceled.
+  CompletionCallbackImpl<URLRequest> before_request_callback_;
 
   DISALLOW_COPY_AND_ASSIGN(URLRequest);
 };
+
+}  // namespace net
 
 #endif  // NET_URL_REQUEST_URL_REQUEST_H_

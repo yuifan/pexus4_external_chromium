@@ -4,6 +4,7 @@
 
 #ifndef BASE_FORMAT_MACROS_H_
 #define BASE_FORMAT_MACROS_H_
+#pragma once
 
 // This file defines the format macros for some integer types.
 
@@ -42,7 +43,9 @@
 #define WidePRIu64 PRIu64
 #define WidePRIx64 PRIx64
 
+#if !defined(PRIuS)
 #define PRIuS "zu"
+#endif
 
 #else  // OS_WIN
 
@@ -62,8 +65,10 @@
 #define WidePRIu64 L"I64u"
 #define WidePRIx64 L"I64x"
 
+#if !defined(PRIuS)
 #define PRIuS "Iu"
+#endif
 
 #endif
 
-#endif  // !BASE_FORMAT_MACROS_H_
+#endif  // BASE_FORMAT_MACROS_H_

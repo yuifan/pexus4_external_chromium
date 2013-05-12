@@ -1,18 +1,20 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_PROXY_PROXY_CONFIG_SERVICE_LINUX_H_
 #define NET_PROXY_PROXY_CONFIG_SERVICE_LINUX_H_
+#pragma once
 
 #include <string>
 #include <vector>
 
 #include "base/basictypes.h"
-#include "base/linux_util.h"
+#include "base/environment.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/scoped_ptr.h"
 #include "base/message_loop.h"
-#include "base/ref_counted.h"
-#include "base/scoped_ptr.h"
+#include "base/observer_list.h"
 #include "net/proxy/proxy_config.h"
 #include "net/proxy/proxy_config_service.h"
 #include "net/proxy/proxy_server.h"
@@ -59,7 +61,7 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
     virtual MessageLoop* GetNotificationLoop() = 0;
 
     // Returns the data source's name (e.g. "gconf", "KDE", "test").
-    // Used only for diagnostic purposes (e.g. LOG(INFO) etc.).
+    // Used only for diagnostic purposes (e.g. VLOG(1) etc.).
     virtual const char* GetDataSource() = 0;
 
     // Gets a string type value from gconf and stores it in
@@ -76,22 +78,32 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
     virtual bool GetStringList(const char* key,
                                std::vector<std::string>* result) = 0;
 
+    // Returns true if the bypass list should be interpreted as a proxy
+    // whitelist rather than blacklist. (This is KDE-specific.)
+    virtual bool BypassListIsReversed() = 0;
+
+    // Returns true if the bypass rules should be interpreted as
+    // suffix-matching rules.
+    virtual bool MatchHostsUsingSuffixMatching() = 0;
+
    private:
     DISALLOW_COPY_AND_ASSIGN(GConfSettingGetter);
   };
 
   // ProxyConfigServiceLinux is created on the UI thread, and
   // SetupAndFetchInitialConfig() is immediately called to
-  // synchronously fetch the original configuration and setup gconf
+  // synchronously fetch the original configuration and set up gconf
   // notifications on the UI thread.
   //
-  // Passed that point, it is accessed periodically through
-  // GetProxyConfig() from the IO thread.
+  // Past that point, it is accessed periodically through the
+  // ProxyConfigService interface (GetLatestProxyConfig, AddObserver,
+  // RemoveObserver) from the IO thread.
   //
   // gconf change notification callbacks can occur at any time and are
   // run on the UI thread. The new gconf settings are fetched on the
   // UI thread, and the new resulting proxy config is posted to the IO
-  // thread through Delegate::SetNewProxyConfig().
+  // thread through Delegate::SetNewProxyConfig(). We then notify
+  // observers on the IO thread of the configuration change.
   //
   // ProxyConfigServiceLinux is deleted from the IO thread.
   //
@@ -105,10 +117,10 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
    public:
     // Constructor receives env var getter implementation to use, and
     // takes ownership of it. This is the normal constructor.
-    explicit Delegate(base::EnvironmentVariableGetter* env_var_getter);
+    explicit Delegate(base::Environment* env_var_getter);
     // Constructor receives gconf and env var getter implementations
     // to use, and takes ownership of them. Used for testing.
-    Delegate(base::EnvironmentVariableGetter* env_var_getter,
+    Delegate(base::Environment* env_var_getter,
              GConfSettingGetter* gconf_getter);
     // Synchronously obtains the proxy configuration. If gconf is
     // used, also enables gconf notification for setting
@@ -130,7 +142,10 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
     void OnCheckProxyConfigSettings();
 
     // Called from IO thread.
-    int GetProxyConfig(ProxyConfig* config);
+    void AddObserver(Observer* observer);
+    void RemoveObserver(Observer* observer);
+    ProxyConfigService::ConfigAvailability GetLatestProxyConfig(
+        ProxyConfig* config);
 
     // Posts a call to OnDestroy() to the UI thread. Called from
     // ProxyConfigServiceLinux's destructor.
@@ -141,7 +156,7 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
    private:
     friend class base::RefCountedThreadSafe<Delegate>;
 
-    ~Delegate() {}
+    ~Delegate();
 
     // Obtains an environment variable's value. Parses a proxy server
     // specification from it and puts it in result. Returns true if the
@@ -168,11 +183,11 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
     // carry the new config information.
     void SetNewProxyConfig(const ProxyConfig& new_config);
 
-    scoped_ptr<base::EnvironmentVariableGetter> env_var_getter_;
+    scoped_ptr<base::Environment> env_var_getter_;
     scoped_ptr<GConfSettingGetter> gconf_getter_;
 
     // Cached proxy configuration, to be returned by
-    // GetProxyConfig. Initially populated from the UI thread, but
+    // GetLatestProxyConfig. Initially populated from the UI thread, but
     // afterwards only accessed from the IO thread.
     ProxyConfig cached_config_;
 
@@ -191,9 +206,11 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
     // this thread. Since gconf is not thread safe, any use of gconf
     // must be done on the thread running this loop.
     MessageLoop* glib_default_loop_;
-    // MessageLoop for the IO thread. GetProxyConfig() is called from
+    // MessageLoop for the IO thread. GetLatestProxyConfig() is called from
     // the thread running this loop.
     MessageLoop* io_loop_;
+
+    ObserverList<Observer> observers_;
 
     DISALLOW_COPY_AND_ASSIGN(Delegate);
   };
@@ -203,14 +220,11 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
   // Usual constructor
   ProxyConfigServiceLinux();
   // For testing: take alternate gconf and env var getter implementations.
-  explicit ProxyConfigServiceLinux(
-      base::EnvironmentVariableGetter* env_var_getter);
-  ProxyConfigServiceLinux(base::EnvironmentVariableGetter* env_var_getter,
+  explicit ProxyConfigServiceLinux(base::Environment* env_var_getter);
+  ProxyConfigServiceLinux(base::Environment* env_var_getter,
                           GConfSettingGetter* gconf_getter);
 
-  virtual ~ProxyConfigServiceLinux() {
-    delegate_->PostDestroyTask();
-  }
+  virtual ~ProxyConfigServiceLinux();
 
   void SetupAndFetchInitialConfig(MessageLoop* glib_default_loop,
                                   MessageLoop* io_loop,
@@ -224,9 +238,10 @@ class ProxyConfigServiceLinux : public ProxyConfigService {
 
   // ProxyConfigService methods:
   // Called from IO thread.
-  virtual int GetProxyConfig(ProxyConfig* config) {
-    return delegate_->GetProxyConfig(config);
-  }
+  virtual void AddObserver(Observer* observer);
+  virtual void RemoveObserver(Observer* observer);
+  virtual ProxyConfigService::ConfigAvailability GetLatestProxyConfig(
+      ProxyConfig* config);
 
  private:
   scoped_refptr<Delegate> delegate_;

@@ -1,109 +1,96 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "base/file_version_info.h"
+#include "base/file_version_info_mac.h"
 
-#import <Cocoa/Cocoa.h>
+#import <Foundation/Foundation.h>
 
 #include "base/file_path.h"
 #include "base/logging.h"
-#include "base/string_util.h"
-#include "base/utf_string_conversions.h"
+#include "base/mac/mac_util.h"
+#include "base/sys_string_conversions.h"
 
-FileVersionInfo::FileVersionInfo(NSBundle *bundle) : bundle_(bundle) {
-  [bundle_ retain];
+FileVersionInfoMac::FileVersionInfoMac(NSBundle *bundle)
+    : bundle_([bundle retain]) {
 }
 
-FileVersionInfo::~FileVersionInfo() {
-  [bundle_ release];
-}
+FileVersionInfoMac::~FileVersionInfoMac() {}
 
 // static
 FileVersionInfo* FileVersionInfo::CreateFileVersionInfoForCurrentModule() {
-  // TODO(erikkay): this should really use bundleForClass, but we don't have
-  // a class to hang onto yet.
-  NSBundle* bundle = [NSBundle mainBundle];
-  return new FileVersionInfo(bundle);
-}
-
-// static
-FileVersionInfo* FileVersionInfo::CreateFileVersionInfo(
-    const std::wstring& file_path) {
-  NSString* path = [NSString stringWithCString:
-      reinterpret_cast<const char*>(file_path.c_str())
-        encoding:NSUTF32StringEncoding];
-  return new FileVersionInfo([NSBundle bundleWithPath:path]);
+  return CreateFileVersionInfo(base::mac::MainAppBundlePath());
 }
 
 // static
 FileVersionInfo* FileVersionInfo::CreateFileVersionInfo(
     const FilePath& file_path) {
-  NSString* path = [NSString stringWithUTF8String:file_path.value().c_str()];
-  return new FileVersionInfo([NSBundle bundleWithPath:path]);
+  NSString* path = base::SysUTF8ToNSString(file_path.value());
+  NSBundle* bundle = [NSBundle bundleWithPath:path];
+  return new FileVersionInfoMac(bundle);
 }
 
-std::wstring FileVersionInfo::company_name() {
-  return std::wstring();
+string16 FileVersionInfoMac::company_name() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::company_short_name() {
-  return std::wstring();
+string16 FileVersionInfoMac::company_short_name() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::internal_name() {
-  return std::wstring();
+string16 FileVersionInfoMac::internal_name() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::product_name() {
-  return GetStringValue(L"CFBundleName");
+string16 FileVersionInfoMac::product_name() {
+  return GetString16Value(kCFBundleNameKey);
 }
 
-std::wstring FileVersionInfo::product_short_name() {
-  return GetStringValue(L"CFBundleName");
+string16 FileVersionInfoMac::product_short_name() {
+  return GetString16Value(kCFBundleNameKey);
 }
 
-std::wstring FileVersionInfo::comments() {
-  return std::wstring();
+string16 FileVersionInfoMac::comments() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::legal_copyright() {
-  return GetStringValue(L"CFBundleGetInfoString");
+string16 FileVersionInfoMac::legal_copyright() {
+  return GetString16Value(CFSTR("CFBundleGetInfoString"));
 }
 
-std::wstring FileVersionInfo::product_version() {
-  return GetStringValue(L"CFBundleShortVersionString");
+string16 FileVersionInfoMac::product_version() {
+  return GetString16Value(CFSTR("CFBundleShortVersionString"));
 }
 
-std::wstring FileVersionInfo::file_description() {
-  return std::wstring();
+string16 FileVersionInfoMac::file_description() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::legal_trademarks() {
-  return std::wstring();
+string16 FileVersionInfoMac::legal_trademarks() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::private_build() {
-  return std::wstring();
+string16 FileVersionInfoMac::private_build() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::file_version() {
+string16 FileVersionInfoMac::file_version() {
   return product_version();
 }
 
-std::wstring FileVersionInfo::original_filename() {
-  return GetStringValue(L"CFBundleName");
+string16 FileVersionInfoMac::original_filename() {
+  return GetString16Value(kCFBundleNameKey);
 }
 
-std::wstring FileVersionInfo::special_build() {
-  return std::wstring();
+string16 FileVersionInfoMac::special_build() {
+  return string16();
 }
 
-std::wstring FileVersionInfo::last_change() {
-  return GetStringValue(L"SVNRevision");
+string16 FileVersionInfoMac::last_change() {
+  return GetString16Value(CFSTR("SVNRevision"));
 }
 
-bool FileVersionInfo::is_official_build() {
+bool FileVersionInfoMac::is_official_build() {
 #if defined (GOOGLE_CHROME_BUILD)
   return true;
 #else
@@ -111,22 +98,13 @@ bool FileVersionInfo::is_official_build() {
 #endif
 }
 
-bool FileVersionInfo::GetValue(const wchar_t* name, std::wstring* value_str) {
+string16 FileVersionInfoMac::GetString16Value(CFStringRef name) {
   if (bundle_) {
-    NSString* value = [bundle_ objectForInfoDictionaryKey:
-        [NSString stringWithUTF8String:WideToUTF8(name).c_str()]];
+    NSString *ns_name = base::mac::CFToNSCast(name);
+    NSString* value = [bundle_ objectForInfoDictionaryKey:ns_name];
     if (value) {
-      *value_str = reinterpret_cast<const wchar_t*>(
-          [value cStringUsingEncoding:NSUTF32StringEncoding]);
-      return true;
+      return base::SysNSStringToUTF16(value);
     }
   }
-  return false;
-}
-
-std::wstring FileVersionInfo::GetStringValue(const wchar_t* name) {
-  std::wstring str;
-  if (GetValue(name, &str))
-    return str;
-  return std::wstring();
+  return string16();
 }

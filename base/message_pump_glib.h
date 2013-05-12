@@ -1,13 +1,14 @@
-// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_MESSAGE_PUMP_GLIB_H_
 #define BASE_MESSAGE_PUMP_GLIB_H_
+#pragma once
 
+#include "base/memory/scoped_ptr.h"
 #include "base/message_pump.h"
 #include "base/observer_list.h"
-#include "base/scoped_ptr.h"
 #include "base/time.h"
 
 typedef union _GdkEvent GdkEvent;
@@ -56,10 +57,10 @@ class MessagePumpForUI : public MessagePump {
   // Like MessagePump::Run, but GdkEvent objects are routed through dispatcher.
   virtual void RunWithDispatcher(Delegate* delegate, Dispatcher* dispatcher);
 
-  virtual void Run(Delegate* delegate) { RunWithDispatcher(delegate, NULL); }
-  virtual void Quit();
-  virtual void ScheduleWork();
-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
+  // Run a single iteration of the mainloop. A return value of true indicates
+  // that an event was handled. |block| indicates if it should wait if no event
+  // is ready for processing.
+  virtual bool RunOnce(GMainContext* context, bool block);
 
   // Internal methods used for processing the pump callbacks.  They are
   // public for simplicity but should not be used directly.  HandlePrepare
@@ -78,24 +79,24 @@ class MessagePumpForUI : public MessagePump {
   // receiving a notification callback.
   void RemoveObserver(Observer* observer);
 
+  // Dispatch an available GdkEvent. Essentially this allows a subclass to do
+  // some task before/after calling the default handler (EventDispatcher).
+  virtual void DispatchEvents(GdkEvent* event);
+
+  // Overridden from MessagePump:
+  virtual void Run(Delegate* delegate);
+  virtual void Quit();
+  virtual void ScheduleWork();
+  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
+
+ protected:
+  // Returns the dispatcher for the current run state (|state_->dispatcher|).
+  Dispatcher* GetDispatcher();
+
  private:
   // We may make recursive calls to Run, so we save state that needs to be
   // separate between them in this structure type.
-  struct RunState {
-    Delegate* delegate;
-    Dispatcher* dispatcher;
-
-    // Used to flag that the current Run() invocation should return ASAP.
-    bool should_quit;
-
-    // Used to count how many Run() invocations are on the stack.
-    int run_depth;
-
-    // This keeps the state of whether the pump got signaled that there was new
-    // work to be done. Since we eat the message on the wake up pipe as soon as
-    // we get it, we keep that state here to stay consistent.
-    bool has_work;
-  };
+  struct RunState;
 
   // Invoked from EventDispatcher. Notifies all observers we're about to
   // process an event.
@@ -116,7 +117,7 @@ class MessagePumpForUI : public MessagePump {
   GMainContext* context_;
 
   // This is the time when we need to do delayed work.
-  Time delayed_work_time_;
+  TimeTicks delayed_work_time_;
 
   // The work source.  It is shared by all calls to Run and destroyed when
   // the message pump is destroyed.

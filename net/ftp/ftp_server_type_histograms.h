@@ -4,6 +4,7 @@
 
 #ifndef NET_FTP_FTP_SERVER_TYPE_HISTOGRAMS_H_
 #define NET_FTP_FTP_SERVER_TYPE_HISTOGRAMS_H_
+#pragma once
 
 // The UpdateFtpServerTypeHistograms function collects statistics related
 // to the types of FTP servers that our users are encountering.
@@ -23,7 +24,8 @@ enum FtpServerType {
   SERVER_WINDOWS = 10,  // Server using Windows listing style.
   SERVER_VMS = 11,      // Server using VMS listing style.
   SERVER_NETWARE = 12,  // Server using Netware listing style.
-  SERVER_MLSD = 13,     // Server using MLSD listing (RFC-3659).
+
+  // Types 13-14 are RESERVED (were earlier used for MLSD listings).
 
   NUM_OF_SERVER_TYPES
 };

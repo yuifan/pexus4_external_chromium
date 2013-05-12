@@ -19,51 +19,21 @@ volatile bool g_cache_tests_error;
 // Implementation of FileIOCallback for the tests.
 class FileCallbackTest: public disk_cache::FileIOCallback {
  public:
-  explicit FileCallbackTest(int id) : id_(id), reuse_(0) {}
-  explicit FileCallbackTest(int id, bool reuse)
-      : id_(id), reuse_(reuse_ ? 0 : 1) {}
+  explicit FileCallbackTest(int id) : id_(id) {}
   ~FileCallbackTest() {}
 
   virtual void OnFileIOComplete(int bytes_copied);
  private:
   int id_;
-  int reuse_;
 };
 
 void FileCallbackTest::OnFileIOComplete(int bytes_copied) {
   if (id_ > g_cache_tests_max_id) {
     NOTREACHED();
     g_cache_tests_error = true;
-  } else if (reuse_) {
-    DCHECK(1 == reuse_);
-    if (2 == reuse_)
-      g_cache_tests_error = true;
-    reuse_++;
   }
 
   g_cache_tests_received++;
-}
-
-// Wait up to 2 secs without callbacks, or until we receive expected callbacks.
-void WaitForCallbacks(int expected) {
-  if (!expected)
-    return;
-
-#if defined(OS_WIN)
-  int iterations = 0;
-  int last = 0;
-  while (iterations < 40) {
-    SleepEx(50, TRUE);
-    if (expected == g_cache_tests_received)
-      return;
-    if (last == g_cache_tests_received)
-      iterations++;
-    else
-      iterations = 0;
-  }
-#elif defined(OS_POSIX)
-  // TODO(rvargas): Do something when async IO is implemented.
-#endif
 }
 
 }  // namespace

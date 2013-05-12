@@ -1,12 +1,15 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
+
+#include "net/tools/fetch/http_listen_socket.h"
+
+#include <map>
 
 #include "base/compiler_specific.h"
 #include "base/logging.h"
 #include "base/message_loop.h"
-#include "base/string_util.h"
-#include "net/tools/fetch/http_listen_socket.h"
+#include "base/string_number_conversions.h"
 #include "net/tools/fetch/http_server_request_info.h"
 #include "net/tools/fetch/http_server_response_info.h"
 
@@ -21,21 +24,27 @@ HttpListenSocket::HttpListenSocket(SOCKET s,
 HttpListenSocket::~HttpListenSocket() {
 }
 
+void HttpListenSocket::Listen() {
+  ListenSocket::Listen();
+}
+
 void HttpListenSocket::Accept() {
   SOCKET conn = ListenSocket::Accept(socket_);
   DCHECK_NE(conn, ListenSocket::kInvalidSocket);
   if (conn == ListenSocket::kInvalidSocket) {
     // TODO
   } else {
-    scoped_refptr<HttpListenSocket> sock =
-        new HttpListenSocket(conn, delegate_);
+    scoped_refptr<HttpListenSocket> sock(
+        new HttpListenSocket(conn, delegate_));
     // it's up to the delegate to AddRef if it wants to keep it around
     DidAccept(this, sock);
   }
 }
 
-HttpListenSocket* HttpListenSocket::Listen(const std::string& ip, int port,
-                                           HttpListenSocket::Delegate* delegate) {
+HttpListenSocket* HttpListenSocket::Listen(
+    const std::string& ip,
+    int port,
+    HttpListenSocket::Delegate* delegate) {
   SOCKET s = ListenSocket::Listen(ip, port);
   if (s == ListenSocket::kInvalidSocket) {
     // TODO (ibrar): error handling
@@ -182,8 +191,9 @@ void HttpListenSocket::DidAccept(ListenSocket* server,
 }
 
 void HttpListenSocket::DidRead(ListenSocket* connection,
-                               const std::string& data) {
-  recv_data_ += data;
+                               const char* data,
+                               int len) {
+  recv_data_.append(data, len);
   while (recv_data_.length()) {
     HttpServerRequestInfo* request = ParseHeaders();
     if (!request)
@@ -223,7 +233,7 @@ void HttpListenSocket::Respond(HttpServerResponseInfo* info,
     response += "Content-type: " + info->content_type + "\r\n";
 
   if (info->content_length > 0)
-    response += "Content-length: " + IntToString(info->content_length) +
+    response += "Content-length: " + base::IntToString(info->content_length) +
         "\r\n";
 
   if (info->connection_close)

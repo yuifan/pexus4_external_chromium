@@ -7,8 +7,9 @@
 #include <windows.h>
 #include <winhttp.h>
 
-#include "base/histogram.h"
+#include "base/metrics/histogram.h"
 #include "base/string_util.h"
+#include "base/utf_string_conversions.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/net_errors.h"
 #include "net/proxy/proxy_info.h"
@@ -19,23 +20,6 @@ using base::TimeDelta;
 using base::TimeTicks;
 
 namespace net {
-
-// A small wrapper for histogramming purposes ;-)
-static BOOL CallWinHttpGetProxyForUrl(HINTERNET session, LPCWSTR url,
-                                      WINHTTP_AUTOPROXY_OPTIONS* options,
-                                      WINHTTP_PROXY_INFO* results) {
-  TimeTicks time_start = TimeTicks::Now();
-  BOOL rv = WinHttpGetProxyForUrl(session, url, options, results);
-  TimeDelta time_delta = TimeTicks::Now() - time_start;
-  // Record separately success and failure times since they will have very
-  // different characteristics.
-  if (rv) {
-    UMA_HISTOGRAM_LONG_TIMES("Net.GetProxyForUrl_OK", time_delta);
-  } else {
-    UMA_HISTOGRAM_LONG_TIMES("Net.GetProxyForUrl_FAIL", time_delta);
-  }
-  return rv;
-}
 
 static void FreeInfo(WINHTTP_PROXY_INFO* info) {
   if (info->lpszProxy)
@@ -56,7 +40,7 @@ int ProxyResolverWinHttp::GetProxyForURL(const GURL& query_url,
                                          ProxyInfo* results,
                                          CompletionCallback* /*callback*/,
                                          RequestHandle* /*request*/,
-                                         LoadLog* /*load_log*/) {
+                                         const BoundNetLog& /*net_log*/) {
   // If we don't have a WinHTTP session, then create a new one.
   if (!session_handle_ && !OpenWinHttpSession())
     return ERR_FAILED;
@@ -81,12 +65,12 @@ int ProxyResolverWinHttp::GetProxyForURL(const GURL& query_url,
   // Otherwise, we fail over to trying it with a value of true.  This way we
   // get good performance in the case where WinHTTP uses an out-of-process
   // resolver.  This is important for Vista and Win2k3.
-  BOOL ok = CallWinHttpGetProxyForUrl(
+  BOOL ok = WinHttpGetProxyForUrl(
       session_handle_, ASCIIToWide(query_url.spec()).c_str(), &options, &info);
   if (!ok) {
     if (ERROR_WINHTTP_LOGIN_FAILURE == GetLastError()) {
       options.fAutoLogonIfChallenged = TRUE;
-      ok = CallWinHttpGetProxyForUrl(
+      ok = WinHttpGetProxyForUrl(
           session_handle_, ASCIIToWide(query_url.spec()).c_str(),
           &options, &info);
     }
@@ -140,10 +124,18 @@ void ProxyResolverWinHttp::CancelRequest(RequestHandle request) {
   NOTREACHED();
 }
 
-int ProxyResolverWinHttp::SetPacScript(const GURL& pac_url,
-                                       const std::string& /*pac_bytes*/,
-                                       CompletionCallback* /*callback*/) {
-  pac_url_ = pac_url.is_valid() ? pac_url : GURL("http://wpad/wpad.dat");
+void ProxyResolverWinHttp::CancelSetPacScript() {
+  NOTREACHED();
+}
+
+int ProxyResolverWinHttp::SetPacScript(
+    const scoped_refptr<ProxyResolverScriptData>& script_data,
+    CompletionCallback* /*callback*/) {
+  if (script_data->type() == ProxyResolverScriptData::TYPE_AUTO_DETECT) {
+    pac_url_ = GURL("http://wpad/wpad.dat");
+  } else {
+    pac_url_ = script_data->url();
+  }
   return OK;
 }
 

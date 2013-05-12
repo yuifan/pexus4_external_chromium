@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -12,7 +12,9 @@
 #include <algorithm>
 
 #include "base/logging.h"
+#include "base/metrics/histogram.h"
 #include "base/pickle.h"
+#include "base/string_number_conversions.h"
 #include "base/string_util.h"
 #include "base/time.h"
 #include "net/base/escape.h"
@@ -84,13 +86,69 @@ bool ShouldUpdateHeader(const std::string::const_iterator& name_begin,
   return true;
 }
 
+// Functions for histogram initialization.  The code 0 is put in the
+// response map to track response codes that are invalid.
+// TODO(gavinp): Greatly prune the collected codes once we learn which
+// ones are not sent in practice, to reduce upload size & memory use.
+
+enum {
+  HISTOGRAM_MIN_HTTP_RESPONSE_CODE = 100,
+  HISTOGRAM_MAX_HTTP_RESPONSE_CODE = 599,
+};
+
+std::vector<int> GetAllHttpResponseCodes() {
+  std::vector<int> codes;
+  codes.reserve(
+      HISTOGRAM_MAX_HTTP_RESPONSE_CODE - HISTOGRAM_MIN_HTTP_RESPONSE_CODE + 2);
+  codes.push_back(0);
+  for (int i = HISTOGRAM_MIN_HTTP_RESPONSE_CODE;
+       i <= HISTOGRAM_MAX_HTTP_RESPONSE_CODE; ++i)
+    codes.push_back(i);
+  return codes;
+}
+
+int MapHttpResponseCode(int code) {
+  if (HISTOGRAM_MIN_HTTP_RESPONSE_CODE <= code &&
+      code <= HISTOGRAM_MAX_HTTP_RESPONSE_CODE)
+    return code;
+  return 0;
+}
+
 }  // namespace
+
+struct HttpResponseHeaders::ParsedHeader {
+  // A header "continuation" contains only a subsequent value for the
+  // preceding header.  (Header values are comma separated.)
+  bool is_continuation() const { return name_begin == name_end; }
+
+  std::string::const_iterator name_begin;
+  std::string::const_iterator name_end;
+  std::string::const_iterator value_begin;
+  std::string::const_iterator value_end;
+};
 
 //-----------------------------------------------------------------------------
 
 HttpResponseHeaders::HttpResponseHeaders(const std::string& raw_input)
     : response_code_(-1) {
   Parse(raw_input);
+
+  // The most important thing to do with this histogram is find out
+  // the existence of unusual HTTP response codes.  As it happens
+  // right now, there aren't double-constructions of response headers
+  // using this constructor, so our counts should also be accurate,
+  // without instantiating the histogram in two places.  It is also
+  // important that this histogram not collect data in the other
+  // constructor, which rebuilds an histogram from a pickle, since
+  // that would actually create a double call between the original
+  // HttpResponseHeader that was serialized, and initialization of the
+  // new object from that pickle.
+  UMA_HISTOGRAM_CUSTOM_ENUMERATION("Net.HttpResponseCode",
+                                   MapHttpResponseCode(response_code_),
+                                   // Note the third argument is only
+                                   // evaluated once, see macro
+                                   // definition for details.
+                                   GetAllHttpResponseCodes());
 }
 
 HttpResponseHeaders::HttpResponseHeaders(const Pickle& pickle, void** iter)
@@ -137,7 +195,7 @@ void HttpResponseHeaders::Persist(Pickle* pickle, PersistOptions options) {
 
     // Locate the start of the next header.
     size_t k = i;
-    while (++k < parsed_.size() && parsed_[k].is_continuation());
+    while (++k < parsed_.size() && parsed_[k].is_continuation()) {}
     --k;
 
     std::string header_name(parsed_[i].name_begin, parsed_[i].name_end);
@@ -177,7 +235,7 @@ void HttpResponseHeaders::Update(const HttpResponseHeaders& new_headers) {
 
     // Locate the start of the next header.
     size_t k = i;
-    while (++k < new_parsed.size() && new_parsed[k].is_continuation());
+    while (++k < new_parsed.size() && new_parsed[k].is_continuation()) {}
     --k;
 
     const std::string::const_iterator& name_begin = new_parsed[i].name_begin;
@@ -208,7 +266,7 @@ void HttpResponseHeaders::MergeWithHeaders(const std::string& raw_headers,
 
     // Locate the start of the next header.
     size_t k = i;
-    while (++k < parsed_.size() && parsed_[k].is_continuation());
+    while (++k < parsed_.size() && parsed_[k].is_continuation()) {}
     --k;
 
     std::string name(parsed_[i].name_begin, parsed_[i].name_end);
@@ -274,8 +332,9 @@ void HttpResponseHeaders::Parse(const std::string& raw_input) {
       find(line_begin, raw_input.end(), '\0');
   // has_headers = true, if there is any data following the status line.
   // Used by ParseStatusLine() to decide if a HTTP/0.9 is really a HTTP/1.0.
-  bool has_headers = line_end != raw_input.end() &&
-      (line_end + 1) != raw_input.end() && *(line_end + 1) != '\0';
+  bool has_headers = (line_end != raw_input.end() &&
+                      (line_end + 1) != raw_input.end() &&
+                      *(line_end + 1) != '\0');
   ParseStatusLine(line_begin, line_end, has_headers);
 
   if (line_end == raw_input.end()) {
@@ -458,10 +517,20 @@ bool HttpResponseHeaders::HasHeaderValue(const std::string& name,
   while (EnumerateHeader(&iter, name, &temp)) {
     if (value.size() == temp.size() &&
         std::equal(temp.begin(), temp.end(), value.begin(),
-                   CaseInsensitiveCompare<char>()))
+                   base::CaseInsensitiveCompare<char>()))
       return true;
   }
   return false;
+}
+
+bool HttpResponseHeaders::HasHeader(const std::string& name) const {
+  return FindHeader(0, name) != std::string::npos;
+}
+
+HttpResponseHeaders::HttpResponseHeaders() : response_code_(-1) {
+}
+
+HttpResponseHeaders::~HttpResponseHeaders() {
 }
 
 // Note: this implementation implicitly assumes that line_end points at a valid
@@ -477,20 +546,20 @@ HttpVersion HttpResponseHeaders::ParseVersion(
   // TODO: handle leading zeros, which is allowed by the rfc1616 sec 3.1.
 
   if ((line_end - p < 4) || !LowerCaseEqualsASCII(p, p + 4, "http")) {
-    DLOG(INFO) << "missing status line";
+    DVLOG(1) << "missing status line";
     return HttpVersion();
   }
 
   p += 4;
 
   if (p >= line_end || *p != '/') {
-    DLOG(INFO) << "missing version";
+    DVLOG(1) << "missing version";
     return HttpVersion();
   }
 
   std::string::const_iterator dot = find(p, line_end, '.');
   if (dot == line_end) {
-    DLOG(INFO) << "malformed version";
+    DVLOG(1) << "malformed version";
     return HttpVersion();
   }
 
@@ -498,7 +567,7 @@ HttpVersion HttpResponseHeaders::ParseVersion(
   ++dot;  // from . to second digit.
 
   if (!(*p >= '0' && *p <= '9' && *dot >= '0' && *dot <= '9')) {
-    DLOG(INFO) << "malformed version number";
+    DVLOG(1) << "malformed version number";
     return HttpVersion();
   }
 
@@ -530,15 +599,15 @@ void HttpResponseHeaders::ParseStatusLine(
     raw_headers_ = "HTTP/1.0";
   }
   if (parsed_http_version_ != http_version_) {
-    DLOG(INFO) << "assuming HTTP/" << http_version_.major_value() << "."
-               << http_version_.minor_value();
+    DVLOG(1) << "assuming HTTP/" << http_version_.major_value() << "."
+             << http_version_.minor_value();
   }
 
   // TODO(eroman): this doesn't make sense if ParseVersion failed.
   std::string::const_iterator p = find(line_begin, line_end, ' ');
 
   if (p == line_end) {
-    DLOG(INFO) << "missing response status; assuming 200 OK";
+    DVLOG(1) << "missing response status; assuming 200 OK";
     raw_headers_.append(" 200 OK");
     raw_headers_.push_back('\0');
     response_code_ = 200;
@@ -554,7 +623,7 @@ void HttpResponseHeaders::ParseStatusLine(
     ++p;
 
   if (p == code) {
-    DLOG(INFO) << "missing response status number; assuming 200";
+    DVLOG(1) << "missing response status number; assuming 200";
     raw_headers_.append(" 200 OK");
     response_code_ = 200;
     return;
@@ -562,7 +631,7 @@ void HttpResponseHeaders::ParseStatusLine(
   raw_headers_.push_back(' ');
   raw_headers_.append(code, p);
   raw_headers_.push_back(' ');
-  response_code_ = static_cast<int>(StringToInt64(std::string(code, p)));
+  base::StringToInt(code, p, &response_code_);
 
   // Skip whitespace.
   while (*p == ' ')
@@ -573,7 +642,7 @@ void HttpResponseHeaders::ParseStatusLine(
     --line_end;
 
   if (p == line_end) {
-    DLOG(INFO) << "missing response status text; assuming OK";
+    DVLOG(1) << "missing response status text; assuming OK";
     // Not super critical what we put here. Just use "OK"
     // even if it isn't descriptive of response_code_.
     raw_headers_.append("OK");
@@ -593,7 +662,7 @@ size_t HttpResponseHeaders::FindHeader(size_t from,
     const std::string::const_iterator& name_end = parsed_[i].name_end;
     if (static_cast<size_t>(name_end - name_begin) == search.size() &&
         std::equal(name_begin, name_end, search.begin(),
-                   CaseInsensitiveCompare<char>()))
+                   base::CaseInsensitiveCompare<char>()))
       return i;
   }
 
@@ -936,8 +1005,11 @@ bool HttpResponseHeaders::GetMaxAgeValue(TimeDelta* result) const {
       if (LowerCaseEqualsASCII(value.begin(),
                                value.begin() + kMaxAgePrefixLen,
                                kMaxAgePrefix)) {
-        *result = TimeDelta::FromSeconds(
-            StringToInt64(value.substr(kMaxAgePrefixLen)));
+        int64 seconds;
+        base::StringToInt64(value.begin() + kMaxAgePrefixLen,
+                            value.end(),
+                            &seconds);
+        *result = TimeDelta::FromSeconds(seconds);
         return true;
       }
     }
@@ -951,7 +1023,9 @@ bool HttpResponseHeaders::GetAgeValue(TimeDelta* result) const {
   if (!EnumerateHeader(NULL, "Age", &value))
     return false;
 
-  *result = TimeDelta::FromSeconds(StringToInt64(value));
+  int64 seconds;
+  base::StringToInt64(value, &seconds);
+  *result = TimeDelta::FromSeconds(seconds);
   return true;
 }
 
@@ -1042,7 +1116,7 @@ int64 HttpResponseHeaders::GetContentLength() const {
     return -1;
 
   int64 result;
-  bool ok = StringToInt64(content_length_val, &result);
+  bool ok = base::StringToInt64(content_length_val, &result);
   if (!ok || result < 0)
     return -1;
 
@@ -1109,20 +1183,20 @@ bool HttpResponseHeaders::GetContentRange(int64* first_byte_position,
           byte_range_resp_spec.begin() + minus_position;
       HttpUtil::TrimLWS(&first_byte_pos_begin, &first_byte_pos_end);
 
-      bool ok = StringToInt64(
-          std::string(first_byte_pos_begin, first_byte_pos_end),
-          first_byte_position);
+      bool ok = base::StringToInt64(first_byte_pos_begin,
+                                    first_byte_pos_end,
+                                    first_byte_position);
 
       // Obtain last-byte-pos.
       std::string::const_iterator last_byte_pos_begin =
-           byte_range_resp_spec.begin() + minus_position + 1;
+          byte_range_resp_spec.begin() + minus_position + 1;
       std::string::const_iterator last_byte_pos_end =
-           byte_range_resp_spec.end();
+          byte_range_resp_spec.end();
       HttpUtil::TrimLWS(&last_byte_pos_begin, &last_byte_pos_end);
 
-      ok &= StringToInt64(
-          std::string(last_byte_pos_begin, last_byte_pos_end),
-          last_byte_position);
+      ok &= base::StringToInt64(last_byte_pos_begin,
+                                last_byte_pos_end,
+                                last_byte_position);
       if (!ok) {
         *first_byte_position = *last_byte_position = -1;
         return false;
@@ -1145,9 +1219,9 @@ bool HttpResponseHeaders::GetContentRange(int64* first_byte_position,
 
   if (LowerCaseEqualsASCII(instance_length_begin, instance_length_end, "*")) {
     return false;
-  } else if (!StringToInt64(
-                 std::string(instance_length_begin, instance_length_end),
-                 instance_length)) {
+  } else if (!base::StringToInt64(instance_length_begin,
+                                  instance_length_end,
+                                  instance_length)) {
     *instance_length = -1;
     return false;
   }

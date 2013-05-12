@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,20 +6,28 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#if defined(USE_GCONF)
 #include <gconf/gconf-client.h>
+#endif
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 
+#include <map>
+
+#include "base/environment.h"
 #include "base/file_path.h"
 #include "base/file_util.h"
 #include "base/logging.h"
 #include "base/message_loop.h"
+#include "base/nix/xdg_util.h"
+#include "base/string_number_conversions.h"
 #include "base/string_tokenizer.h"
 #include "base/string_util.h"
 #include "base/task.h"
+#include "base/threading/thread_restrictions.h"
 #include "base/timer.h"
 #include "googleurl/src/url_canon.h"
 #include "net/base/net_errors.h"
@@ -38,11 +46,11 @@ namespace {
 // TODO(arindam): Remove URI string manipulation by using MapUrlSchemeToProxy.
 std::string FixupProxyHostScheme(ProxyServer::Scheme scheme,
                                  std::string host) {
-  if (scheme == ProxyServer::SCHEME_SOCKS4 &&
-      StartsWithASCII(host, "socks5://", false)) {
-    // We default to socks 4, but if the user specifically set it to
-    // socks5://, then use that.
-    scheme = ProxyServer::SCHEME_SOCKS5;
+  if (scheme == ProxyServer::SCHEME_SOCKS5 &&
+      StartsWithASCII(host, "socks4://", false)) {
+    // We default to socks 5, but if the user specifically set it to
+    // socks4://, then use that.
+    scheme = ProxyServer::SCHEME_SOCKS4;
   }
   // Strip the scheme if any.
   std::string::size_type colon = host.find("://");
@@ -74,11 +82,14 @@ std::string FixupProxyHostScheme(ProxyServer::Scheme scheme,
 
 }  // namespace
 
+ProxyConfigServiceLinux::Delegate::~Delegate() {
+}
+
 bool ProxyConfigServiceLinux::Delegate::GetProxyFromEnvVarForScheme(
     const char* variable, ProxyServer::Scheme scheme,
     ProxyServer* result_server) {
   std::string env_value;
-  if (env_var_getter_->Getenv(variable, &env_value)) {
+  if (env_var_getter_->GetVar(variable, &env_value)) {
     if (!env_value.empty()) {
       env_value = FixupProxyHostScheme(scheme, env_value);
       ProxyServer proxy_server =
@@ -106,25 +117,25 @@ bool ProxyConfigServiceLinux::Delegate::GetConfigFromEnv(ProxyConfig* config) {
   // extension has ever used this, but it still sounds like a good
   // idea.
   std::string auto_proxy;
-  if (env_var_getter_->Getenv("auto_proxy", &auto_proxy)) {
+  if (env_var_getter_->GetVar("auto_proxy", &auto_proxy)) {
     if (auto_proxy.empty()) {
       // Defined and empty => autodetect
-      config->auto_detect = true;
+      config->set_auto_detect(true);
     } else {
       // specified autoconfig URL
-      config->pac_url = GURL(auto_proxy);
+      config->set_pac_url(GURL(auto_proxy));
     }
     return true;
   }
   // "all_proxy" is a shortcut to avoid defining {http,https,ftp}_proxy.
   ProxyServer proxy_server;
   if (GetProxyFromEnvVar("all_proxy", &proxy_server)) {
-    config->proxy_rules.type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
-    config->proxy_rules.single_proxy = proxy_server;
+    config->proxy_rules().type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
+    config->proxy_rules().single_proxy = proxy_server;
   } else {
     bool have_http = GetProxyFromEnvVar("http_proxy", &proxy_server);
     if (have_http)
-      config->proxy_rules.proxy_for_http = proxy_server;
+      config->proxy_rules().proxy_for_http = proxy_server;
     // It would be tempting to let http_proxy apply for all protocols
     // if https_proxy and ftp_proxy are not defined. Googling turns up
     // several documents that mention only http_proxy. But then the
@@ -132,38 +143,44 @@ bool ProxyConfigServiceLinux::Delegate::GetConfigFromEnv(ProxyConfig* config) {
     // like other apps do this. So we will refrain.
     bool have_https = GetProxyFromEnvVar("https_proxy", &proxy_server);
     if (have_https)
-      config->proxy_rules.proxy_for_https = proxy_server;
+      config->proxy_rules().proxy_for_https = proxy_server;
     bool have_ftp = GetProxyFromEnvVar("ftp_proxy", &proxy_server);
     if (have_ftp)
-      config->proxy_rules.proxy_for_ftp = proxy_server;
+      config->proxy_rules().proxy_for_ftp = proxy_server;
     if (have_http || have_https || have_ftp) {
       // mustn't change type unless some rules are actually set.
-      config->proxy_rules.type = ProxyConfig::ProxyRules::TYPE_PROXY_PER_SCHEME;
+      config->proxy_rules().type =
+          ProxyConfig::ProxyRules::TYPE_PROXY_PER_SCHEME;
     }
   }
-  if (config->proxy_rules.empty()) {
+  if (config->proxy_rules().empty()) {
     // If the above were not defined, try for socks.
-    ProxyServer::Scheme scheme = ProxyServer::SCHEME_SOCKS4;
+    // For environment variables, we default to version 5, per the gnome
+    // documentation: http://library.gnome.org/devel/gnet/stable/gnet-socks.html
+    ProxyServer::Scheme scheme = ProxyServer::SCHEME_SOCKS5;
     std::string env_version;
-    if (env_var_getter_->Getenv("SOCKS_VERSION", &env_version)
-        && env_version == "5")
-      scheme = ProxyServer::SCHEME_SOCKS5;
+    if (env_var_getter_->GetVar("SOCKS_VERSION", &env_version)
+        && env_version == "4")
+      scheme = ProxyServer::SCHEME_SOCKS4;
     if (GetProxyFromEnvVarForScheme("SOCKS_SERVER", scheme, &proxy_server)) {
-      config->proxy_rules.type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
-      config->proxy_rules.single_proxy = proxy_server;
+      config->proxy_rules().type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
+      config->proxy_rules().single_proxy = proxy_server;
     }
   }
   // Look for the proxy bypass list.
   std::string no_proxy;
-  env_var_getter_->Getenv("no_proxy", &no_proxy);
-  if (config->proxy_rules.empty()) {
+  env_var_getter_->GetVar("no_proxy", &no_proxy);
+  if (config->proxy_rules().empty()) {
     // Having only "no_proxy" set, presumably to "*", makes it
     // explicit that env vars do specify a configuration: having no
     // rules specified only means the user explicitly asks for direct
     // connections.
     return !no_proxy.empty();
   }
-  config->ParseNoProxyList(no_proxy);
+  // Note that this uses "suffix" matching. So a bypass of "google.com"
+  // is understood to mean a bypass of "*google.com".
+  config->proxy_rules().bypass_rules.ParseFromStringUsingSuffixMatching(
+      no_proxy);
   return true;
 }
 
@@ -171,6 +188,7 @@ namespace {
 
 const int kDebounceTimeoutMilliseconds = 250;
 
+#if defined(USE_GCONF)
 // This is the "real" gconf version that actually uses gconf.
 class GConfSettingGetterImplGConf
     : public ProxyConfigServiceLinux::GConfSettingGetter {
@@ -191,7 +209,7 @@ class GConfSettingGetterImplGConf
         // We are on the UI thread so we can clean it safely. This is
         // the case at least for ui_tests running under Valgrind in
         // bug 16076.
-        LOG(INFO) << "~GConfSettingGetterImplGConf: releasing gconf client";
+        VLOG(1) << "~GConfSettingGetterImplGConf: releasing gconf client";
         Shutdown();
       } else {
         LOG(WARNING) << "~GConfSettingGetterImplGConf: leaking gconf client";
@@ -343,6 +361,15 @@ class GConfSettingGetterImplGConf
     return true;
   }
 
+  virtual bool BypassListIsReversed() {
+    // This is a KDE-specific setting.
+    return false;
+  }
+
+  virtual bool MatchHostsUsingSuffixMatching() {
+    return false;
+  }
+
  private:
   // Logs and frees a glib error. Returns false if there was no error
   // (error is NULL).
@@ -377,8 +404,8 @@ class GConfSettingGetterImplGConf
   static void OnGConfChangeNotification(
       GConfClient* client, guint cnxn_id,
       GConfEntry* entry, gpointer user_data) {
-    LOG(INFO) << "gconf change notification for key "
-              << gconf_entry_get_key(entry);
+    VLOG(1) << "gconf change notification for key "
+            << gconf_entry_get_key(entry);
     // We don't track which key has changed, just that something did change.
     GConfSettingGetterImplGConf* setting_getter =
         reinterpret_cast<GConfSettingGetterImplGConf*>(user_data);
@@ -396,6 +423,7 @@ class GConfSettingGetterImplGConf
 
   DISALLOW_COPY_AND_ASSIGN(GConfSettingGetterImplGConf);
 };
+#endif  // defined(USE_GCONF)
 
 // This is the KDE version that reads kioslaverc and simulates gconf.
 // Doing this allows the main Delegate code, as well as the unit tests
@@ -404,21 +432,63 @@ class GConfSettingGetterImplKDE
     : public ProxyConfigServiceLinux::GConfSettingGetter,
       public base::MessagePumpLibevent::Watcher {
  public:
-  explicit GConfSettingGetterImplKDE(
-      base::EnvironmentVariableGetter* env_var_getter)
+  explicit GConfSettingGetterImplKDE(base::Environment* env_var_getter)
       : inotify_fd_(-1), notify_delegate_(NULL), indirect_manual_(false),
-        auto_no_pac_(false), reversed_exception_(false), file_loop_(NULL) {
-    // We don't save the env var getter for later use since we don't own it.
-    // Instead we use it here and save the result we actually care about.
-    std::string kde_home;
-    if (!env_var_getter->Getenv("KDE_HOME", &kde_home)) {
-      if (!env_var_getter->Getenv("HOME", &kde_home))
+        auto_no_pac_(false), reversed_bypass_list_(false),
+        env_var_getter_(env_var_getter), file_loop_(NULL) {
+    // This has to be called on the UI thread (http://crbug.com/69057).
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
+
+    // Derive the location of the kde config dir from the environment.
+    std::string home;
+    if (env_var_getter->GetVar("KDEHOME", &home) && !home.empty()) {
+      // $KDEHOME is set. Use it unconditionally.
+      kde_config_dir_ = KDEHomeToConfigPath(FilePath(home));
+    } else {
+      // $KDEHOME is unset. Try to figure out what to use. This seems to be
+      // the common case on most distributions.
+      if (!env_var_getter->GetVar(base::env_vars::kHome, &home))
         // User has no $HOME? Give up. Later we'll report the failure.
         return;
-      kde_home = FilePath(kde_home).Append(FILE_PATH_LITERAL(".kde")).value();
+      if (base::nix::GetDesktopEnvironment(env_var_getter) ==
+          base::nix::DESKTOP_ENVIRONMENT_KDE3) {
+        // KDE3 always uses .kde for its configuration.
+        FilePath kde_path = FilePath(home).Append(".kde");
+        kde_config_dir_ = KDEHomeToConfigPath(kde_path);
+      } else {
+        // Some distributions patch KDE4 to use .kde4 instead of .kde, so that
+        // both can be installed side-by-side. Sadly they don't all do this, and
+        // they don't always do this: some distributions have started switching
+        // back as well. So if there is a .kde4 directory, check the timestamps
+        // of the config directories within and use the newest one.
+        // Note that we should currently be running in the UI thread, because in
+        // the gconf version, that is the only thread that can access the proxy
+        // settings (a gconf restriction). As noted below, the initial read of
+        // the proxy settings will be done in this thread anyway, so we check
+        // for .kde4 here in this thread as well.
+        FilePath kde3_path = FilePath(home).Append(".kde");
+        FilePath kde3_config = KDEHomeToConfigPath(kde3_path);
+        FilePath kde4_path = FilePath(home).Append(".kde4");
+        FilePath kde4_config = KDEHomeToConfigPath(kde4_path);
+        bool use_kde4 = false;
+        if (file_util::DirectoryExists(kde4_path)) {
+          base::PlatformFileInfo kde3_info;
+          base::PlatformFileInfo kde4_info;
+          if (file_util::GetFileInfo(kde4_config, &kde4_info)) {
+            if (file_util::GetFileInfo(kde3_config, &kde3_info)) {
+              use_kde4 = kde4_info.last_modified >= kde3_info.last_modified;
+            } else {
+              use_kde4 = true;
+            }
+          }
+        }
+        if (use_kde4) {
+          kde_config_dir_ = KDEHomeToConfigPath(kde4_path);
+        } else {
+          kde_config_dir_ = KDEHomeToConfigPath(kde3_path);
+        }
+      }
     }
-    kde_config_dir_ = FilePath(kde_home).Append(
-        FILE_PATH_LITERAL("share")).Append(FILE_PATH_LITERAL("config"));
   }
 
   virtual ~GConfSettingGetterImplKDE() {
@@ -436,6 +506,8 @@ class GConfSettingGetterImplKDE
 
   virtual bool Init(MessageLoop* glib_default_loop,
                     MessageLoopForIO* file_loop) {
+    // This has to be called on the UI thread (http://crbug.com/69057).
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
     DCHECK(inotify_fd_ < 0);
     inotify_fd_ = inotify_init();
     if (inotify_fd_ < 0) {
@@ -523,16 +595,28 @@ class GConfSettingGetterImplKDE
     return true;
   }
 
+  virtual bool BypassListIsReversed() {
+    return reversed_bypass_list_;
+  }
+
+  virtual bool MatchHostsUsingSuffixMatching() {
+    return true;
+  }
+
  private:
   void ResetCachedSettings() {
     string_table_.clear();
     strings_table_.clear();
     indirect_manual_ = false;
     auto_no_pac_ = false;
-    reversed_exception_ = false;
+    reversed_bypass_list_ = false;
   }
 
-  void AddProxy(std::string prefix, std::string value) {
+  FilePath KDEHomeToConfigPath(const FilePath& kde_home) {
+    return kde_home.Append("share").Append("config");
+  }
+
+  void AddProxy(const std::string& prefix, const std::string& value) {
     if (value.empty() || value.substr(0, 3) == "//:")
       // No proxy.
       return;
@@ -540,6 +624,17 @@ class GConfSettingGetterImplKDE
     // would only append it right back again. So we just leave the port
     // number right in the host string.
     string_table_[prefix + "host"] = value;
+  }
+
+  void AddHostList(const std::string& key, const std::string& value) {
+    std::vector<std::string> tokens;
+    StringTokenizer tk(value, ", ");
+    while (tk.GetNext()) {
+      std::string token = tk.token();
+      if (!token.empty())
+        tokens.push_back(token);
+    }
+    strings_table_[key] = tokens;
   }
 
   void AddKDESetting(const std::string& key, const std::string& value) {
@@ -553,7 +648,9 @@ class GConfSettingGetterImplKDE
       const char* mode = "none";
       indirect_manual_ = false;
       auto_no_pac_ = false;
-      switch (StringToInt(value)) {
+      int int_value;
+      base::StringToInt(value, &int_value);
+      switch (int_value) {
         case 0:  // No proxy, or maybe kioslaverc syntax error.
           break;
         case 1:  // Manual configuration.
@@ -584,19 +681,15 @@ class GConfSettingGetterImplKDE
       // We count "true" or any nonzero number as true, otherwise false.
       // Note that if the value is not actually numeric StringToInt()
       // will return 0, which we count as false.
-      reversed_exception_ = value == "true" || StringToInt(value);
+      int int_value;
+      base::StringToInt(value, &int_value);
+      reversed_bypass_list_ = (value == "true" || int_value);
     } else if (key == "NoProxyFor") {
-      std::vector<std::string> exceptions;
-      StringTokenizer tk(value, ",");
-      while (tk.GetNext()) {
-        std::string token = tk.token();
-        if (!token.empty())
-          exceptions.push_back(token);
-      }
-      strings_table_["/system/http_proxy/ignore_hosts"] = exceptions;
+      AddHostList("/system/http_proxy/ignore_hosts", value);
     } else if (key == "AuthMode") {
       // Check for authentication, just so we can warn.
-      int mode = StringToInt(value);
+      int mode;
+      base::StringToInt(value, &mode);
       if (mode) {
         // ProxyConfig does not support authentication parameters, but
         // Chrome will prompt for the password later. So we ignore this.
@@ -606,16 +699,26 @@ class GConfSettingGetterImplKDE
     }
   }
 
-  void ResolveIndirect(std::string key) {
-    // We can't save the environment variable getter that was passed
-    // when this object was constructed, but this setting is likely
-    // to be pretty unusual and the actual values it would return can
-    // be tested without using it. So we just use getenv() here.
+  void ResolveIndirect(const std::string& key) {
     string_map_type::iterator it = string_table_.find(key);
     if (it != string_table_.end()) {
-      char* value = getenv(it->second.c_str());
-      if (value)
+      std::string value;
+      if (env_var_getter_->GetVar(it->second.c_str(), &value))
         it->second = value;
+      else
+        string_table_.erase(it);
+    }
+  }
+
+  void ResolveIndirectList(const std::string& key) {
+    strings_map_type::iterator it = strings_table_.find(key);
+    if (it != strings_table_.end()) {
+      std::string value;
+      if (!it->second.empty() &&
+          env_var_getter_->GetVar(it->second[0].c_str(), &value))
+        AddHostList(key, value);
+      else
+        strings_table_.erase(it);
     }
   }
 
@@ -628,26 +731,18 @@ class GConfSettingGetterImplKDE
       ResolveIndirect("/system/http_proxy/host");
       ResolveIndirect("/system/proxy/secure_host");
       ResolveIndirect("/system/proxy/ftp_host");
+      ResolveIndirectList("/system/http_proxy/ignore_hosts");
     }
     if (auto_no_pac_) {
       // Remove the PAC URL; we're not supposed to use it.
       string_table_.erase("/system/proxy/autoconfig_url");
-    }
-    if (reversed_exception_) {
-      // We don't actually support this setting. (It means to use the proxy
-      // *only* for the exception list, rather than everything but them.)
-      // Nevertheless we can do better than *exactly the opposite* of the
-      // desired behavior by clearing the exception list and warning.
-      strings_table_.erase("/system/http_proxy/ignore_hosts");
-      LOG(WARNING) << "KDE reversed proxy exception list not supported";
     }
   }
 
   // Reads kioslaverc one line at a time and calls AddKDESetting() to add
   // each relevant name-value pair to the appropriate value table.
   void UpdateCachedSettings() {
-    FilePath kioslaverc = kde_config_dir_.Append(
-        FILE_PATH_LITERAL("kioslaverc"));
+    FilePath kioslaverc = kde_config_dir_.Append("kioslaverc");
     file_util::ScopedFILE input(file_util::OpenFile(kioslaverc, "r"));
     if (!input.get())
       return;
@@ -724,7 +819,7 @@ class GConfSettingGetterImplKDE
   // This is the callback from the debounce timer.
   void OnDebouncedNotification() {
     DCHECK(MessageLoop::current() == file_loop_);
-    LOG(INFO) << "inotify change notification for kioslaverc";
+    VLOG(1) << "inotify change notification for kioslaverc";
     UpdateCachedSettings();
     DCHECK(notify_delegate_);
     // Forward to a method on the proxy config service delegate object.
@@ -747,8 +842,8 @@ class GConfSettingGetterImplKDE
       while (event_ptr < event_buf + r) {
         inotify_event* event = reinterpret_cast<inotify_event*>(event_ptr);
         // The kernel always feeds us whole events.
-        CHECK(event_ptr + sizeof(inotify_event) <= event_buf + r);
-        CHECK(event->name + event->len <= event_buf + r);
+        CHECK_LE(event_ptr + sizeof(inotify_event), event_buf + r);
+        CHECK_LE(event->name + event->len, event_buf + r);
         if (!strcmp(event->name, "kioslaverc"))
           kioslaverc_touched = true;
         // Advance the pointer just past the end of the filename.
@@ -795,7 +890,11 @@ class GConfSettingGetterImplKDE
   FilePath kde_config_dir_;
   bool indirect_manual_;
   bool auto_no_pac_;
-  bool reversed_exception_;
+  bool reversed_bypass_list_;
+  // We don't own |env_var_getter_|.  It's safe to hold a pointer to it, since
+  // both it and us are owned by ProxyConfigServiceLinux::Delegate, and have the
+  // same lifetime.
+  base::Environment* env_var_getter_;
 
   // We cache these settings whenever we re-read the kioslaverc file.
   string_map_type string_table_;
@@ -825,10 +924,10 @@ bool ProxyConfigServiceLinux::Delegate::GetProxyFromGConf(
   gconf_getter_->GetInt((key + "port").c_str(), &port);
   if (port != 0) {
     // If a port is set and non-zero:
-    host += ":" + IntToString(port);
+    host += ":" + base::IntToString(port);
   }
   host = FixupProxyHostScheme(
-      is_socks ? ProxyServer::SCHEME_SOCKS4 : ProxyServer::SCHEME_HTTP,
+      is_socks ? ProxyServer::SCHEME_SOCKS5 : ProxyServer::SCHEME_HTTP,
       host);
   ProxyServer proxy_server = ProxyServer::FromURI(host,
                                                   ProxyServer::SCHEME_HTTP);
@@ -862,11 +961,11 @@ bool ProxyConfigServiceLinux::Delegate::GetConfigFromGConf(
         GURL pac_url(pac_url_str);
         if (!pac_url.is_valid())
           return false;
-        config->pac_url = pac_url;
+        config->set_pac_url(pac_url);
         return true;
       }
     }
-    config->auto_detect = true;
+    config->set_auto_detect(true);
     return true;
   }
 
@@ -895,38 +994,40 @@ bool ProxyConfigServiceLinux::Delegate::GetConfigFromGConf(
     // Try socks.
     if (GetProxyFromGConf("/system/proxy/socks_", true, &proxy_server)) {
       // gconf settings do not appear to distinguish between socks
-      // version. We default to version 4.
-      config->proxy_rules.type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
-      config->proxy_rules.single_proxy = proxy_server;
+      // version. We default to version 5. For more information on this policy
+      // decisions, see:
+      // http://code.google.com/p/chromium/issues/detail?id=55912#c2
+      config->proxy_rules().type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
+      config->proxy_rules().single_proxy = proxy_server;
     }
   }
-  if (config->proxy_rules.empty()) {
+  if (config->proxy_rules().empty()) {
     bool have_http = GetProxyFromGConf("/system/http_proxy/", false,
                                        &proxy_server);
     if (same_proxy) {
       if (have_http) {
-        config->proxy_rules.type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
-        config->proxy_rules.single_proxy = proxy_server;
+        config->proxy_rules().type = ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY;
+        config->proxy_rules().single_proxy = proxy_server;
       }
     } else {
       // Protocol specific settings.
       if (have_http)
-        config->proxy_rules.proxy_for_http = proxy_server;
+        config->proxy_rules().proxy_for_http = proxy_server;
       bool have_secure = GetProxyFromGConf("/system/proxy/secure_", false,
                                            &proxy_server);
       if (have_secure)
-        config->proxy_rules.proxy_for_https = proxy_server;
+        config->proxy_rules().proxy_for_https = proxy_server;
       bool have_ftp = GetProxyFromGConf("/system/proxy/ftp_", false,
                                         &proxy_server);
       if (have_ftp)
-        config->proxy_rules.proxy_for_ftp = proxy_server;
+        config->proxy_rules().proxy_for_ftp = proxy_server;
       if (have_http || have_secure || have_ftp)
-        config->proxy_rules.type =
+        config->proxy_rules().type =
             ProxyConfig::ProxyRules::TYPE_PROXY_PER_SCHEME;
     }
   }
 
-  if (config->proxy_rules.empty()) {
+  if (config->proxy_rules().empty()) {
     // Manual mode but we couldn't parse any rules.
     return false;
   }
@@ -943,34 +1044,51 @@ bool ProxyConfigServiceLinux::Delegate::GetConfigFromGConf(
   }
 
   // Now the bypass list.
-  gconf_getter_->GetStringList("/system/http_proxy/ignore_hosts",
-                               &config->proxy_bypass);
+  std::vector<std::string> ignore_hosts_list;
+  config->proxy_rules().bypass_rules.Clear();
+  if (gconf_getter_->GetStringList("/system/http_proxy/ignore_hosts",
+                                   &ignore_hosts_list)) {
+    std::vector<std::string>::const_iterator it(ignore_hosts_list.begin());
+    for (; it != ignore_hosts_list.end(); ++it) {
+      if (gconf_getter_->MatchHostsUsingSuffixMatching()) {
+        config->proxy_rules().bypass_rules.
+            AddRuleFromStringUsingSuffixMatching(*it);
+      } else {
+        config->proxy_rules().bypass_rules.AddRuleFromString(*it);
+      }
+    }
+  }
   // Note that there are no settings with semantics corresponding to
-  // config->proxy_bypass_local_names.
+  // bypass of local names in GNOME. In KDE, "<local>" is supported
+  // as a hostname rule.
+
+  // KDE allows one to reverse the bypass rules.
+  config->proxy_rules().reverse_bypass = gconf_getter_->BypassListIsReversed();
 
   return true;
 }
 
-ProxyConfigServiceLinux::Delegate::Delegate(
-    base::EnvironmentVariableGetter* env_var_getter)
+ProxyConfigServiceLinux::Delegate::Delegate(base::Environment* env_var_getter)
     : env_var_getter_(env_var_getter),
       glib_default_loop_(NULL), io_loop_(NULL) {
   // Figure out which GConfSettingGetterImpl to use, if any.
-  switch (base::GetDesktopEnvironment(env_var_getter)) {
-    case base::DESKTOP_ENVIRONMENT_GNOME:
+  switch (base::nix::GetDesktopEnvironment(env_var_getter)) {
+    case base::nix::DESKTOP_ENVIRONMENT_GNOME:
+#if defined(USE_GCONF)
       gconf_getter_.reset(new GConfSettingGetterImplGConf());
+#endif
       break;
-    case base::DESKTOP_ENVIRONMENT_KDE3:
-    case base::DESKTOP_ENVIRONMENT_KDE4:
+    case base::nix::DESKTOP_ENVIRONMENT_KDE3:
+    case base::nix::DESKTOP_ENVIRONMENT_KDE4:
       gconf_getter_.reset(new GConfSettingGetterImplKDE(env_var_getter));
       break;
-    case base::DESKTOP_ENVIRONMENT_OTHER:
+    case base::nix::DESKTOP_ENVIRONMENT_XFCE:
+    case base::nix::DESKTOP_ENVIRONMENT_OTHER:
       break;
   }
 }
 
-ProxyConfigServiceLinux::Delegate::Delegate(
-    base::EnvironmentVariableGetter* env_var_getter,
+ProxyConfigServiceLinux::Delegate::Delegate(base::Environment* env_var_getter,
     GConfSettingGetter* gconf_getter)
     : env_var_getter_(env_var_getter), gconf_getter_(gconf_getter),
       glib_default_loop_(NULL), io_loop_(NULL) {
@@ -989,16 +1107,16 @@ void ProxyConfigServiceLinux::Delegate::SetupAndFetchInitialConfig(
   // proxy setting change notifications. This should not be the usual
   // case but is intended to simplify test setups.
   if (!io_loop_ || !file_loop)
-    LOG(INFO) << "Monitoring of proxy setting changes is disabled";
+    VLOG(1) << "Monitoring of proxy setting changes is disabled";
 
   // Fetch and cache the current proxy config. The config is left in
-  // cached_config_, where GetProxyConfig() running on the IO thread
+  // cached_config_, where GetLatestProxyConfig() running on the IO thread
   // will expect to find it. This is safe to do because we return
   // before this ProxyConfigServiceLinux is passed on to
   // the ProxyService.
 
   // Note: It would be nice to prioritize environment variables
-  // and only fallback to gconf if env vars were unset. But
+  // and only fall back to gconf if env vars were unset. But
   // gnome-terminal "helpfully" sets http_proxy and no_proxy, and it
   // does so even if the proxy mode is set to auto, which would
   // mislead us.
@@ -1010,8 +1128,8 @@ void ProxyConfigServiceLinux::Delegate::SetupAndFetchInitialConfig(
       if (GetConfigFromGConf(&cached_config_)) {
         cached_config_.set_id(1);  // mark it as valid
         got_config = true;
-        LOG(INFO) << "Obtained proxy settings from " <<
-            gconf_getter_->GetDataSource();
+        VLOG(1) << "Obtained proxy settings from "
+                << gconf_getter_->GetDataSource();
         // If gconf proxy mode is "none", meaning direct, then we take
         // that to be a valid config and will not check environment
         // variables. The alternative would have been to look for a proxy
@@ -1035,19 +1153,36 @@ void ProxyConfigServiceLinux::Delegate::SetupAndFetchInitialConfig(
     // work.
     if (GetConfigFromEnv(&cached_config_)) {
       cached_config_.set_id(1);  // mark it as valid
-      LOG(INFO) << "Obtained proxy settings from environment variables";
+      VLOG(1) << "Obtained proxy settings from environment variables";
     }
   }
 }
 
-int ProxyConfigServiceLinux::Delegate::GetProxyConfig(ProxyConfig* config) {
+void ProxyConfigServiceLinux::Delegate::AddObserver(Observer* observer) {
+  observers_.AddObserver(observer);
+}
+
+void ProxyConfigServiceLinux::Delegate::RemoveObserver(Observer* observer) {
+  observers_.RemoveObserver(observer);
+}
+
+ProxyConfigService::ConfigAvailability
+    ProxyConfigServiceLinux::Delegate::GetLatestProxyConfig(
+        ProxyConfig* config) {
   // This is called from the IO thread.
   DCHECK(!io_loop_ || MessageLoop::current() == io_loop_);
 
   // Simply return the last proxy configuration that glib_default_loop
   // notified us of.
-  *config = cached_config_;
-  return cached_config_.is_valid() ? OK : ERR_FAILED;
+  *config = cached_config_.is_valid() ?
+      cached_config_ : ProxyConfig::CreateDirect();
+
+  // We return CONFIG_VALID to indicate that *config was filled in. It is always
+  // going to be available since we initialized eagerly on the UI thread.
+  // TODO(eroman): do lazy initialization instead, so we no longer need
+  //               to construct ProxyConfigServiceLinux on the UI thread.
+  //               In which case, we may return false here.
+  return CONFIG_VALID;
 }
 
 // Depending on the GConfSettingGetter in use, this method will be called
@@ -1060,7 +1195,7 @@ void ProxyConfigServiceLinux::Delegate::OnCheckProxyConfigSettings() {
   if (valid)
     new_config.set_id(1);  // mark it as valid
 
-  // See if it is different than what we had before.
+  // See if it is different from what we had before.
   if (new_config.is_valid() != reference_config_.is_valid() ||
       !new_config.Equals(reference_config_)) {
     // Post a task to |io_loop| with the new configuration, so it can
@@ -1079,8 +1214,11 @@ void ProxyConfigServiceLinux::Delegate::OnCheckProxyConfigSettings() {
 void ProxyConfigServiceLinux::Delegate::SetNewProxyConfig(
     const ProxyConfig& new_config) {
   DCHECK(MessageLoop::current() == io_loop_);
-  LOG(INFO) << "Proxy configuration changed";
+  VLOG(1) << "Proxy configuration changed";
   cached_config_ = new_config;
+  FOR_EACH_OBSERVER(
+      Observer, observers_,
+      OnProxyConfigChanged(new_config, ProxyConfigService::CONFIG_VALID));
 }
 
 void ProxyConfigServiceLinux::Delegate::PostDestroyTask() {
@@ -1108,18 +1246,35 @@ void ProxyConfigServiceLinux::Delegate::OnDestroy() {
 }
 
 ProxyConfigServiceLinux::ProxyConfigServiceLinux()
-    : delegate_(new Delegate(base::EnvironmentVariableGetter::Create())) {
+    : delegate_(new Delegate(base::Environment::Create())) {
+}
+
+ProxyConfigServiceLinux::~ProxyConfigServiceLinux() {
+  delegate_->PostDestroyTask();
 }
 
 ProxyConfigServiceLinux::ProxyConfigServiceLinux(
-    base::EnvironmentVariableGetter* env_var_getter)
+    base::Environment* env_var_getter)
     : delegate_(new Delegate(env_var_getter)) {
 }
 
 ProxyConfigServiceLinux::ProxyConfigServiceLinux(
-    base::EnvironmentVariableGetter* env_var_getter,
+    base::Environment* env_var_getter,
     GConfSettingGetter* gconf_getter)
     : delegate_(new Delegate(env_var_getter, gconf_getter)) {
+}
+
+void ProxyConfigServiceLinux::AddObserver(Observer* observer) {
+  delegate_->AddObserver(observer);
+}
+
+void ProxyConfigServiceLinux::RemoveObserver(Observer* observer) {
+  delegate_->RemoveObserver(observer);
+}
+
+ProxyConfigService::ConfigAvailability
+    ProxyConfigServiceLinux::GetLatestProxyConfig(ProxyConfig* config) {
+  return delegate_->GetLatestProxyConfig(config);
 }
 
 }  // namespace net

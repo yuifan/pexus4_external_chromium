@@ -1,6 +1,6 @@
-// Copyright (c) 2008 The Chromium Authors. All rights reserved.  Use of this
-// source code is governed by a BSD-style license that can be found in the
-// LICENSE file.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include "net/base/file_stream.h"
 
@@ -9,6 +9,8 @@
 #include "base/file_path.h"
 #include "base/logging.h"
 #include "base/message_loop.h"
+#include "base/metrics/histogram.h"
+#include "base/threading/thread_restrictions.h"
 #include "net/base/net_errors.h"
 
 namespace net {
@@ -74,14 +76,15 @@ class FileStream::AsyncContext : public MessageLoopForIO::IOHandler {
 FileStream::AsyncContext::~AsyncContext() {
   is_closing_ = true;
   bool waited = false;
-  base::Time start = base::Time::Now();
+  base::TimeTicks start = base::TimeTicks::Now();
   while (callback_) {
     waited = true;
     MessageLoopForIO::current()->WaitForIOCompletion(INFINITE, this);
   }
   if (waited) {
     // We want to see if we block the message loop for too long.
-    UMA_HISTOGRAM_TIMES("AsyncIO.FileStreamClose", base::Time::Now() - start);
+    UMA_HISTOGRAM_TIMES("AsyncIO.FileStreamClose",
+                        base::TimeTicks::Now() - start);
   }
 }
 
@@ -117,12 +120,14 @@ void FileStream::AsyncContext::OnIOCompleted(
 
 FileStream::FileStream()
     : file_(INVALID_HANDLE_VALUE),
-      open_flags_(0) {
+      open_flags_(0),
+      auto_closed_(true) {
 }
 
 FileStream::FileStream(base::PlatformFile file, int flags)
     : file_(file),
-      open_flags_(flags) {
+      open_flags_(flags),
+      auto_closed_(false) {
   // If the file handle is opened with base::PLATFORM_FILE_ASYNC, we need to
   // make sure we will perform asynchronous File IO to it.
   if (flags & base::PLATFORM_FILE_ASYNC) {
@@ -133,7 +138,8 @@ FileStream::FileStream(base::PlatformFile file, int flags)
 }
 
 FileStream::~FileStream() {
-  Close();
+  if (auto_closed_)
+    Close();
 }
 
 void FileStream::Close() {
@@ -154,7 +160,7 @@ int FileStream::Open(const FilePath& path, int open_flags) {
   }
 
   open_flags_ = open_flags;
-  file_ = base::CreatePlatformFile(path.value(), open_flags_, NULL);
+  file_ = base::CreatePlatformFile(path, open_flags_, NULL, NULL);
   if (file_ == INVALID_HANDLE_VALUE) {
     DWORD error = GetLastError();
     LOG(WARNING) << "Failed to open file: " << error;
@@ -193,6 +199,8 @@ int64 FileStream::Seek(Whence whence, int64 offset) {
 }
 
 int64 FileStream::Available() {
+  base::ThreadRestrictions::AssertIOAllowed();
+
   if (!IsOpen())
     return ERR_UNEXPECTED;
 
@@ -218,8 +226,12 @@ int FileStream::Read(
 
   OVERLAPPED* overlapped = NULL;
   if (async_context_.get()) {
+    DCHECK(callback);
     DCHECK(!async_context_->callback());
     overlapped = async_context_->overlapped();
+  } else {
+    DCHECK(!callback);
+    base::ThreadRestrictions::AssertIOAllowed();
   }
 
   int rv;
@@ -274,8 +286,12 @@ int FileStream::Write(
 
   OVERLAPPED* overlapped = NULL;
   if (async_context_.get()) {
+    DCHECK(callback);
     DCHECK(!async_context_->callback());
     overlapped = async_context_->overlapped();
+  } else {
+    DCHECK(!callback);
+    base::ThreadRestrictions::AssertIOAllowed();
   }
 
   int rv;
@@ -298,7 +314,26 @@ int FileStream::Write(
   return rv;
 }
 
+int FileStream::Flush() {
+  base::ThreadRestrictions::AssertIOAllowed();
+
+  if (!IsOpen())
+    return ERR_UNEXPECTED;
+
+  DCHECK(open_flags_ & base::PLATFORM_FILE_WRITE);
+  if (FlushFileBuffers(file_)) {
+    return OK;
+  }
+
+  int rv;
+  DWORD error = GetLastError();
+  rv = MapErrorCode(error);
+  return rv;
+}
+
 int64 FileStream::Truncate(int64 bytes) {
+  base::ThreadRestrictions::AssertIOAllowed();
+
   if (!IsOpen())
     return ERR_UNEXPECTED;
 

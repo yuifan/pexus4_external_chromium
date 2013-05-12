@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -10,6 +10,7 @@
 
 #ifndef NET_BASE_LISTEN_SOCKET_H_
 #define NET_BASE_LISTEN_SOCKET_H_
+#pragma once
 
 #include "build/build_config.h"
 
@@ -18,13 +19,13 @@
 #endif
 #include <string>
 #if defined(OS_WIN)
-#include "base/object_watcher.h"
+#include "base/win/object_watcher.h"
 #elif defined(OS_POSIX)
 #include "base/message_loop.h"
 #endif
 
 #include "base/basictypes.h"
-#include "base/ref_counted.h"
+#include "base/memory/ref_counted.h"
 
 #if defined(OS_POSIX)
 struct event;  // From libevent
@@ -34,7 +35,7 @@ typedef int SOCKET;
 // Implements a raw socket interface
 class ListenSocket : public base::RefCountedThreadSafe<ListenSocket>,
 #if defined(OS_WIN)
-                     public base::ObjectWatcher::Delegate
+                     public base::win::ObjectWatcher::Delegate
 #elif defined(OS_POSIX)
                      public MessageLoopForIO::Watcher
 #endif
@@ -51,7 +52,9 @@ class ListenSocket : public base::RefCountedThreadSafe<ListenSocket>,
     // Socket that was created.  Ownership of connection is transferred
     // to the delegate with this call.
     virtual void DidAccept(ListenSocket *server, ListenSocket *connection) = 0;
-    virtual void DidRead(ListenSocket *connection, const std::string& data) = 0;
+    virtual void DidRead(ListenSocket *connection,
+                         const char* data,
+                         int len) = 0;
     virtual void DidClose(ListenSocket *sock) = 0;
   };
 
@@ -73,6 +76,13 @@ class ListenSocket : public base::RefCountedThreadSafe<ListenSocket>,
  protected:
   friend class base::RefCountedThreadSafe<ListenSocket>;
 
+  enum WaitState {
+    NOT_WAITING      = 0,
+    WAITING_ACCEPT   = 1,
+    WAITING_READ     = 3,
+    WAITING_CLOSE    = 4
+  };
+
   static const SOCKET kInvalidSocket;
   static const int kSocketError;
 
@@ -90,12 +100,6 @@ class ListenSocket : public base::RefCountedThreadSafe<ListenSocket>,
   virtual void Close();
   virtual void CloseSocket(SOCKET s);
 
-  enum WaitState {
-    NOT_WAITING      = 0,
-    WAITING_ACCEPT   = 1,
-    WAITING_READ     = 3,
-    WAITING_CLOSE    = 4
-  };
   // Pass any value in case of Windows, because in Windows
   // we are not using state.
   void WatchSocket(WaitState state);
@@ -104,15 +108,15 @@ class ListenSocket : public base::RefCountedThreadSafe<ListenSocket>,
 #if defined(OS_WIN)
   // ObjectWatcher delegate
   virtual void OnObjectSignaled(HANDLE object);
-  base::ObjectWatcher watcher_;
+  base::win::ObjectWatcher watcher_;
   HANDLE socket_event_;
 #elif defined(OS_POSIX)
+  // Called by MessagePumpLibevent when the socket is ready to do I/O
+  virtual void OnFileCanReadWithoutBlocking(int fd);
+  virtual void OnFileCanWriteWithoutBlocking(int fd);
   WaitState wait_state_;
   // The socket's libevent wrapper
   MessageLoopForIO::FileDescriptorWatcher watcher_;
-  // Called by MessagePumpLibevent when the socket is ready to do I/O
-  void OnFileCanReadWithoutBlocking(int fd);
-  void OnFileCanWriteWithoutBlocking(int fd);
 #endif
 
   SOCKET socket_;

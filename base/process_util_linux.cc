@@ -17,8 +17,12 @@
 
 #include "base/file_util.h"
 #include "base/logging.h"
+#include "base/string_number_conversions.h"
+#include "base/string_split.h"
 #include "base/string_tokenizer.h"
 #include "base/string_util.h"
+#include "base/sys_info.h"
+#include "base/threading/thread_restrictions.h"
 
 namespace {
 
@@ -28,15 +32,73 @@ enum ParsingState {
 };
 
 // Reads /proc/<pid>/stat and populates |proc_stats| with the values split by
-// spaces.
-void GetProcStats(pid_t pid, std::vector<std::string>* proc_stats) {
+// spaces. Returns true if successful.
+bool GetProcStats(pid_t pid, std::vector<std::string>* proc_stats) {
+  // Synchronously reading files in /proc is safe.
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+
   FilePath stat_file("/proc");
-  stat_file = stat_file.Append(IntToString(pid));
+  stat_file = stat_file.Append(base::IntToString(pid));
   stat_file = stat_file.Append("stat");
   std::string mem_stats;
   if (!file_util::ReadFileToString(stat_file, &mem_stats))
-    return;
-  SplitString(mem_stats, ' ', proc_stats);
+    return false;
+  base::SplitString(mem_stats, ' ', proc_stats);
+  return true;
+}
+
+// Reads /proc/<pid>/cmdline and populates |proc_cmd_line_args| with the command
+// line arguments. Returns true if successful.
+// Note: /proc/<pid>/cmdline contains command line arguments separated by single
+// null characters. We tokenize it into a vector of strings using '\0' as a
+// delimiter.
+bool GetProcCmdline(pid_t pid, std::vector<std::string>* proc_cmd_line_args) {
+  // Synchronously reading files in /proc is safe.
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+
+  FilePath cmd_line_file("/proc");
+  cmd_line_file = cmd_line_file.Append(base::IntToString(pid));
+  cmd_line_file = cmd_line_file.Append("cmdline");
+  std::string cmd_line;
+  if (!file_util::ReadFileToString(cmd_line_file, &cmd_line))
+    return false;
+  std::string delimiters;
+  delimiters.push_back('\0');
+  Tokenize(cmd_line, delimiters, proc_cmd_line_args);
+  return true;
+}
+
+// Get the total CPU of a single process.  Return value is number of jiffies
+// on success or -1 on error.
+int GetProcessCPU(pid_t pid) {
+  // Synchronously reading files in /proc is safe.
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+
+  // Use /proc/<pid>/task to find all threads and parse their /stat file.
+  FilePath path = FilePath(StringPrintf("/proc/%d/task/", pid));
+
+  DIR* dir = opendir(path.value().c_str());
+  if (!dir) {
+    PLOG(ERROR) << "opendir(" << path.value() << ")";
+    return -1;
+  }
+
+  int total_cpu = 0;
+  while (struct dirent* ent = readdir(dir)) {
+    if (ent->d_name[0] == '.')
+      continue;
+
+    FilePath stat_path = path.AppendASCII(ent->d_name).AppendASCII("stat");
+    std::string stat;
+    if (file_util::ReadFileToString(stat_path, &stat)) {
+      int cpu = base::ParseProcStatCPU(stat);
+      if (cpu > 0)
+        total_cpu += cpu;
+    }
+  }
+  closedir(dir);
+
+  return total_cpu;
 }
 
 }  // namespace
@@ -44,8 +106,11 @@ void GetProcStats(pid_t pid, std::vector<std::string>* proc_stats) {
 namespace base {
 
 ProcessId GetParentProcessId(ProcessHandle process) {
+  // Synchronously reading files in /proc is safe.
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+
   FilePath stat_file("/proc");
-  stat_file = stat_file.Append(IntToString(process));
+  stat_file = stat_file.Append(base::IntToString(process));
   stat_file = stat_file.Append("status");
   std::string status;
   if (!file_util::ReadFileToString(stat_file, &status))
@@ -63,7 +128,8 @@ ProcessId GetParentProcessId(ProcessHandle process) {
       case KEY_VALUE:
         DCHECK(!last_key_name.empty());
         if (last_key_name == "PPid") {
-          pid_t ppid = StringToInt(tokenizer.token());
+          int ppid;
+          base::StringToInt(tokenizer.token(), &ppid);
           return ppid;
         }
         state = KEY_NAME;
@@ -76,48 +142,35 @@ ProcessId GetParentProcessId(ProcessHandle process) {
 
 FilePath GetProcessExecutablePath(ProcessHandle process) {
   FilePath stat_file("/proc");
-  stat_file = stat_file.Append(IntToString(process));
+  stat_file = stat_file.Append(base::IntToString(process));
   stat_file = stat_file.Append("exe");
-  char exename[2048];
-  ssize_t len = readlink(stat_file.value().c_str(), exename, sizeof(exename));
-  if (len < 1) {
+  FilePath exe_name;
+  if (!file_util::ReadSymbolicLink(stat_file, &exe_name)) {
     // No such process.  Happens frequently in e.g. TerminateAllChromeProcesses
     return FilePath();
   }
-  return FilePath(std::string(exename, len));
+  return exe_name;
 }
 
-NamedProcessIterator::NamedProcessIterator(const std::wstring& executable_name,
-                                           const ProcessFilter* filter)
-    : executable_name_(executable_name), filter_(filter) {
+ProcessIterator::ProcessIterator(const ProcessFilter* filter)
+    : filter_(filter) {
   procfs_dir_ = opendir("/proc");
 }
 
-NamedProcessIterator::~NamedProcessIterator() {
+ProcessIterator::~ProcessIterator() {
   if (procfs_dir_) {
     closedir(procfs_dir_);
     procfs_dir_ = NULL;
   }
 }
 
-const ProcessEntry* NamedProcessIterator::NextProcessEntry() {
-  bool result = false;
-  do {
-    result = CheckForNextProcess();
-  } while (result && !IncludeEntry());
-
-  if (result)
-    return &entry_;
-
-  return NULL;
-}
-
-bool NamedProcessIterator::CheckForNextProcess() {
+bool ProcessIterator::CheckForNextProcess() {
   // TODO(port): skip processes owned by different UID
 
   dirent* slot = 0;
   const char* openparen;
   const char* closeparen;
+  std::vector<std::string> cmd_line_args;
 
   // Arbitrarily guess that there will never be more than 200 non-process
   // files in /proc.  Hardy has 53.
@@ -143,26 +196,32 @@ bool NamedProcessIterator::CheckForNextProcess() {
       continue;
     }
 
+    // Read the process's command line.
+    std::string pid_string(slot->d_name);
+    int pid;
+    if (StringToInt(pid_string, &pid) && !GetProcCmdline(pid, &cmd_line_args))
+      continue;
+
     // Read the process's status.
     char buf[NAME_MAX + 12];
     sprintf(buf, "/proc/%s/stat", slot->d_name);
     FILE *fp = fopen(buf, "r");
     if (!fp)
-      return false;
+      continue;
     const char* result = fgets(buf, sizeof(buf), fp);
     fclose(fp);
     if (!result)
-      return false;
+      continue;
 
     // Parse the status.  It is formatted like this:
-    // %d (%s) %c %d ...
-    // pid (name) runstate ppid
+    // %d (%s) %c %d %d ...
+    // pid (name) runstate ppid gid
     // To avoid being fooled by names containing a closing paren, scan
     // backwards.
     openparen = strchr(buf, '(');
     closeparen = strrchr(buf, ')');
     if (!openparen || !closeparen)
-      return false;
+      continue;
     char runstate = closeparen[2];
 
     // Is the process in 'Zombie' state, i.e. dead but waiting to be reaped?
@@ -179,57 +238,70 @@ bool NamedProcessIterator::CheckForNextProcess() {
     return false;
   }
 
-  entry_.pid = atoi(slot->d_name);
-  entry_.ppid = atoi(closeparen + 3);
+  // This seems fragile.
+  entry_.pid_ = atoi(slot->d_name);
+  entry_.ppid_ = atoi(closeparen + 3);
+  entry_.gid_ = atoi(strchr(closeparen + 4, ' '));
+
+  entry_.cmd_line_args_.assign(cmd_line_args.begin(), cmd_line_args.end());
 
   // TODO(port): read pid's commandline's $0, like killall does.  Using the
   // short name between openparen and closeparen won't work for long names!
   int len = closeparen - openparen - 1;
-  if (len > NAME_MAX)
-    len = NAME_MAX;
-  memcpy(entry_.szExeFile, openparen + 1, len);
-  entry_.szExeFile[len] = 0;
-
+  entry_.exe_file_.assign(openparen + 1, len);
   return true;
 }
 
 bool NamedProcessIterator::IncludeEntry() {
-  // TODO(port): make this also work for non-ASCII filenames
-  if (WideToASCII(executable_name_) != entry_.szExeFile)
+  if (executable_name_ != entry().exe_file())
     return false;
-  if (!filter_)
-    return true;
-  return filter_->Includes(entry_.pid, entry_.ppid);
+  return ProcessIterator::IncludeEntry();
+}
+
+
+// static
+ProcessMetrics* ProcessMetrics::CreateProcessMetrics(ProcessHandle process) {
+  return new ProcessMetrics(process);
 }
 
 // On linux, we return vsize.
 size_t ProcessMetrics::GetPagefileUsage() const {
   std::vector<std::string> proc_stats;
-  GetProcStats(process_, &proc_stats);
+  if (!GetProcStats(process_, &proc_stats))
+    LOG(WARNING) << "Failed to get process stats.";
   const size_t kVmSize = 22;
-  if (proc_stats.size() > kVmSize)
-    return static_cast<size_t>(StringToInt(proc_stats[kVmSize]));
+  if (proc_stats.size() > kVmSize) {
+    int vm_size;
+    base::StringToInt(proc_stats[kVmSize], &vm_size);
+    return static_cast<size_t>(vm_size);
+  }
   return 0;
 }
 
 // On linux, we return the high water mark of vsize.
 size_t ProcessMetrics::GetPeakPagefileUsage() const {
   std::vector<std::string> proc_stats;
-  GetProcStats(process_, &proc_stats);
+  if (!GetProcStats(process_, &proc_stats))
+    LOG(WARNING) << "Failed to get process stats.";
   const size_t kVmPeak = 21;
-  if (proc_stats.size() > kVmPeak)
-    return static_cast<size_t>(StringToInt(proc_stats[kVmPeak]));
+  if (proc_stats.size() > kVmPeak) {
+    int vm_peak;
+    if (base::StringToInt(proc_stats[kVmPeak], &vm_peak))
+      return vm_peak;
+  }
   return 0;
 }
 
 // On linux, we return RSS.
 size_t ProcessMetrics::GetWorkingSetSize() const {
   std::vector<std::string> proc_stats;
-  GetProcStats(process_, &proc_stats);
+  if (!GetProcStats(process_, &proc_stats))
+    LOG(WARNING) << "Failed to get process stats.";
   const size_t kVmRss = 23;
   if (proc_stats.size() > kVmRss) {
-    size_t num_pages = static_cast<size_t>(StringToInt(proc_stats[kVmRss]));
-    return num_pages * getpagesize();
+    int num_pages;
+    if (base::StringToInt(proc_stats[kVmRss], &num_pages))
+      return static_cast<size_t>(num_pages) * getpagesize();
   }
   return 0;
 }
@@ -237,19 +309,30 @@ size_t ProcessMetrics::GetWorkingSetSize() const {
 // On linux, we return the high water mark of RSS.
 size_t ProcessMetrics::GetPeakWorkingSetSize() const {
   std::vector<std::string> proc_stats;
-  GetProcStats(process_, &proc_stats);
+  if (!GetProcStats(process_, &proc_stats))
+    LOG(WARNING) << "Failed to get process stats.";
   const size_t kVmHwm = 23;
   if (proc_stats.size() > kVmHwm) {
-    size_t num_pages = static_cast<size_t>(StringToInt(proc_stats[kVmHwm]));
-    return num_pages * getpagesize();
+    int num_pages;
+    base::StringToInt(proc_stats[kVmHwm], &num_pages);
+    return static_cast<size_t>(num_pages) * getpagesize();
   }
   return 0;
 }
 
-size_t ProcessMetrics::GetPrivateBytes() const {
+bool ProcessMetrics::GetMemoryBytes(size_t* private_bytes,
+                                    size_t* shared_bytes) {
   WorkingSetKBytes ws_usage;
-  GetWorkingSetKBytes(&ws_usage);
-  return ws_usage.priv << 10;
+  if (!GetWorkingSetKBytes(&ws_usage))
+    return false;
+
+  if (private_bytes)
+    *private_bytes = ws_usage.priv << 10;
+
+  if (shared_bytes)
+    *shared_bytes = ws_usage.shared * 1024;
+
+  return true;
 }
 
 // Private and Shared working set sizes are obtained from /proc/<pid>/smaps.
@@ -257,20 +340,32 @@ size_t ProcessMetrics::GetPrivateBytes() const {
 // close approximation.
 // See http://www.pixelbeat.org/scripts/ps_mem.py
 bool ProcessMetrics::GetWorkingSetKBytes(WorkingSetKBytes* ws_usage) const {
-  FilePath stat_file =
-    FilePath("/proc").Append(IntToString(process_)).Append("smaps");
+  // Synchronously reading files in /proc is safe.
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+
+  FilePath proc_dir = FilePath("/proc").Append(base::IntToString(process_));
   std::string smaps;
   int private_kb = 0;
   int pss_kb = 0;
   bool have_pss = false;
-  if (file_util::ReadFileToString(stat_file, &smaps) && smaps.length() > 0) {
+  bool ret;
+
+  {
+    FilePath smaps_file = proc_dir.Append("smaps");
+    // Synchronously reading files in /proc is safe.
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
+    ret = file_util::ReadFileToString(smaps_file, &smaps);
+  }
+  if (ret && smaps.length() > 0) {
+    const std::string private_prefix = "Private_";
+    const std::string pss_prefix = "Pss";
     StringTokenizer tokenizer(smaps, ":\n");
+    StringPiece last_key_name;
     ParsingState state = KEY_NAME;
-    std::string last_key_name;
     while (tokenizer.GetNext()) {
       switch (state) {
         case KEY_NAME:
-          last_key_name = tokenizer.token();
+          last_key_name = tokenizer.token_piece();
           state = KEY_VALUE;
           break;
         case KEY_VALUE:
@@ -278,11 +373,15 @@ bool ProcessMetrics::GetWorkingSetKBytes(WorkingSetKBytes* ws_usage) const {
             NOTREACHED();
             return false;
           }
-          if (StartsWithASCII(last_key_name, "Private_", 1)) {
-            private_kb += StringToInt(tokenizer.token());
-          } else if (StartsWithASCII(last_key_name, "Pss", 1)) {
+          if (last_key_name.starts_with(private_prefix)) {
+            int cur;
+            base::StringToInt(tokenizer.token(), &cur);
+            private_kb += cur;
+          } else if (last_key_name.starts_with(pss_prefix)) {
             have_pss = true;
-            pss_kb += StringToInt(tokenizer.token());
+            int cur;
+            base::StringToInt(tokenizer.token(), &cur);
+            pss_kb += cur;
           }
           state = KEY_NAME;
           break;
@@ -295,18 +394,25 @@ bool ProcessMetrics::GetWorkingSetKBytes(WorkingSetKBytes* ws_usage) const {
     if (page_size_kb <= 0)
       return false;
 
-    stat_file =
-        FilePath("/proc").Append(IntToString(process_)).Append("statm");
     std::string statm;
-    if (!file_util::ReadFileToString(stat_file, &statm) || statm.length() == 0)
+    {
+      FilePath statm_file = proc_dir.Append("statm");
+      // Synchronously reading files in /proc is safe.
+      base::ThreadRestrictions::ScopedAllowIO allow_io;
+      ret = file_util::ReadFileToString(statm_file, &statm);
+    }
+    if (!ret || statm.length() == 0)
       return false;
 
     std::vector<std::string> statm_vec;
-    SplitString(statm, ' ', &statm_vec);
+    base::SplitString(statm, ' ', &statm_vec);
     if (statm_vec.size() != 7)
       return false;  // Not the format we expect.
-    private_kb = StringToInt(statm_vec[1]) - StringToInt(statm_vec[2]);
-    private_kb *= page_size_kb;
+
+    int statm1, statm2;
+    base::StringToInt(statm_vec[1], &statm1);
+    base::StringToInt(statm_vec[2], &statm2);
+    private_kb = (statm1 - statm2) * page_size_kb;
   }
   ws_usage->priv = private_kb;
   // Sharable is not calculated, as it does not provide interesting data.
@@ -316,96 +422,6 @@ bool ProcessMetrics::GetWorkingSetKBytes(WorkingSetKBytes* ws_usage) const {
   if (have_pss)
     ws_usage->shared = pss_kb;
   return true;
-}
-
-// To have /proc/self/io file you must enable CONFIG_TASK_IO_ACCOUNTING
-// in your kernel configuration.
-bool ProcessMetrics::GetIOCounters(IoCounters* io_counters) const {
-  std::string proc_io_contents;
-  FilePath io_file("/proc");
-  io_file = io_file.Append(IntToString(process_));
-  io_file = io_file.Append("io");
-  if (!file_util::ReadFileToString(io_file, &proc_io_contents))
-    return false;
-
-  (*io_counters).OtherOperationCount = 0;
-  (*io_counters).OtherTransferCount = 0;
-
-  StringTokenizer tokenizer(proc_io_contents, ": \n");
-  ParsingState state = KEY_NAME;
-  std::string last_key_name;
-  while (tokenizer.GetNext()) {
-    switch (state) {
-      case KEY_NAME:
-        last_key_name = tokenizer.token();
-        state = KEY_VALUE;
-        break;
-      case KEY_VALUE:
-        DCHECK(!last_key_name.empty());
-        if (last_key_name == "syscr") {
-          (*io_counters).ReadOperationCount = StringToInt64(tokenizer.token());
-        } else if (last_key_name == "syscw") {
-          (*io_counters).WriteOperationCount = StringToInt64(tokenizer.token());
-        } else if (last_key_name == "rchar") {
-          (*io_counters).ReadTransferCount = StringToInt64(tokenizer.token());
-        } else if (last_key_name == "wchar") {
-          (*io_counters).WriteTransferCount = StringToInt64(tokenizer.token());
-        }
-        state = KEY_NAME;
-        break;
-    }
-  }
-  return true;
-}
-
-
-// Exposed for testing.
-int ParseProcStatCPU(const std::string& input) {
-  // /proc/<pid>/stat contains the process name in parens.  In case the
-  // process name itself contains parens, skip past them.
-  std::string::size_type rparen = input.rfind(')');
-  if (rparen == std::string::npos)
-    return -1;
-
-  // From here, we expect a bunch of space-separated fields, where the
-  // 0-indexed 11th and 12th are utime and stime.  On two different machines
-  // I found 42 and 39 fields, so let's just expect the ones we need.
-  std::vector<std::string> fields;
-  SplitString(input.substr(rparen + 2), ' ', &fields);
-  if (fields.size() < 13)
-    return -1;  // Output not in the format we expect.
-
-  return StringToInt(fields[11]) + StringToInt(fields[12]);
-}
-
-// Get the total CPU of a single process.  Return value is number of jiffies
-// on success or -1 on error.
-static int GetProcessCPU(pid_t pid) {
-  // Use /proc/<pid>/task to find all threads and parse their /stat file.
-  FilePath path = FilePath(StringPrintf("/proc/%d/task/", pid));
-
-  DIR* dir = opendir(path.value().c_str());
-  if (!dir) {
-    PLOG(ERROR) << "opendir(" << path.value() << ")";
-    return -1;
-  }
-
-  int total_cpu = 0;
-  while (struct dirent* ent = readdir(dir)) {
-    if (ent->d_name[0] == '.')
-      continue;
-
-    FilePath stat_path = path.AppendASCII(ent->d_name).AppendASCII("stat");
-    std::string stat;
-    if (file_util::ReadFileToString(stat_path, &stat)) {
-      int cpu = ParseProcStatCPU(stat);
-      if (cpu > 0)
-        total_cpu += cpu;
-    }
-  }
-  closedir(dir);
-
-  return total_cpu;
 }
 
 double ProcessMetrics::GetCPUUsage() {
@@ -451,6 +467,84 @@ double ProcessMetrics::GetCPUUsage() {
   return percentage;
 }
 
+// To have /proc/self/io file you must enable CONFIG_TASK_IO_ACCOUNTING
+// in your kernel configuration.
+bool ProcessMetrics::GetIOCounters(IoCounters* io_counters) const {
+  // Synchronously reading files in /proc is safe.
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+
+  std::string proc_io_contents;
+  FilePath io_file("/proc");
+  io_file = io_file.Append(base::IntToString(process_));
+  io_file = io_file.Append("io");
+  if (!file_util::ReadFileToString(io_file, &proc_io_contents))
+    return false;
+
+  (*io_counters).OtherOperationCount = 0;
+  (*io_counters).OtherTransferCount = 0;
+
+  StringTokenizer tokenizer(proc_io_contents, ": \n");
+  ParsingState state = KEY_NAME;
+  std::string last_key_name;
+  while (tokenizer.GetNext()) {
+    switch (state) {
+      case KEY_NAME:
+        last_key_name = tokenizer.token();
+        state = KEY_VALUE;
+        break;
+      case KEY_VALUE:
+        DCHECK(!last_key_name.empty());
+        if (last_key_name == "syscr") {
+          base::StringToInt64(tokenizer.token(),
+              reinterpret_cast<int64*>(&(*io_counters).ReadOperationCount));
+        } else if (last_key_name == "syscw") {
+          base::StringToInt64(tokenizer.token(),
+              reinterpret_cast<int64*>(&(*io_counters).WriteOperationCount));
+        } else if (last_key_name == "rchar") {
+          base::StringToInt64(tokenizer.token(),
+              reinterpret_cast<int64*>(&(*io_counters).ReadTransferCount));
+        } else if (last_key_name == "wchar") {
+          base::StringToInt64(tokenizer.token(),
+              reinterpret_cast<int64*>(&(*io_counters).WriteTransferCount));
+        }
+        state = KEY_NAME;
+        break;
+    }
+  }
+  return true;
+}
+
+ProcessMetrics::ProcessMetrics(ProcessHandle process)
+    : process_(process),
+      last_time_(0),
+      last_system_time_(0),
+      last_cpu_(0) {
+  processor_count_ = base::SysInfo::NumberOfProcessors();
+}
+
+
+// Exposed for testing.
+int ParseProcStatCPU(const std::string& input) {
+  // /proc/<pid>/stat contains the process name in parens.  In case the
+  // process name itself contains parens, skip past them.
+  std::string::size_type rparen = input.rfind(')');
+  if (rparen == std::string::npos)
+    return -1;
+
+  // From here, we expect a bunch of space-separated fields, where the
+  // 0-indexed 11th and 12th are utime and stime.  On two different machines
+  // I found 42 and 39 fields, so let's just expect the ones we need.
+  std::vector<std::string> fields;
+  base::SplitString(input.substr(rparen + 2), ' ', &fields);
+  if (fields.size() < 13)
+    return -1;  // Output not in the format we expect.
+
+  int fields11, fields12;
+  base::StringToInt(fields[11], &fields11);
+  base::StringToInt(fields[12], &fields12);
+  return fields11 + fields12;
+}
+
 namespace {
 
 // The format of /proc/meminfo is:
@@ -468,6 +562,9 @@ const size_t kMemCacheIndex = 10;
 }  // namespace
 
 size_t GetSystemCommitCharge() {
+  // Synchronously reading files in /proc is safe.
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+
   // Used memory is: total - free - buffers - caches
   FilePath meminfo_file("/proc/meminfo");
   std::string meminfo_data;
@@ -489,21 +586,21 @@ size_t GetSystemCommitCharge() {
   DCHECK_EQ(meminfo_fields[kMemBuffersIndex-1], "Buffers:");
   DCHECK_EQ(meminfo_fields[kMemCacheIndex-1], "Cached:");
 
-  size_t result_in_kb;
-  result_in_kb = StringToInt(meminfo_fields[kMemTotalIndex]);
-  result_in_kb -= StringToInt(meminfo_fields[kMemFreeIndex]);
-  result_in_kb -= StringToInt(meminfo_fields[kMemBuffersIndex]);
-  result_in_kb -= StringToInt(meminfo_fields[kMemCacheIndex]);
+  int mem_total, mem_free, mem_buffers, mem_cache;
+  base::StringToInt(meminfo_fields[kMemTotalIndex], &mem_total);
+  base::StringToInt(meminfo_fields[kMemFreeIndex], &mem_free);
+  base::StringToInt(meminfo_fields[kMemBuffersIndex], &mem_buffers);
+  base::StringToInt(meminfo_fields[kMemCacheIndex], &mem_cache);
 
-  return result_in_kb;
+  return mem_total - mem_free - mem_buffers - mem_cache;
 }
 
 namespace {
 
 void OnNoMemorySize(size_t size) {
   if (size != 0)
-    CHECK(false) << "Out of memory, size = " << size;
-  CHECK(false) << "Out of memory.";
+    LOG(FATAL) << "Out of memory, size = " << size;
+  LOG(FATAL) << "Out of memory.";
 }
 
 void OnNoMemory() {
@@ -513,8 +610,7 @@ void OnNoMemory() {
 }  // namespace
 
 extern "C" {
-
-#if !defined(LINUX_USE_TCMALLOC)
+#if !defined(USE_TCMALLOC)
 
 extern "C" {
 void* __libc_malloc(size_t size);
@@ -539,7 +635,7 @@ void* __libc_memalign(size_t alignment, size_t size);
 // for this in process_util_unittest.cc.
 //
 // If we are using tcmalloc, then the problem is moot since tcmalloc handles
-// this for us. Thus this code is in a !defined(LINUX_USE_TCMALLOC) block.
+// this for us. Thus this code is in a !defined(USE_TCMALLOC) block.
 //
 // We call the real libc functions in this code by using __libc_malloc etc.
 // Previously we tried using dlsym(RTLD_NEXT, ...) but that failed depending on
@@ -590,7 +686,7 @@ int posix_memalign(void** ptr, size_t alignment, size_t size) {
   return 0;
 }
 
-#endif  // !defined(LINUX_USE_TCMALLOC)
+#endif  // !defined(USE_TCMALLOC)
 }  // extern C
 
 void EnableTerminationOnOutOfMemory() {
@@ -605,13 +701,13 @@ bool AdjustOOMScore(ProcessId process, int score) {
     return false;
 
   FilePath oom_adj("/proc");
-  oom_adj = oom_adj.Append(Int64ToString(process));
+  oom_adj = oom_adj.Append(base::Int64ToString(process));
   oom_adj = oom_adj.AppendASCII("oom_adj");
 
   if (!file_util::PathExists(oom_adj))
     return false;
 
-  std::string score_str = IntToString(score);
+  std::string score_str = base::IntToString(score);
   return (static_cast<int>(score_str.length()) ==
           file_util::WriteFile(oom_adj, score_str.c_str(), score_str.length()));
 }

@@ -1,14 +1,16 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "base/basictypes.h"
-#include "base/multiprocess_test.h"
-#include "base/platform_thread.h"
-#include "base/scoped_nsautorelease_pool.h"
+#include "base/mac/scoped_nsautorelease_pool.h"
+#include "base/memory/scoped_ptr.h"
 #include "base/shared_memory.h"
-#include "base/scoped_ptr.h"
+#include "base/test/multiprocess_test.h"
+#include "base/threading/platform_thread.h"
+#include "base/time.h"
 #include "testing/gtest/include/gtest/gtest.h"
+#include "testing/multiprocess_func_list.h"
 
 static const int kNumThreads = 5;
 static const int kNumTasks = 5;
@@ -32,10 +34,10 @@ class MultipleThreadMain : public PlatformThread::Delegate {
 
   // PlatformThread::Delegate interface.
   void ThreadMain() {
-    ScopedNSAutoreleasePool pool;  // noop if not OSX
-    const int kDataSize = 1024;
+    mac::ScopedNSAutoreleasePool pool;  // noop if not OSX
+    const uint32 kDataSize = 1024;
     SharedMemory memory;
-    bool rv = memory.Create(s_test_name_, false, true, kDataSize);
+    bool rv = memory.CreateNamed(s_test_name_, true, kDataSize);
     EXPECT_TRUE(rv);
     rv = memory.Map(kDataSize);
     EXPECT_TRUE(rv);
@@ -54,13 +56,13 @@ class MultipleThreadMain : public PlatformThread::Delegate {
  private:
   int16 id_;
 
-  static const wchar_t* const s_test_name_;
+  static const char* const s_test_name_;
 
   DISALLOW_COPY_AND_ASSIGN(MultipleThreadMain);
 };
 
-const wchar_t* const MultipleThreadMain::s_test_name_ =
-    L"SharedMemoryOpenThreadTest";
+const char* const MultipleThreadMain::s_test_name_ =
+    "SharedMemoryOpenThreadTest";
 
 // TODO(port):
 // This test requires the ability to pass file descriptors between processes.
@@ -77,12 +79,12 @@ class MultipleLockThread : public PlatformThread::Delegate {
 
   // PlatformThread::Delegate interface.
   void ThreadMain() {
-    const int kDataSize = sizeof(int);
+    const uint32 kDataSize = sizeof(int);
     SharedMemoryHandle handle = NULL;
     {
       SharedMemory memory1;
-      EXPECT_TRUE(memory1.Create(L"SharedMemoryMultipleLockThreadTest",
-                                 false, true, kDataSize));
+      EXPECT_TRUE(memory1.CreateNamed("SharedMemoryMultipleLockThreadTest",
+                                 true, kDataSize));
       EXPECT_TRUE(memory1.ShareToProcess(GetCurrentProcess(), &handle));
       // TODO(paulg): Implement this once we have a posix version of
       // SharedMemory::ShareToProcess.
@@ -115,8 +117,8 @@ class MultipleLockThread : public PlatformThread::Delegate {
 }  // namespace
 
 TEST(SharedMemoryTest, OpenClose) {
-  const int kDataSize = 1024;
-  std::wstring test_name = L"SharedMemoryOpenCloseTest";
+  const uint32 kDataSize = 1024;
+  std::string test_name = "SharedMemoryOpenCloseTest";
 
   // Open two handles to a memory segment, confirm that they are mapped
   // separately yet point to the same space.
@@ -127,7 +129,7 @@ TEST(SharedMemoryTest, OpenClose) {
   EXPECT_TRUE(rv);
   rv = memory1.Open(test_name, false);
   EXPECT_FALSE(rv);
-  rv = memory1.Create(test_name, false, false, kDataSize);
+  rv = memory1.CreateNamed(test_name, false, kDataSize);
   EXPECT_TRUE(rv);
   rv = memory1.Map(kDataSize);
   EXPECT_TRUE(rv);
@@ -159,6 +161,58 @@ TEST(SharedMemoryTest, OpenClose) {
   rv = memory1.Delete(test_name);
   EXPECT_TRUE(rv);
   rv = memory2.Delete(test_name);
+  EXPECT_TRUE(rv);
+}
+
+TEST(SharedMemoryTest, OpenExclusive) {
+  const uint32 kDataSize = 1024;
+  const uint32 kDataSize2 = 2048;
+  std::ostringstream test_name_stream;
+  test_name_stream << "SharedMemoryOpenExclusiveTest."
+                   << Time::Now().ToDoubleT();
+  std::string test_name = test_name_stream.str();
+
+  // Open two handles to a memory segment and check that open_existing works
+  // as expected.
+  SharedMemory memory1;
+  bool rv = memory1.CreateNamed(test_name, false, kDataSize);
+  EXPECT_TRUE(rv);
+
+  // Memory1 knows it's size because it created it.
+  EXPECT_EQ(memory1.created_size(), kDataSize);
+
+  rv = memory1.Map(kDataSize);
+  EXPECT_TRUE(rv);
+
+  memset(memory1.memory(), 'G', kDataSize);
+
+  SharedMemory memory2;
+  // Should not be able to create if openExisting is false.
+  rv = memory2.CreateNamed(test_name, false, kDataSize2);
+  EXPECT_FALSE(rv);
+
+  // Should be able to create with openExisting true.
+  rv = memory2.CreateNamed(test_name, true, kDataSize2);
+  EXPECT_TRUE(rv);
+
+  // Memory2 shouldn't know the size because we didn't create it.
+  EXPECT_EQ(memory2.created_size(), 0U);
+
+  // We should be able to map the original size.
+  rv = memory2.Map(kDataSize);
+  EXPECT_TRUE(rv);
+
+  // Verify that opening memory2 didn't truncate or delete memory 1.
+  char *start_ptr = static_cast<char *>(memory2.memory());
+  char *end_ptr = start_ptr + kDataSize;
+  for (char* ptr = start_ptr; ptr < end_ptr; ptr++) {
+    EXPECT_EQ(*ptr, 'G');
+  }
+
+  memory1.Close();
+  memory2.Close();
+
+  rv = memory1.Delete(test_name);
   EXPECT_TRUE(rv);
 }
 
@@ -234,7 +288,7 @@ TEST(SharedMemoryTest, AnonymousPrivate) {
   int i, j;
   int count = 4;
   bool rv;
-  const int kDataSize = 8192;
+  const uint32 kDataSize = 8192;
 
   scoped_array<SharedMemory> memories(new SharedMemory[count]);
   scoped_array<int*> pointers(new int*[count]);
@@ -242,9 +296,7 @@ TEST(SharedMemoryTest, AnonymousPrivate) {
   ASSERT_TRUE(pointers.get());
 
   for (i = 0; i < count; i++) {
-    rv = memories[i].Create(L"", false, true, kDataSize);
-    EXPECT_TRUE(rv);
-    rv = memories[i].Map(kDataSize);
+    rv = memories[i].CreateAndMapAnonymous(kDataSize);
     EXPECT_TRUE(rv);
     int *ptr = static_cast<int*>(memories[i].memory());
     EXPECT_TRUE(ptr);
@@ -271,9 +323,7 @@ TEST(SharedMemoryTest, AnonymousPrivate) {
   for (int i = 0; i < count; i++) {
     memories[i].Close();
   }
-
 }
-
 
 // On POSIX it is especially important we test shmem across processes,
 // not just across threads.  But the test is enabled on all platforms.
@@ -287,10 +337,10 @@ class SharedMemoryProcessTest : public MultiProcessTest {
 
   static int TaskTestMain() {
     int errors = 0;
-    ScopedNSAutoreleasePool pool;  // noop if not OSX
-    const int kDataSize = 1024;
+    mac::ScopedNSAutoreleasePool pool;  // noop if not OSX
+    const uint32 kDataSize = 1024;
     SharedMemory memory;
-    bool rv = memory.Create(s_test_name_, false, true, kDataSize);
+    bool rv = memory.CreateNamed(s_test_name_, true, kDataSize);
     EXPECT_TRUE(rv);
     if (rv != true)
       errors++;
@@ -315,23 +365,29 @@ class SharedMemoryProcessTest : public MultiProcessTest {
   }
 
  private:
-  static const wchar_t* const s_test_name_;
+  static const char* const s_test_name_;
 };
 
-const wchar_t* const SharedMemoryProcessTest::s_test_name_ = L"MPMem";
+const char* const SharedMemoryProcessTest::s_test_name_ = "MPMem";
 
 
-TEST_F(SharedMemoryProcessTest, Tasks) {
+#if defined(OS_MACOSX)
+#define MAYBE_Tasks FLAKY_Tasks
+#else
+#define MAYBE_Tasks Tasks
+#endif
+
+TEST_F(SharedMemoryProcessTest, MAYBE_Tasks) {
   SharedMemoryProcessTest::CleanUp();
 
-  base::ProcessHandle handles[kNumTasks];
+  ProcessHandle handles[kNumTasks];
   for (int index = 0; index < kNumTasks; ++index) {
-    handles[index] = SpawnChild(L"SharedMemoryTestMain");
+    handles[index] = SpawnChild("SharedMemoryTestMain", false);
   }
 
   int exit_code = 0;
   for (int index = 0; index < kNumTasks; ++index) {
-    EXPECT_TRUE(base::WaitForExitCode(handles[index], &exit_code));
+    EXPECT_TRUE(WaitForExitCode(handles[index], &exit_code));
     EXPECT_TRUE(exit_code == 0);
   }
 
@@ -341,6 +397,5 @@ TEST_F(SharedMemoryProcessTest, Tasks) {
 MULTIPROCESS_TEST_MAIN(SharedMemoryTestMain) {
   return SharedMemoryProcessTest::TaskTestMain();
 }
-
 
 }  // namespace base

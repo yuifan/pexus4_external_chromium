@@ -1,27 +1,30 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_MESSAGE_PUMP_H_
 #define BASE_MESSAGE_PUMP_H_
+#pragma once
 
-#include "base/ref_counted.h"
+#include "base/base_api.h"
+#include "base/memory/ref_counted.h"
 
 namespace base {
 
-class Time;
+class TimeTicks;
 
-class MessagePump : public RefCountedThreadSafe<MessagePump> {
+class BASE_API MessagePump : public RefCountedThreadSafe<MessagePump> {
  public:
   // Please see the comments above the Run method for an illustration of how
   // these delegate methods are used.
-  class Delegate {
+  class BASE_API Delegate {
    public:
     virtual ~Delegate() {}
 
     // Called from within Run in response to ScheduleWork or when the message
     // pump would otherwise call DoDelayedWork.  Returns true to indicate that
-    // work was done.  DoDelayedWork will not be called if DoWork returns true.
+    // work was done.  DoDelayedWork will still be called if DoWork returns
+    // true, but DoIdleWork will not.
     virtual bool DoWork() = 0;
 
     // Called from within Run in response to ScheduleDelayedWork or when the
@@ -32,14 +35,15 @@ class MessagePump : public RefCountedThreadSafe<MessagePump> {
     // |next_delayed_work_time| is null (per Time::is_null), then the queue of
     // future delayed work (timer events) is currently empty, and no additional
     // calls to this function need to be scheduled.
-    virtual bool DoDelayedWork(Time* next_delayed_work_time) = 0;
+    virtual bool DoDelayedWork(TimeTicks* next_delayed_work_time) = 0;
 
     // Called from within Run just before the message pump goes to sleep.
     // Returns true to indicate that idle work was done.
     virtual bool DoIdleWork() = 0;
   };
 
-  virtual ~MessagePump() {}
+  MessagePump();
+  virtual ~MessagePump();
 
   // The Run method is called to enter the message pump's run loop.
   //
@@ -59,7 +63,8 @@ class MessagePump : public RefCountedThreadSafe<MessagePump> {
   //     if (should_quit_)
   //       break;
   //
-  //     did_work |= delegate_->DoDelayedWork();
+  //     TimeTicks next_time;
+  //     did_work |= delegate_->DoDelayedWork(&next_time);
   //     if (should_quit_)
   //       break;
   //
@@ -82,9 +87,9 @@ class MessagePump : public RefCountedThreadSafe<MessagePump> {
   // blocks until there is more work of any type to do.
   //
   // Notice that the run loop cycles between calling DoInternalWork, DoWork,
-  // and DoDelayedWork methods.  This helps ensure that neither work queue
-  // starves the other.  This is important for message pumps that are used to
-  // drive animations, for example.
+  // and DoDelayedWork methods.  This helps ensure that none of these work
+  // queues starve the others.  This is important for message pumps that are
+  // used to drive animations, for example.
   //
   // Notice also that after each callout to foreign code, the run loop checks
   // to see if it should quit.  The Quit method is responsible for setting this
@@ -114,7 +119,7 @@ class MessagePump : public RefCountedThreadSafe<MessagePump> {
   // Schedule a DoDelayedWork callback to happen at the specified time,
   // cancelling any pending DoDelayedWork callback.  This method may only be
   // used on the thread that called Run.
-  virtual void ScheduleDelayedWork(const Time& delayed_work_time) = 0;
+  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time) = 0;
 };
 
 }  // namespace base

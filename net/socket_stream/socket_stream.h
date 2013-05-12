@@ -1,28 +1,31 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_SOCKET_STREAM_SOCKET_STREAM_H_
 #define NET_SOCKET_STREAM_SOCKET_STREAM_H_
+#pragma once
 
 #include <deque>
 #include <map>
 #include <string>
-#include <vector>
 
-#include "base/linked_ptr.h"
-#include "base/ref_counted.h"
-#include "base/scoped_ptr.h"
+#include "base/memory/linked_ptr.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/string16.h"
 #include "base/task.h"
 #include "net/base/address_list.h"
 #include "net/base/completion_callback.h"
 #include "net/base/io_buffer.h"
+#include "net/base/net_log.h"
+#include "net/base/net_errors.h"
+#include "net/base/ssl_config_service.h"
 #include "net/http/http_auth.h"
 #include "net/http/http_auth_cache.h"
 #include "net/http/http_auth_handler.h"
 #include "net/proxy/proxy_service.h"
 #include "net/socket/tcp_client_socket.h"
-#include "net/url_request/request_tracker.h"
 #include "net/url_request/url_request_context.h"
 
 namespace net {
@@ -30,11 +33,10 @@ namespace net {
 class AuthChallengeInfo;
 class ClientSocketFactory;
 class HostResolver;
-class LoadLog;
+class HttpAuthHandlerFactory;
 class SSLConfigService;
 class SingleRequestHostResolver;
 class SocketStreamMetrics;
-class SocketStreamThrottle;
 
 // SocketStream is used to implement Web Sockets.
 // It provides plain full-duplex stream with proxy and SSL support.
@@ -56,6 +58,11 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   class Delegate {
    public:
     virtual ~Delegate() {}
+
+    virtual int OnStartOpenConnection(SocketStream* socket,
+                                      CompletionCallback* callback) {
+      return OK;
+    }
 
     // Called when socket stream has been connected.  The socket stream accepts
     // at most |max_pending_send_allowed| so that a client of the socket stream
@@ -100,6 +107,7 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   void SetUserData(const void* key, UserData* data);
 
   const GURL& url() const { return url_; }
+  bool is_secure() const;
   const AddressList& address_list() const { return addresses_; }
   Delegate* delegate() const { return delegate_; }
   int max_pending_send_allowed() const { return max_pending_send_allowed_; }
@@ -107,32 +115,32 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   URLRequestContext* context() const { return context_.get(); }
   void set_context(URLRequestContext* context);
 
-  LoadLog* load_log() const { return load_log_; }
+  BoundNetLog* net_log() { return &net_log_; }
 
   // Opens the connection on the IO thread.
   // Once the connection is established, calls delegate's OnConnected.
-  void Connect();
+  virtual void Connect();
 
   // Requests to send |len| bytes of |data| on the connection.
   // Returns true if |data| is buffered in the job.
   // Returns false if size of buffered data would exceeds
   // |max_pending_send_allowed_| and |data| is not sent at all.
-  bool SendData(const char* data, int len);
+  virtual bool SendData(const char* data, int len);
 
   // Requests to close the connection.
   // Once the connection is closed, calls delegate's OnClose.
-  void Close();
+  virtual void Close();
 
   // Restarts with authentication info.
   // Should be used for response of OnAuthRequired.
-  void RestartWithAuth(
-      const std::wstring& username,
-      const std::wstring& password);
+  virtual void RestartWithAuth(
+      const string16& username,
+      const string16& password);
 
   // Detach delegate.  Call before delegate is deleted.
   // Once delegate is detached, close the socket stream and never call delegate
   // back.
-  void DetachDelegate();
+  virtual void DetachDelegate();
 
   // Sets an alternative HostResolver. For testing purposes only.
   void SetHostResolver(HostResolver* host_resolver);
@@ -141,7 +149,18 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   // |factory|.  For testing purposes only.
   void SetClientSocketFactory(ClientSocketFactory* factory);
 
+ protected:
+  friend class base::RefCountedThreadSafe<SocketStream>;
+  virtual ~SocketStream();
+
+  Delegate* delegate_;
+
  private:
+  friend class WebSocketThrottleTest;
+
+  typedef std::map<const void*, linked_ptr<UserData> > UserDataMap;
+  typedef std::deque< scoped_refptr<IOBufferWithSize> > PendingDataQueue;
+
   class RequestHeaders : public IOBuffer {
    public:
     RequestHeaders() : IOBuffer() {}
@@ -158,7 +177,7 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
 
   class ResponseHeaders : public IOBuffer {
    public:
-    ResponseHeaders() : IOBuffer() {}
+    ResponseHeaders();
 
     void SetDataOffset(size_t offset) { data_ = headers_.get() + offset; }
     char* headers() const { return headers_.get(); }
@@ -166,7 +185,7 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
     void Realloc(size_t new_size);
 
    private:
-     ~ResponseHeaders() { data_ = NULL; }
+     ~ResponseHeaders();
 
     scoped_ptr_malloc<char> headers_;
   };
@@ -198,16 +217,14 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
     kSOCKSProxy,  // If using a SOCKS proxy
   };
 
-  typedef std::deque< scoped_refptr<IOBufferWithSize> > PendingDataQueue;
-  friend class RequestTracker<SocketStream>;
-  friend class base::RefCountedThreadSafe<SocketStream>;
-  ~SocketStream();
-
-  friend class WebSocketThrottleTest;
+  // Use the same number as HttpNetworkTransaction::kMaxHeaderBufSize.
+  enum { kMaxTunnelResponseHeadersSize = 32768 };  // 32 kilobytes.
 
   // Copies the given addrinfo list in |addresses_|.
   // Used for WebSocketThrottleTest.
   void CopyAddrInfo(struct addrinfo* head);
+
+  void DoClose();
 
   // Finishes the job.
   // Calls OnError and OnClose of delegate, and no more
@@ -228,7 +245,7 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   int DoResolveProxyComplete(int result);
   int DoResolveHost();
   int DoResolveHostComplete(int result);
-  int DoTcpConnect();
+  int DoTcpConnect(int result);
   int DoTcpConnectComplete(int result);
   int DoWriteTunnelHeaders();
   int DoWriteTunnelHeadersComplete(int result);
@@ -247,25 +264,21 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
 
   int HandleCertificateError(int result);
 
-  bool is_secure() const;
   SSLConfigService* ssl_config_service() const;
   ProxyService* proxy_service() const;
 
-  void GetInfoForTracker(
-      RequestTracker<SocketStream>::RecentRequestInfo* info) const;
-
-  scoped_refptr<LoadLog> load_log_;
+  BoundNetLog net_log_;
 
   GURL url_;
-  Delegate* delegate_;
   int max_pending_send_allowed_;
   scoped_refptr<URLRequestContext> context_;
 
-  typedef std::map<const void*, linked_ptr<UserData> > UserDataMap;
   UserDataMap user_data_;
 
   State next_state_;
-  scoped_refptr<HostResolver> host_resolver_;
+  HostResolver* host_resolver_;
+  CertVerifier* cert_verifier_;
+  HttpAuthHandlerFactory* http_auth_handler_factory_;
   ClientSocketFactory* factory_;
 
   ProxyMode proxy_mode_;
@@ -275,7 +288,7 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   ProxyInfo proxy_info_;
 
   HttpAuthCache auth_cache_;
-  scoped_refptr<HttpAuthHandler> auth_handler_;
+  scoped_ptr<HttpAuthHandler> auth_handler_;
   HttpAuth::Identity auth_identity_;
   scoped_refptr<AuthChallengeInfo> auth_info_;
 
@@ -284,9 +297,6 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   scoped_refptr<ResponseHeaders> tunnel_response_headers_;
   int tunnel_response_headers_capacity_;
   int tunnel_response_headers_len_;
-
-  // Use the same number as HttpNetworkTransaction::kMaxHeaderBufSize.
-  enum { kMaxTunnelResponseHeadersSize = 32768 };  // 32 kilobytes.
 
   scoped_ptr<SingleRequestHostResolver> resolver_;
   AddressList addresses_;
@@ -313,11 +323,10 @@ class SocketStream : public base::RefCountedThreadSafe<SocketStream> {
   int write_buf_size_;
   PendingDataQueue pending_write_bufs_;
 
-  SocketStreamThrottle* throttle_;
+  bool closing_;
+  bool server_closed_;
 
   scoped_ptr<SocketStreamMetrics> metrics_;
-
-  RequestTracker<SocketStream>::Node request_tracker_node_;
 
   DISALLOW_COPY_AND_ASSIGN(SocketStream);
 };

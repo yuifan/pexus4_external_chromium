@@ -120,6 +120,11 @@ bool DoScheme(const CHAR* spec,
   // The output scheme starts from the current position.
   out_scheme->begin = output->length();
 
+  // Danger: it's important that this code does not strip any characters: it
+  // only emits the canonical version (be it valid or escaped) of each of
+  // the input characters. Stripping would put it out of sync with
+  // url_util::FindAndCompareScheme, which could cause some security checks on
+  // schemes to be incorrect.
   bool success = true;
   int end = scheme.end();
   for (int i = scheme.begin; i < end; i++) {
@@ -208,9 +213,6 @@ bool DoUserInfo(const CHAR* username_spec,
 inline void WritePortInt(char* output, int output_len, int port) {
   _itoa_s(port, output, output_len, 10);
 }
-inline void WritePortInt(char16* output, int output_len, int port) {
-  _itow_s(port, output, output_len, 10);
-}
 
 // This function will prepend the colon if there will be a port.
 template<typename CHAR, typename UCHAR>
@@ -285,12 +287,11 @@ void DoCanonicalizeRef(const CHAR* spec,
     } else {
       // Non-ASCII characters are appended unescaped, but only when they are
       // valid. Invalid Unicode characters are replaced with the "invalid
-      // character" as IE seems to.
+      // character" as IE seems to (ReadUTFChar puts the unicode replacement
+      // character in the output on failure for us).
       unsigned code_point;
-      if (!ReadUTFChar(spec, &i, end, &code_point))
-        AppendUTF8Value(kUnicodeReplacementCharacter, output);
-      else
-        AppendUTF8Value(code_point, output);
+      ReadUTFChar(spec, &i, end, &code_point);
+      AppendUTF8Value(code_point, output);
     }
   }
 

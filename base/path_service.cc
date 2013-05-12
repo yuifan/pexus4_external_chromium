@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -13,10 +13,9 @@
 #include "base/file_path.h"
 #include "base/file_util.h"
 #include "base/hash_tables.h"
-#include "base/lock.h"
+#include "base/lazy_instance.h"
 #include "base/logging.h"
-#include "base/singleton.h"
-#include "base/string_util.h"
+#include "base/synchronization/lock.h"
 
 namespace base {
   bool PathProvider(int key, FilePath* result);
@@ -32,7 +31,6 @@ namespace base {
 namespace {
 
 typedef base::hash_map<int, FilePath> PathMap;
-typedef base::hash_set<int> PathSet;
 
 // We keep a linked list of providers.  In a debug build we ensure that no two
 // providers claim overlapping keys.
@@ -94,9 +92,9 @@ static Provider base_provider_posix = {
 
 
 struct PathData {
-  Lock      lock;
-  PathMap   cache;      // Track mappings from path key to path value.
-  PathSet   overrides;  // Track whether a path has been overridden.
+  base::Lock lock;
+  PathMap cache;        // Cache mappings from path key to path value.
+  PathMap overrides;    // Track path overrides.
   Provider* providers;  // Linked list of path service providers.
 
   PathData() {
@@ -120,8 +118,10 @@ struct PathData {
   }
 };
 
+static base::LazyInstance<PathData> g_path_data(base::LINKER_INITIALIZED);
+
 static PathData* GetPathData() {
-  return Singleton<PathData>::get();
+  return g_path_data.Pointer();
 }
 
 }  // namespace
@@ -130,7 +130,7 @@ static PathData* GetPathData() {
 // static
 bool PathService::GetFromCache(int key, FilePath* result) {
   PathData* path_data = GetPathData();
-  AutoLock scoped_lock(path_data->lock);
+  base::AutoLock scoped_lock(path_data->lock);
 
   // check for a cached version
   PathMap::const_iterator it = path_data->cache.find(key);
@@ -142,9 +142,23 @@ bool PathService::GetFromCache(int key, FilePath* result) {
 }
 
 // static
+bool PathService::GetFromOverrides(int key, FilePath* result) {
+  PathData* path_data = GetPathData();
+  base::AutoLock scoped_lock(path_data->lock);
+
+  // check for an overriden version.
+  PathMap::const_iterator it = path_data->overrides.find(key);
+  if (it != path_data->overrides.end()) {
+    *result = it->second;
+    return true;
+  }
+  return false;
+}
+
+// static
 void PathService::AddToCache(int key, const FilePath& path) {
   PathData* path_data = GetPathData();
-  AutoLock scoped_lock(path_data->lock);
+  base::AutoLock scoped_lock(path_data->lock);
   // Save the computed path in our cache.
   path_data->cache[key] = path;
 }
@@ -157,13 +171,16 @@ bool PathService::Get(int key, FilePath* result) {
   PathData* path_data = GetPathData();
   DCHECK(path_data);
   DCHECK(result);
-  DCHECK(key >= base::DIR_CURRENT);
+  DCHECK_GE(key, base::DIR_CURRENT);
 
   // special case the current directory because it can never be cached
   if (key == base::DIR_CURRENT)
     return file_util::GetCurrentDirectory(result);
 
   if (GetFromCache(key, result))
+    return true;
+
+  if (GetFromOverrides(key, result))
     return true;
 
   FilePath path;
@@ -188,30 +205,10 @@ bool PathService::Get(int key, FilePath* result) {
   return true;
 }
 
-#if defined(OS_WIN)
-// static
-bool PathService::Get(int key, std::wstring* result) {
-  // Deprecated compatibility function.
-  FilePath path;
-  if (!Get(key, &path))
-    return false;
-  *result = path.ToWStringHack();
-  return true;
-}
-#endif
-
-bool PathService::IsOverridden(int key) {
-  PathData* path_data = GetPathData();
-  DCHECK(path_data);
-
-  AutoLock scoped_lock(path_data->lock);
-  return path_data->overrides.find(key) != path_data->overrides.end();
-}
-
 bool PathService::Override(int key, const FilePath& path) {
   PathData* path_data = GetPathData();
   DCHECK(path_data);
-  DCHECK(key > base::DIR_CURRENT) << "invalid path key";
+  DCHECK_GT(key, base::DIR_CURRENT) << "invalid path key";
 
   FilePath file_path = path;
 
@@ -228,9 +225,15 @@ bool PathService::Override(int key, const FilePath& path) {
   if (!file_util::AbsolutePath(&file_path))
     return false;
 
-  AutoLock scoped_lock(path_data->lock);
+  base::AutoLock scoped_lock(path_data->lock);
+
+  // Clear the cache now. Some of its entries could have depended
+  // on the value we are overriding, and are now out of sync with reality.
+  path_data->cache.clear();
+
   path_data->cache[key] = file_path;
-  path_data->overrides.insert(key);
+  path_data->overrides[key] = file_path;
+
   return true;
 }
 
@@ -238,9 +241,9 @@ void PathService::RegisterProvider(ProviderFunc func, int key_start,
                                    int key_end) {
   PathData* path_data = GetPathData();
   DCHECK(path_data);
-  DCHECK(key_end > key_start);
+  DCHECK_GT(key_end, key_start);
 
-  AutoLock scoped_lock(path_data->lock);
+  base::AutoLock scoped_lock(path_data->lock);
 
   Provider* p;
 

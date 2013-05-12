@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,11 +7,12 @@
 #include <errno.h>
 #include <fcntl.h>
 
-#include "eintr_wrapper.h"
 #include "base/auto_reset.h"
+#include "base/eintr_wrapper.h"
 #include "base/logging.h"
-#include "base/scoped_nsautorelease_pool.h"
-#include "base/scoped_ptr.h"
+#include "base/mac/scoped_nsautorelease_pool.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/observer_list.h"
 #include "base/time.h"
 #if defined(USE_SYSTEM_LIBEVENT)
 #include <event.h>
@@ -50,7 +51,9 @@ static int SetNonBlocking(int fd) {
 
 MessagePumpLibevent::FileDescriptorWatcher::FileDescriptorWatcher()
     : is_persistent_(false),
-      event_(NULL) {
+      event_(NULL),
+      pump_(NULL),
+      watcher_(NULL) {
 }
 
 MessagePumpLibevent::FileDescriptorWatcher::~FileDescriptorWatcher() {
@@ -59,10 +62,23 @@ MessagePumpLibevent::FileDescriptorWatcher::~FileDescriptorWatcher() {
   }
 }
 
+bool MessagePumpLibevent::FileDescriptorWatcher::StopWatchingFileDescriptor() {
+  event* e = ReleaseEvent();
+  if (e == NULL)
+    return true;
+
+  // event_del() is a no-op if the event isn't active.
+  int rv = event_del(e);
+  delete e;
+  pump_ = NULL;
+  watcher_ = NULL;
+  return (rv == 0);
+}
+
 void MessagePumpLibevent::FileDescriptorWatcher::Init(event *e,
                                                       bool is_persistent) {
   DCHECK(e);
-  DCHECK(event_ == NULL);
+  DCHECK(!event_);
 
   is_persistent_ = is_persistent;
   event_ = e;
@@ -74,29 +90,18 @@ event *MessagePumpLibevent::FileDescriptorWatcher::ReleaseEvent() {
   return e;
 }
 
-bool MessagePumpLibevent::FileDescriptorWatcher::StopWatchingFileDescriptor() {
-  event* e = ReleaseEvent();
-  if (e == NULL)
-    return true;
-
-  // event_del() is a no-op if the event isn't active.
-  int rv = event_del(e);
-  delete e;
-  return (rv == 0);
+void MessagePumpLibevent::FileDescriptorWatcher::OnFileCanReadWithoutBlocking(
+    int fd, MessagePumpLibevent* pump) {
+  pump->WillProcessIOEvent();
+  watcher_->OnFileCanReadWithoutBlocking(fd);
+  pump->DidProcessIOEvent();
 }
 
-// Called if a byte is received on the wakeup pipe.
-void MessagePumpLibevent::OnWakeup(int socket, short flags, void* context) {
-  base::MessagePumpLibevent* that =
-              static_cast<base::MessagePumpLibevent*>(context);
-  DCHECK(that->wakeup_pipe_out_ == socket);
-
-  // Remove and discard the wakeup byte.
-  char buf;
-  int nread = HANDLE_EINTR(read(socket, &buf, 1));
-  DCHECK_EQ(nread, 1);
-  // Tell libevent to break out of inner loop.
-  event_base_loopbreak(that->event_base_);
+void MessagePumpLibevent::FileDescriptorWatcher::OnFileCanWriteWithoutBlocking(
+    int fd, MessagePumpLibevent* pump) {
+  pump->WillProcessIOEvent();
+  watcher_->OnFileCanWriteWithoutBlocking(fd);
+  pump->DidProcessIOEvent();
 }
 
 MessagePumpLibevent::MessagePumpLibevent()
@@ -109,42 +114,19 @@ MessagePumpLibevent::MessagePumpLibevent()
      NOTREACHED();
 }
 
-bool MessagePumpLibevent::Init() {
-  int fds[2];
-  if (pipe(fds)) {
-    DLOG(ERROR) << "pipe() failed, errno: " << errno;
-    return false;
-  }
-  if (SetNonBlocking(fds[0])) {
-    DLOG(ERROR) << "SetNonBlocking for pipe fd[0] failed, errno: " << errno;
-    return false;
-  }
-  if (SetNonBlocking(fds[1])) {
-    DLOG(ERROR) << "SetNonBlocking for pipe fd[1] failed, errno: " << errno;
-    return false;
-  }
-  wakeup_pipe_out_ = fds[0];
-  wakeup_pipe_in_ = fds[1];
-
-  wakeup_event_ = new event;
-  event_set(wakeup_event_, wakeup_pipe_out_, EV_READ | EV_PERSIST,
-            OnWakeup, this);
-  event_base_set(event_base_, wakeup_event_);
-
-  if (event_add(wakeup_event_, 0))
-    return false;
-  return true;
-}
-
 MessagePumpLibevent::~MessagePumpLibevent() {
   DCHECK(wakeup_event_);
   DCHECK(event_base_);
   event_del(wakeup_event_);
   delete wakeup_event_;
-  if (wakeup_pipe_in_ >= 0)
-    close(wakeup_pipe_in_);
-  if (wakeup_pipe_out_ >= 0)
-    close(wakeup_pipe_out_);
+  if (wakeup_pipe_in_ >= 0) {
+    if (HANDLE_EINTR(close(wakeup_pipe_in_)) < 0)
+      PLOG(ERROR) << "close";
+  }
+  if (wakeup_pipe_out_ >= 0) {
+    if (HANDLE_EINTR(close(wakeup_pipe_out_)) < 0)
+      PLOG(ERROR) << "close";
+  }
   event_base_free(event_base_);
 }
 
@@ -190,7 +172,7 @@ bool MessagePumpLibevent::WatchFileDescriptor(int fd,
   }
 
   // Set current interest mask and message pump for this event.
-  event_set(evt.get(), fd, event_mask, OnLibeventNotification, delegate);
+  event_set(evt.get(), fd, event_mask, OnLibeventNotification, controller);
 
   // Tell libevent which message pump this socket will belong to when we add it.
   if (event_base_set(event_base_, evt.get()) != 0) {
@@ -204,20 +186,19 @@ bool MessagePumpLibevent::WatchFileDescriptor(int fd,
 
   // Transfer ownership of evt to controller.
   controller->Init(evt.release(), persistent);
+
+  controller->set_watcher(delegate);
+  controller->set_pump(this);
+
   return true;
 }
 
+void MessagePumpLibevent::AddIOObserver(IOObserver *obs) {
+  io_observers_.AddObserver(obs);
+}
 
-void MessagePumpLibevent::OnLibeventNotification(int fd, short flags,
-                                                 void* context) {
-  Watcher* watcher = static_cast<Watcher*>(context);
-
-  if (flags & EV_WRITE) {
-    watcher->OnFileCanWriteWithoutBlocking(fd);
-  }
-  if (flags & EV_READ) {
-    watcher->OnFileCanReadWithoutBlocking(fd);
-  }
+void MessagePumpLibevent::RemoveIOObserver(IOObserver *obs) {
+  io_observers_.RemoveObserver(obs);
 }
 
 // Tell libevent to break out of inner loop.
@@ -229,14 +210,14 @@ static void timer_callback(int fd, short events, void *context)
 // Reentrant!
 void MessagePumpLibevent::Run(Delegate* delegate) {
   DCHECK(keep_running_) << "Quit must have been called outside of Run!";
-  AutoReset auto_reset_in_run(&in_run_, true);
+  AutoReset<bool> auto_reset_in_run(&in_run_, true);
 
   // event_base_loopexit() + EVLOOP_ONCE is leaky, see http://crbug.com/25641.
   // Instead, make our own timer and reuse it on each call to event_base_loop().
   scoped_ptr<event> timer_event(new event);
 
   for (;;) {
-    ScopedNSAutoreleasePool autorelease_pool;
+    mac::ScopedNSAutoreleasePool autorelease_pool;
 
     bool did_work = delegate->DoWork();
     if (!keep_running_)
@@ -261,7 +242,7 @@ void MessagePumpLibevent::Run(Delegate* delegate) {
     if (delayed_work_time_.is_null()) {
       event_base_loop(event_base_, EVLOOP_ONCE);
     } else {
-      TimeDelta delay = delayed_work_time_ - Time::Now();
+      TimeDelta delay = delayed_work_time_ - TimeTicks::Now();
       if (delay > TimeDelta()) {
         struct timeval poll_tv;
         poll_tv.tv_sec = delay.InSeconds();
@@ -274,7 +255,7 @@ void MessagePumpLibevent::Run(Delegate* delegate) {
       } else {
         // It looks like delayed_work_time_ indicates a time in the past, so we
         // need to call DoDelayedWork now.
-        delayed_work_time_ = Time();
+        delayed_work_time_ = TimeTicks();
       }
     }
   }
@@ -297,11 +278,78 @@ void MessagePumpLibevent::ScheduleWork() {
       << "[nwrite:" << nwrite << "] [errno:" << errno << "]";
 }
 
-void MessagePumpLibevent::ScheduleDelayedWork(const Time& delayed_work_time) {
+void MessagePumpLibevent::ScheduleDelayedWork(
+    const TimeTicks& delayed_work_time) {
   // We know that we can't be blocked on Wait right now since this method can
   // only be called on the same thread as Run, so we only need to update our
   // record of how long to sleep when we do sleep.
   delayed_work_time_ = delayed_work_time;
+}
+
+void MessagePumpLibevent::WillProcessIOEvent() {
+  FOR_EACH_OBSERVER(IOObserver, io_observers_, WillProcessIOEvent());
+}
+
+void MessagePumpLibevent::DidProcessIOEvent() {
+  FOR_EACH_OBSERVER(IOObserver, io_observers_, DidProcessIOEvent());
+}
+
+bool MessagePumpLibevent::Init() {
+  int fds[2];
+  if (pipe(fds)) {
+    DLOG(ERROR) << "pipe() failed, errno: " << errno;
+    return false;
+  }
+  if (SetNonBlocking(fds[0])) {
+    DLOG(ERROR) << "SetNonBlocking for pipe fd[0] failed, errno: " << errno;
+    return false;
+  }
+  if (SetNonBlocking(fds[1])) {
+    DLOG(ERROR) << "SetNonBlocking for pipe fd[1] failed, errno: " << errno;
+    return false;
+  }
+  wakeup_pipe_out_ = fds[0];
+  wakeup_pipe_in_ = fds[1];
+
+  wakeup_event_ = new event;
+  event_set(wakeup_event_, wakeup_pipe_out_, EV_READ | EV_PERSIST,
+            OnWakeup, this);
+  event_base_set(event_base_, wakeup_event_);
+
+  if (event_add(wakeup_event_, 0))
+    return false;
+  return true;
+}
+
+// static
+void MessagePumpLibevent::OnLibeventNotification(int fd, short flags,
+                                                 void* context) {
+  FileDescriptorWatcher* controller =
+      static_cast<FileDescriptorWatcher*>(context);
+
+  MessagePumpLibevent* pump = controller->pump();
+
+  if (flags & EV_WRITE) {
+    controller->OnFileCanWriteWithoutBlocking(fd, pump);
+  }
+  if (flags & EV_READ) {
+    controller->OnFileCanReadWithoutBlocking(fd, pump);
+  }
+}
+
+// Called if a byte is received on the wakeup pipe.
+// static
+void MessagePumpLibevent::OnWakeup(int socket, short flags, void* context) {
+  base::MessagePumpLibevent* that =
+              static_cast<base::MessagePumpLibevent*>(context);
+  DCHECK(that->wakeup_pipe_out_ == socket);
+
+  // Remove and discard the wakeup byte.
+  char buf;
+  int nread = HANDLE_EINTR(read(socket, &buf, 1));
+  DCHECK_EQ(nread, 1);
+  // Tell libevent to break out of inner loop.
+  event_base_loopbreak(that->event_base_);
 }
 
 }  // namespace base

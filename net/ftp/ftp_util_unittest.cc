@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,7 +7,9 @@
 #include "base/basictypes.h"
 #include "base/format_macros.h"
 #include "base/string_util.h"
+#include "base/stringprintf.h"
 #include "base/time.h"
+#include "base/utf_string_conversions.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
 namespace {
@@ -93,6 +95,7 @@ TEST(FtpUtilTest, VMSPathToUnix) {
     { "[.a.b.c]",    "a/b/c"      },
     { "[.a.b.c]d",   "a/b/c/d"    },
     { "[.a.b.c.d]",  "a/b/c/d"    },
+    { "[.",          ""           },
   };
   for (size_t i = 0; i < ARRAYSIZE_UNSAFE(kTestCases); i++) {
     EXPECT_EQ(kTestCases[i].expected_output,
@@ -102,8 +105,9 @@ TEST(FtpUtilTest, VMSPathToUnix) {
 }
 
 TEST(FtpUtilTest, LsDateListingToTime) {
-  base::Time::Exploded now_exploded;
-  base::Time::Now().LocalExplode(&now_exploded);
+  base::Time mock_current_time;
+  ASSERT_TRUE(base::Time::FromString(L"Tue, 15 Nov 1994 12:45:26 GMT",
+                                     &mock_current_time));
 
   const struct {
     // Input.
@@ -119,24 +123,45 @@ TEST(FtpUtilTest, LsDateListingToTime) {
     int expected_minute;
   } kTestCases[] = {
     { "Nov", "01", "2007", 2007, 11, 1, 0, 0 },
-    { "Jul", "25", "13:37", now_exploded.year, 7, 25, 13, 37 },
+    { "Jul", "25", "13:37", 1994, 7, 25, 13, 37 },
 
-    // Test date listings in German, we should support them for FTP servers
-    // giving localized listings.
+    // Test date listings in German.
     { "M\xc3\xa4r", "13", "2009", 2009, 3, 13, 0, 0 },
-    { "Mai", "1", "10:10", now_exploded.year, 5, 1, 10, 10 },
-    { "Okt", "14", "21:18", now_exploded.year, 10, 14, 21, 18 },
+    { "Mai", "1", "10:10", 1994, 5, 1, 10, 10 },
+    { "Okt", "14", "21:18", 1994, 10, 14, 21, 18 },
     { "Dez", "25", "2008", 2008, 12, 25, 0, 0 },
+
+    // Test date listings in Russian.
+    { "\xd1\x8f\xd0\xbd\xd0\xb2", "1", "2011", 2011, 1, 1, 0, 0 },
+    { "\xd1\x84\xd0\xb5\xd0\xb2", "1", "2011", 2011, 2, 1, 0, 0 },
+    { "\xd0\xbc\xd0\xb0\xd1\x80", "1", "2011", 2011, 3, 1, 0, 0 },
+    { "\xd0\xb0\xd0\xbf\xd1\x80", "1", "2011", 2011, 4, 1, 0, 0 },
+    { "\xd0\xbc\xd0\xb0\xd0\xb9", "1", "2011", 2011, 5, 1, 0, 0 },
+    { "\xd0\xb8\xd1\x8e\xd0\xbd", "1", "2011", 2011, 6, 1, 0, 0 },
+    { "\xd0\xb8\xd1\x8e\xd0\xbb", "1", "2011", 2011, 7, 1, 0, 0 },
+    { "\xd0\xb0\xd0\xb2\xd0\xb3", "1", "2011", 2011, 8, 1, 0, 0 },
+    { "\xd1\x81\xd0\xb5\xd0\xbd", "1", "2011", 2011, 9, 1, 0, 0 },
+    { "\xd0\xbe\xd0\xba\xd1\x82", "1", "2011", 2011, 10, 1, 0, 0 },
+    { "\xd0\xbd\xd0\xbe\xd1\x8f", "1", "2011", 2011, 11, 1, 0, 0 },
+    { "\xd0\xb4\xd0\xb5\xd0\xba", "1", "2011", 2011, 12, 1, 0, 0 },
+
+    // Test current year detection.
+    { "Nov", "01", "12:00", 1994, 11, 1, 12, 0 },
+    { "Nov", "15", "12:00", 1994, 11, 15, 12, 0 },
+    { "Nov", "16", "12:00", 1993, 11, 16, 12, 0 },
+    { "Jan", "01", "08:30", 1994, 1, 1, 8, 30 },
+    { "Sep", "02", "09:00", 1994, 9, 2, 9, 0 },
+    { "Dec", "06", "21:00", 1993, 12, 6, 21, 0 },
   };
   for (size_t i = 0; i < ARRAYSIZE_UNSAFE(kTestCases); i++) {
-    SCOPED_TRACE(StringPrintf("Test[%" PRIuS "]: %s %s %s", i,
-                              kTestCases[i].month, kTestCases[i].day,
-                              kTestCases[i].rest));
+    SCOPED_TRACE(base::StringPrintf("Test[%" PRIuS "]: %s %s %s", i,
+                                    kTestCases[i].month, kTestCases[i].day,
+                                    kTestCases[i].rest));
 
     base::Time time;
     ASSERT_TRUE(net::FtpUtil::LsDateListingToTime(
         UTF8ToUTF16(kTestCases[i].month), UTF8ToUTF16(kTestCases[i].day),
-        UTF8ToUTF16(kTestCases[i].rest), &time));
+        UTF8ToUTF16(kTestCases[i].rest), mock_current_time, &time));
 
     base::Time::Exploded time_exploded;
     time.LocalExplode(&time_exploded);
@@ -168,8 +193,8 @@ TEST(FtpUtilTest, GetStringPartAfterColumns) {
     { "  foo   abc ", 2, "" },
   };
   for (size_t i = 0; i < ARRAYSIZE_UNSAFE(kTestCases); i++) {
-    SCOPED_TRACE(StringPrintf("Test[%" PRIuS "]: %s %d",
-                              i, kTestCases[i].text, kTestCases[i].column));
+    SCOPED_TRACE(base::StringPrintf("Test[%" PRIuS "]: %s %d", i,
+                                    kTestCases[i].text, kTestCases[i].column));
 
     EXPECT_EQ(ASCIIToUTF16(kTestCases[i].expected_result),
               net::FtpUtil::GetStringPartAfterColumns(

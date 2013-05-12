@@ -4,6 +4,7 @@
 
 #ifndef BASE_FILE_DESCRIPTOR_SHUFFLE_H_
 #define BASE_FILE_DESCRIPTOR_SHUFFLE_H_
+#pragma once
 
 // This code exists to perform the shuffling of file descriptors which is
 // commonly needed when forking subprocesses. The naive approve is very simple,
@@ -45,9 +46,9 @@ class InjectionDelegate {
 // An implementation of the InjectionDelegate interface using the file
 // descriptor table of the current process as the domain.
 class FileDescriptorTableInjection : public InjectionDelegate {
-  bool Duplicate(int* result, int fd);
-  bool Move(int src, int dest);
-  void Close(int fd);
+  virtual bool Duplicate(int* result, int fd);
+  virtual bool Move(int src, int dest);
+  virtual void Close(int fd);
 };
 
 // A single arc of the directed graph which describes an injective multimapping.
@@ -69,9 +70,13 @@ typedef std::vector<InjectionArc> InjectiveMultimap;
 bool PerformInjectiveMultimap(const InjectiveMultimap& map,
                               InjectionDelegate* delegate);
 
-static inline bool ShuffleFileDescriptors(const InjectiveMultimap& map) {
+bool PerformInjectiveMultimapDestructive(InjectiveMultimap* map,
+                                         InjectionDelegate* delegate);
+
+// This function will not call malloc but will mutate |map|
+static inline bool ShuffleFileDescriptors(InjectiveMultimap* map) {
   FileDescriptorTableInjection delegate;
-  return PerformInjectiveMultimap(map, &delegate);
+  return PerformInjectiveMultimapDestructive(map, &delegate);
 }
 
 }  // namespace base

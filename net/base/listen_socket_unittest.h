@@ -1,9 +1,10 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_BASE_LISTEN_SOCKET_UNITTEST_H_
 #define NET_BASE_LISTEN_SOCKET_UNITTEST_H_
+#pragma once
 
 #include "build/build_config.h"
 
@@ -12,17 +13,18 @@
 #elif defined(OS_POSIX)
 #include <sys/socket.h>
 #include <errno.h>
-#include <semaphore.h>
 #include <arpa/inet.h>
 #endif
 
-#include "base/thread.h"
 #include "base/basictypes.h"
+#include "base/memory/scoped_ptr.h"
 #include "base/message_loop.h"
 #include "base/string_util.h"
-#include "base/thread.h"
-#include "net/base/net_util.h"
+#include "base/synchronization/condition_variable.h"
+#include "base/synchronization/lock.h"
+#include "base/threading/thread.h"
 #include "net/base/listen_socket.h"
+#include "net/base/net_util.h"
 #include "net/base/winsock_init.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
@@ -52,7 +54,7 @@ class ListenSocketTestAction {
         data_(data) {}
 
   const std::string data() const { return data_; }
-  const ActionType type() const { return action_; }
+  ActionType type() const { return action_; }
 
  private:
   ActionType action_;
@@ -66,26 +68,14 @@ class ListenSocketTester :
     public ListenSocket::ListenSocketDelegate,
     public base::RefCountedThreadSafe<ListenSocketTester> {
 
- protected:
-  friend class base::RefCountedThreadSafe<ListenSocketTester>;
-
-  virtual ~ListenSocketTester() {}
-
-  virtual ListenSocket* DoListen();
-
  public:
-  ListenSocketTester()
-      : thread_(NULL),
-        loop_(NULL),
-        server_(NULL),
-        connection_(NULL){
-  }
+  ListenSocketTester();
 
-  virtual void SetUp();
-  virtual void TearDown();
+  void SetUp();
+  void TearDown();
 
   void ReportAction(const ListenSocketTestAction& action);
-  bool NextAction(int timeout);
+  void NextAction();
 
   // read all pending data from the test socket
   int ClearTestSocket();
@@ -93,10 +83,6 @@ class ListenSocketTester :
   void Shutdown();
   void Listen();
   void SendFromTester();
-  virtual void DidAccept(ListenSocket *server, ListenSocket *connection);
-  virtual void DidRead(ListenSocket *connection, const std::string& data);
-  virtual void DidClose(ListenSocket *sock);
-  virtual bool Send(SOCKET sock, const std::string& str);
   // verify the send/read from client to server
   void TestClientSend();
   // verify send/read of a longer string
@@ -104,22 +90,32 @@ class ListenSocketTester :
   // verify a send/read from server to client
   void TestServerSend();
 
-#if defined(OS_WIN)
-  CRITICAL_SECTION lock_;
-  HANDLE semaphore_;
-#elif defined(OS_POSIX)
-  pthread_mutex_t lock_;
-  sem_t* semaphore_;
-#endif
+  virtual bool Send(SOCKET sock, const std::string& str);
+
+  // ListenSocket::ListenSocketDelegate:
+  virtual void DidAccept(ListenSocket *server, ListenSocket *connection);
+  virtual void DidRead(ListenSocket *connection, const char* data, int len);
+  virtual void DidClose(ListenSocket *sock);
 
   scoped_ptr<base::Thread> thread_;
   MessageLoopForIO* loop_;
   ListenSocket* server_;
   ListenSocket* connection_;
   ListenSocketTestAction last_action_;
-  std::deque<ListenSocketTestAction> queue_;
+
   SOCKET test_socket_;
   static const int kTestPort;
+
+  base::Lock lock_;  // protects |queue_| and wraps |cv_|
+  base::ConditionVariable cv_;
+  std::deque<ListenSocketTestAction> queue_;
+
+ protected:
+  friend class base::RefCountedThreadSafe<ListenSocketTester>;
+
+  virtual ~ListenSocketTester();
+
+  virtual ListenSocket* DoListen();
 };
 
 #endif  // NET_BASE_LISTEN_SOCKET_UNITTEST_H_

@@ -4,11 +4,16 @@
 
 #ifndef BASE_FLOAT_UTIL_H_
 #define BASE_FLOAT_UTIL_H_
+#pragma once
 
 #include "build/build_config.h"
 
 #include <float.h>
 #include <math.h>
+
+#if defined(OS_SOLARIS)
+#include <ieeefp.h>
+#endif
 
 namespace base {
 

@@ -1,9 +1,12 @@
-// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_BASE_STATIC_COOKIE_POLICY_H_
 #define NET_BASE_STATIC_COOKIE_POLICY_H_
+#pragma once
+
+#include <string>
 
 #include "base/basictypes.h"
 #include "net/base/cookie_policy.h"
@@ -20,10 +23,17 @@ namespace net {
 //
 class StaticCookiePolicy : public CookiePolicy {
  public:
+  // Do not change the order of these types as they are persisted in
+  // preferences.
   enum Type {
-    ALLOW_ALL_COOKIES = 0,      // Do not perform any cookie blocking.
-    BLOCK_THIRD_PARTY_COOKIES,  // Prevent third-party cookies from being set.
-    BLOCK_ALL_COOKIES           // Disable cookies.
+    // Do not perform any cookie blocking.
+    ALLOW_ALL_COOKIES = 0,
+    // Prevent only third-party cookies from being set.
+    BLOCK_SETTING_THIRD_PARTY_COOKIES,
+    // Block all cookies (third-party or not) from begin set or read.
+    BLOCK_ALL_COOKIES,
+    // Prevent only third-party cookies from being set or read.
+    BLOCK_ALL_THIRD_PARTY_COOKIES
   };
 
   StaticCookiePolicy()
@@ -44,15 +54,13 @@ class StaticCookiePolicy : public CookiePolicy {
   // Consults the user's third-party cookie blocking preferences to determine
   // whether the URL's cookies can be read.
   virtual int CanGetCookies(const GURL& url,
-                            const GURL& first_party_for_cookies,
-                            CompletionCallback* callback);
+                            const GURL& first_party_for_cookies) const;
 
   // Consults the user's third-party cookie blocking preferences to determine
   // whether the URL's cookies can be set.
   virtual int CanSetCookie(const GURL& url,
                            const GURL& first_party_for_cookies,
-                           const std::string& cookie_line,
-                           CompletionCallback* callback);
+                           const std::string& cookie_line) const;
 
  private:
   Type type_;

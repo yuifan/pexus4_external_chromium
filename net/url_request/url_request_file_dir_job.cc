@@ -1,13 +1,14 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "net/url_request/url_request_file_dir_job.h"
 
+#include "base/compiler_specific.h"
 #include "base/file_util.h"
 #include "base/message_loop.h"
-#include "base/string_util.h"
 #include "base/sys_string_conversions.h"
+#include "base/utf_string_conversions.h"
 #include "base/time.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/io_buffer.h"
@@ -18,7 +19,7 @@
 #include <sys/stat.h>
 #endif
 
-using std::string;
+namespace net {
 
 URLRequestFileDirJob::URLRequestFileDirJob(URLRequest* request,
                                            const FilePath& dir_path)
@@ -28,32 +29,33 @@ URLRequestFileDirJob::URLRequestFileDirJob(URLRequest* request,
       list_complete_(false),
       wrote_header_(false),
       read_pending_(false),
-      read_buffer_length_(0) {
-}
-
-URLRequestFileDirJob::~URLRequestFileDirJob() {
-  DCHECK(read_pending_ == false);
-  DCHECK(lister_ == NULL);
-}
-
-void URLRequestFileDirJob::Start() {
-  // Start reading asynchronously so that all error reporting and data
-  // callbacks happen as they would for network requests.
-  MessageLoop::current()->PostTask(FROM_HERE, NewRunnableMethod(
-      this, &URLRequestFileDirJob::StartAsync));
+      read_buffer_length_(0),
+      ALLOW_THIS_IN_INITIALIZER_LIST(method_factory_(this)) {
 }
 
 void URLRequestFileDirJob::StartAsync() {
   DCHECK(!lister_);
 
+  // TODO(willchan): This is stupid.  We should tell |lister_| not to call us
+  // back.  Fix this stupidity.
+
   // AddRef so that *this* cannot be destroyed while the lister_
   // is trying to feed us data.
 
   AddRef();
-  lister_ = new net::DirectoryLister(dir_path_, this);
+  lister_ = new DirectoryLister(dir_path_, this);
   lister_->Start();
 
   NotifyHeadersComplete();
+}
+
+void URLRequestFileDirJob::Start() {
+  // Start reading asynchronously so that all error reporting and data
+  // callbacks happen as they would for network requests.
+  MessageLoop::current()->PostTask(
+      FROM_HERE,
+      method_factory_.NewRunnableMethod(
+          &URLRequestFileDirJob::StartAsync));
 }
 
 void URLRequestFileDirJob::Kill() {
@@ -62,16 +64,18 @@ void URLRequestFileDirJob::Kill() {
 
   canceled_ = true;
 
-  // Don't call CloseLister or dispatch an error to the URLRequest because we
-  // want OnListDone to be called to also write the error to the output stream.
-  // OnListDone will notify the URLRequest at this time.
+  // Don't call CloseLister or dispatch an error to the URLRequest because
+  // we want OnListDone to be called to also write the error to the output
+  // stream. OnListDone will notify the URLRequest at this time.
   if (lister_)
     lister_->Cancel();
 
   URLRequestJob::Kill();
+
+  method_factory_.RevokeAll();
 }
 
-bool URLRequestFileDirJob::ReadRawData(net::IOBuffer* buf, int buf_size,
+bool URLRequestFileDirJob::ReadRawData(IOBuffer* buf, int buf_size,
                                        int *bytes_read) {
   DCHECK(bytes_read);
   *bytes_read = 0;
@@ -90,19 +94,19 @@ bool URLRequestFileDirJob::ReadRawData(net::IOBuffer* buf, int buf_size,
   return false;
 }
 
-bool URLRequestFileDirJob::GetMimeType(string* mime_type) const {
+bool URLRequestFileDirJob::GetMimeType(std::string* mime_type) const {
   *mime_type = "text/html";
   return true;
 }
 
-bool URLRequestFileDirJob::GetCharset(string* charset) {
+bool URLRequestFileDirJob::GetCharset(std::string* charset) {
   // All the filenames are converted to UTF-8 before being added.
   *charset = "utf-8";
   return true;
 }
 
 void URLRequestFileDirJob::OnListFile(
-    const file_util::FileEnumerator::FindInfo& data) {
+    const DirectoryLister::DirectoryListerData& data) {
   // We wait to write out the header until we get the first file, so that we
   // can catch errors from DirectoryLister and show an error page.
   if (!wrote_header_) {
@@ -117,31 +121,31 @@ void URLRequestFileDirJob::OnListFile(
     const string16& title = WideToUTF16(
         base::SysNativeMBToWide(dir_path_.value()));
 #endif
-    data_.append(net::GetDirectoryListingHeader(title));
+    data_.append(GetDirectoryListingHeader(title));
     wrote_header_ = true;
   }
 
 #if defined(OS_WIN)
-  int64 size = (static_cast<unsigned __int64>(data.nFileSizeHigh) << 32) |
-      data.nFileSizeLow;
+  int64 size = (static_cast<unsigned __int64>(data.info.nFileSizeHigh) << 32) |
+      data.info.nFileSizeLow;
 
   // Note that we should not convert ftLastWriteTime to the local time because
   // ICU's datetime formatting APIs expect time in UTC and take into account
   // the timezone before formatting.
-  data_.append(net::GetDirectoryListingEntry(
-      data.cFileName, std::string(),
-      (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? true : false,
+  data_.append(GetDirectoryListingEntry(
+      data.info.cFileName, std::string(),
+      (data.info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? true : false,
       size,
-      base::Time::FromFileTime(data.ftLastWriteTime)));
+      base::Time::FromFileTime(data.info.ftLastWriteTime)));
 
 #elif defined(OS_POSIX)
   // TOOD(jungshik): The same issue as for the directory name.
-  data_.append(net::GetDirectoryListingEntry(
-      WideToUTF16(base::SysNativeMBToWide(data.filename)),
-      data.filename,
-      S_ISDIR(data.stat.st_mode),
-      data.stat.st_size,
-      base::Time::FromTimeT(data.stat.st_mtime)));
+  data_.append(GetDirectoryListingEntry(
+      WideToUTF16(base::SysNativeMBToWide(data.info.filename)),
+      data.info.filename,
+      S_ISDIR(data.info.stat.st_mode),
+      data.info.stat.st_size,
+      base::Time::FromTimeT(data.info.stat.st_mtime)));
 #endif
 
   // TODO(darin): coalesce more?
@@ -165,31 +169,17 @@ void URLRequestFileDirJob::OnListDone(int error) {
   Release();  // The Lister is finished; may delete *this*
 }
 
+URLRequestFileDirJob::~URLRequestFileDirJob() {
+  DCHECK(read_pending_ == false);
+  DCHECK(lister_ == NULL);
+}
+
 void URLRequestFileDirJob::CloseLister() {
   if (lister_) {
     lister_->Cancel();
     lister_->set_delegate(NULL);
     lister_ = NULL;
   }
-}
-
-bool URLRequestFileDirJob::FillReadBuffer(char *buf, int buf_size,
-                                          int *bytes_read) {
-  DCHECK(bytes_read);
-
-  *bytes_read = 0;
-
-  int count = std::min(buf_size, static_cast<int>(data_.size()));
-  if (count) {
-    memcpy(buf, &data_[0], count);
-    data_.erase(0, count);
-    *bytes_read = count;
-    return true;
-  } else if (list_complete_) {
-    // EOF
-    return true;
-  }
-  return false;
 }
 
 void URLRequestFileDirJob::CompleteRead() {
@@ -212,23 +202,23 @@ void URLRequestFileDirJob::CompleteRead() {
   }
 }
 
-bool URLRequestFileDirJob::IsRedirectResponse(
-    GURL* location, int* http_status_code) {
-  // If the URL did not have a trailing slash, treat the response as a redirect
-  // to the URL with a trailing slash appended.
-  std::string path = request_->url().path();
-  if (path.empty() || (path[path.size() - 1] != '/')) {
-    // This happens when we discovered the file is a directory, so needs a
-    // slash at the end of the path.
-    std::string new_path = path;
-    new_path.push_back('/');
-    GURL::Replacements replacements;
-    replacements.SetPathStr(new_path);
+bool URLRequestFileDirJob::FillReadBuffer(char *buf, int buf_size,
+                                          int *bytes_read) {
+  DCHECK(bytes_read);
 
-    *location = request_->url().ReplaceComponents(replacements);
-    *http_status_code = 301;  // simulate a permanent redirect
+  *bytes_read = 0;
+
+  int count = std::min(buf_size, static_cast<int>(data_.size()));
+  if (count) {
+    memcpy(buf, &data_[0], count);
+    data_.erase(0, count);
+    *bytes_read = count;
+    return true;
+  } else if (list_complete_) {
+    // EOF
     return true;
   }
-
   return false;
 }
+
+}  // namespace net

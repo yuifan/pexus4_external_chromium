@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -19,9 +19,8 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
     // Expected outputs (fields of the ProxyConfig).
     bool auto_detect;
     GURL pac_url;
-    ProxyConfig::ProxyRules proxy_rules;
+    ProxyRulesExpectation proxy_rules;
     const char* proxy_bypass_list;  // newline separated
-    bool bypass_local_names;
   } tests[] = {
     // Auto detect.
     {
@@ -35,9 +34,7 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       // Expected result.
       true,                       // auto_detect
       GURL(),                     // pac_url
-      ProxyConfig::ProxyRules(),  // proxy_rules
-      "",                         // proxy_bypass_list
-      false,                      // bypass_local_names
+      ProxyRulesExpectation::Empty(),
     },
 
     // Valid PAC url
@@ -52,9 +49,7 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       // Expected result.
       false,                         // auto_detect
       GURL("http://wpad/wpad.dat"),  // pac_url
-      ProxyConfig::ProxyRules(),     // proxy_rules
-      "",                            // proxy_bypass_list
-      false,                         // bypass_local_names
+      ProxyRulesExpectation::Empty(),
     },
 
     // Invalid PAC url string.
@@ -69,9 +64,7 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       // Expected result.
       false,                      // auto_detect
       GURL(),                     // pac_url
-      ProxyConfig::ProxyRules(),  // proxy_rules
-      "",                         // proxy_bypass_list
-      false,                      // bypass_local_names
+      ProxyRulesExpectation::Empty(),
     },
 
     // Single-host in proxy list.
@@ -86,9 +79,9 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       // Expected result.
       false,                                   // auto_detect
       GURL(),                                  // pac_url
-      MakeSingleProxyRules("www.google.com"),  // proxy_rules
-      "",                                      // proxy_bypass_list
-      false,                                   // bypass_local_names
+      ProxyRulesExpectation::Single(
+          "www.google.com:80",  // single proxy
+          ""),                  // bypass rules
     },
 
     // Per-scheme proxy rules.
@@ -103,12 +96,14 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       // Expected result.
       false,                                   // auto_detect
       GURL(),                                  // pac_url
-      MakeProxyPerSchemeRules("www.google.com:80", "www.foo.com:110", ""),
-      "",                                      // proxy_bypass_list
-      false,                                   // bypass_local_names
+      ProxyRulesExpectation::PerScheme(
+          "www.google.com:80",  // http
+          "www.foo.com:110",   // https
+          "",                  // ftp
+          ""),                 // bypass rules
     },
 
-    // SOCKS proxy configuration
+    // SOCKS proxy configuration.
     {
       { // Input.
         FALSE,                                            // fAutoDetect
@@ -119,12 +114,18 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       },
 
       // Expected result.
+      // Note that "socks" is interprted as meaning "socks4", since that is how
+      // Internet Explorer applies the settings. For more details on this
+      // policy, see:
+      // http://code.google.com/p/chromium/issues/detail?id=55912#c2
       false,                                   // auto_detect
       GURL(),                                  // pac_url
-      MakeProxyPerSchemeRules("www.google.com:80", "www.foo.com:110",
-                              "ftpproxy:20", "foopy:130"),
-      "",                                      // proxy_bypass_list
-      false,                                   // bypass_local_names
+      ProxyRulesExpectation::PerSchemeWithSocks(
+          "www.google.com:80",   // http
+          "www.foo.com:110",     // https
+          "ftpproxy:20",         // ftp
+          "socks4://foopy:130",  // socks
+          ""),                   // bypass rules
     },
 
     // Bypass local names.
@@ -138,12 +139,10 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
 
       true,                       // auto_detect
       GURL(),                     // pac_url
-      ProxyConfig::ProxyRules(),  // proxy_rules
-      "",                         // proxy_bypass_list
-      true,                       // bypass_local_names
+      ProxyRulesExpectation::EmptyWithBypass("<local>"),
     },
 
-    // Bypass "google.com" and local names, using semicolon as delimeter
+    // Bypass "google.com" and local names, using semicolon as delimiter
     // (ignoring white space).
     {
       { // Input.
@@ -156,12 +155,10 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       // Expected result.
       true,                       // auto_detect
       GURL(),                     // pac_url
-      ProxyConfig::ProxyRules(),  // proxy_rules
-      "google.com\n",             // proxy_bypass_list
-      true,                       // bypass_local_names
+      ProxyRulesExpectation::EmptyWithBypass("<local>,google.com"),
     },
 
-    // Bypass "foo.com" and "google.com", using lines as delimeter.
+    // Bypass "foo.com" and "google.com", using lines as delimiter.
     {
       { // Input.
         TRUE,                      // fAutoDetect
@@ -173,9 +170,22 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
       // Expected result.
       true,                       // auto_detect
       GURL(),                     // pac_url
-      ProxyConfig::ProxyRules(),  // proxy_rules
-      "foo.com\ngoogle.com\n",    // proxy_bypass_list
-      false,                      // bypass_local_names
+      ProxyRulesExpectation::EmptyWithBypass("foo.com,google.com"),
+    },
+
+    // Bypass "foo.com" and "google.com", using commas as delimiter.
+    {
+      { // Input.
+        TRUE,                      // fAutoDetect
+        NULL,                      // lpszAutoConfigUrl
+        NULL,                      // lpszProxy
+        L"foo.com, google.com",    // lpszProxy_bypass
+      },
+
+      // Expected result.
+      true,                       // auto_detect
+      GURL(),                     // pac_url
+      ProxyRulesExpectation::EmptyWithBypass("foo.com,google.com"),
     },
   };
 
@@ -183,12 +193,9 @@ TEST(ProxyConfigServiceWinTest, SetFromIEConfig) {
     ProxyConfig config;
     ProxyConfigServiceWin::SetFromIEConfig(&config, tests[i].ie_config);
 
-    EXPECT_EQ(tests[i].auto_detect, config.auto_detect);
-    EXPECT_EQ(tests[i].pac_url, config.pac_url);
-    EXPECT_EQ(tests[i].proxy_bypass_list,
-              FlattenProxyBypass(config.proxy_bypass));
-    EXPECT_EQ(tests[i].bypass_local_names, config.proxy_bypass_local_names);
-    EXPECT_EQ(tests[i].proxy_rules, config.proxy_rules);
+    EXPECT_EQ(tests[i].auto_detect, config.auto_detect());
+    EXPECT_EQ(tests[i].pac_url, config.pac_url());
+    EXPECT_TRUE(tests[i].proxy_rules.Matches(config.proxy_rules()));
   }
 }
 

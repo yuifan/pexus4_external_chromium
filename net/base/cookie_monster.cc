@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -49,97 +49,368 @@
 #include "base/basictypes.h"
 #include "base/format_macros.h"
 #include "base/logging.h"
-#include "base/scoped_ptr.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/message_loop.h"
+#include "base/metrics/histogram.h"
 #include "base/string_tokenizer.h"
 #include "base/string_util.h"
+#include "base/stringprintf.h"
 #include "googleurl/src/gurl.h"
+#include "googleurl/src/url_canon.h"
 #include "net/base/net_util.h"
 #include "net/base/registry_controlled_domain.h"
 
-// #define COOKIE_LOGGING_ENABLED
-#ifdef COOKIE_LOGGING_ENABLED
-#define COOKIE_DLOG(severity) DLOG_IF(INFO, 1)
-#else
-#define COOKIE_DLOG(severity) DLOG_IF(INFO, 0)
-#endif
-
 using base::Time;
 using base::TimeDelta;
+using base::TimeTicks;
+
+static const int kMinutesInTenYears = 10 * 365 * 24 * 60;
 
 namespace net {
 
-// Cookie garbage collection thresholds.  Based off of the Mozilla defaults.
-// It might seem scary to have a high purge value, but really it's not.  You
-// just make sure that you increase the max to cover the increase in purge,
-// and we would have been purging the same amount of cookies.  We're just
-// going through the garbage collection process less often.
-static const size_t kNumCookiesPerHost      = 70;  // ~50 cookies
-static const size_t kNumCookiesPerHostPurge = 20;
-static const size_t kNumCookiesTotal        = 3300;  // ~3000 cookies
-static const size_t kNumCookiesTotalPurge   = 300;
+// See comments at declaration of these variables in cookie_monster.h
+// for details.
+const size_t CookieMonster::kDomainMaxCookies           = 180;
+const size_t CookieMonster::kDomainPurgeCookies         = 30;
+const size_t CookieMonster::kMaxCookies                 = 3300;
+const size_t CookieMonster::kPurgeCookies               = 300;
+const int CookieMonster::kSafeFromGlobalPurgeDays       = 30;
+
+namespace {
 
 // Default minimum delay after updating a cookie's LastAccessDate before we
 // will update it again.
-static const int kDefaultAccessUpdateThresholdSeconds = 60;
+const int kDefaultAccessUpdateThresholdSeconds = 60;
+
+// Comparator to sort cookies from highest creation date to lowest
+// creation date.
+struct OrderByCreationTimeDesc {
+  bool operator()(const CookieMonster::CookieMap::iterator& a,
+                  const CookieMonster::CookieMap::iterator& b) const {
+    return a->second->CreationDate() > b->second->CreationDate();
+  }
+};
+
+// Constants for use in VLOG
+const int kVlogPerCookieMonster = 1;
+const int kVlogPeriodic = 3;
+const int kVlogGarbageCollection = 5;
+const int kVlogSetCookies = 7;
+const int kVlogGetCookies = 9;
+
+// Mozilla sorts on the path length (longest first), and then it
+// sorts by creation time (oldest first).
+// The RFC says the sort order for the domain attribute is undefined.
+bool CookieSorter(CookieMonster::CanonicalCookie* cc1,
+                  CookieMonster::CanonicalCookie* cc2) {
+  if (cc1->Path().length() == cc2->Path().length())
+    return cc1->CreationDate() < cc2->CreationDate();
+  return cc1->Path().length() > cc2->Path().length();
+}
+
+bool LRUCookieSorter(const CookieMonster::CookieMap::iterator& it1,
+                     const CookieMonster::CookieMap::iterator& it2) {
+  // Cookies accessed less recently should be deleted first.
+  if (it1->second->LastAccessDate() != it2->second->LastAccessDate())
+    return it1->second->LastAccessDate() < it2->second->LastAccessDate();
+
+  // In rare cases we might have two cookies with identical last access times.
+  // To preserve the stability of the sort, in these cases prefer to delete
+  // older cookies over newer ones.  CreationDate() is guaranteed to be unique.
+  return it1->second->CreationDate() < it2->second->CreationDate();
+}
+
+// Our strategy to find duplicates is:
+// (1) Build a map from (cookiename, cookiepath) to
+//     {list of cookies with this signature, sorted by creation time}.
+// (2) For each list with more than 1 entry, keep the cookie having the
+//     most recent creation time, and delete the others.
+//
+// Two cookies are considered equivalent if they have the same domain,
+// name, and path.
+struct CookieSignature {
+ public:
+  CookieSignature(const std::string& name, const std::string& domain,
+                  const std::string& path)
+      : name(name),
+        domain(domain),
+        path(path) {}
+
+  // To be a key for a map this class needs to be assignable, copyable,
+  // and have an operator<.  The default assignment operator
+  // and copy constructor are exactly what we want.
+
+  bool operator<(const CookieSignature& cs) const {
+    // Name compare dominates, then domain, then path.
+    int diff = name.compare(cs.name);
+    if (diff != 0)
+      return diff < 0;
+
+    diff = domain.compare(cs.domain);
+    if (diff != 0)
+      return diff < 0;
+
+    return path.compare(cs.path) < 0;
+  }
+
+  std::string name;
+  std::string domain;
+  std::string path;
+};
+
+// Returns the effective TLD+1 for a given host. This only makes sense for http
+// and https schemes. For other schemes, the host will be returned unchanged
+// (minus any leading period).
+std::string GetEffectiveDomain(const std::string& scheme,
+                               const std::string& host) {
+  if (scheme == "http" || scheme == "https")
+    return RegistryControlledDomainService::GetDomainAndRegistry(host);
+
+  if (!CookieMonster::DomainIsHostOnly(host))
+    return host.substr(1);
+  return host;
+}
+
+// Determine the actual cookie domain based on the domain string passed
+// (if any) and the URL from which the cookie came.
+// On success returns true, and sets cookie_domain to either a
+//   -host cookie domain (ex: "google.com")
+//   -domain cookie domain (ex: ".google.com")
+bool GetCookieDomainWithString(const GURL& url,
+                               const std::string& domain_string,
+                               std::string* result) {
+  const std::string url_host(url.host());
+
+  // If no domain was specified in the domain string, default to a host cookie.
+  // We match IE/Firefox in allowing a domain=IPADDR if it matches the url
+  // ip address hostname exactly.  It should be treated as a host cookie.
+  if (domain_string.empty() ||
+      (url.HostIsIPAddress() && url_host == domain_string)) {
+    *result = url_host;
+    DCHECK(CookieMonster::DomainIsHostOnly(*result));
+    return true;
+  }
+
+  // Get the normalized domain specified in cookie line.
+  // Note: The RFC says we can reject a cookie if the domain
+  // attribute does not start with a dot. IE/FF/Safari however, allow a cookie
+  // of the form domain=my.domain.com, treating it the same as
+  // domain=.my.domain.com -- for compatibility we do the same here.  Firefox
+  // also treats domain=.....my.domain.com like domain=.my.domain.com, but
+  // neither IE nor Safari do this, and we don't either.
+  url_canon::CanonHostInfo ignored;
+  std::string cookie_domain(CanonicalizeHost(domain_string, &ignored));
+  if (cookie_domain.empty())
+    return false;
+  if (cookie_domain[0] != '.')
+    cookie_domain = "." + cookie_domain;
+
+  // Ensure |url| and |cookie_domain| have the same domain+registry.
+  const std::string url_scheme(url.scheme());
+  const std::string url_domain_and_registry(
+      GetEffectiveDomain(url_scheme, url_host));
+  if (url_domain_and_registry.empty())
+    return false;  // IP addresses/intranet hosts can't set domain cookies.
+  const std::string cookie_domain_and_registry(
+      GetEffectiveDomain(url_scheme, cookie_domain));
+  if (url_domain_and_registry != cookie_domain_and_registry)
+    return false;  // Can't set a cookie on a different domain + registry.
+
+  // Ensure |url_host| is |cookie_domain| or one of its subdomains.  Given that
+  // we know the domain+registry are the same from the above checks, this is
+  // basically a simple string suffix check.
+  if ((url_host.length() < cookie_domain.length()) ?
+      (cookie_domain != ("." + url_host)) :
+      url_host.compare(url_host.length() - cookie_domain.length(),
+                       cookie_domain.length(), cookie_domain))
+    return false;
+
+  *result = cookie_domain;
+  return true;
+}
+
+// Determine the cookie domain to use for setting the specified cookie.
+bool GetCookieDomain(const GURL& url,
+                     const CookieMonster::ParsedCookie& pc,
+                     std::string* result) {
+  std::string domain_string;
+  if (pc.HasDomain())
+    domain_string = pc.Domain();
+  return GetCookieDomainWithString(url, domain_string, result);
+}
+
+std::string CanonPathWithString(const GURL& url,
+                                const std::string& path_string) {
+  // The RFC says the path should be a prefix of the current URL path.
+  // However, Mozilla allows you to set any path for compatibility with
+  // broken websites.  We unfortunately will mimic this behavior.  We try
+  // to be generous and accept cookies with an invalid path attribute, and
+  // default the path to something reasonable.
+
+  // The path was supplied in the cookie, we'll take it.
+  if (!path_string.empty() && path_string[0] == '/')
+    return path_string;
+
+  // The path was not supplied in the cookie or invalid, we will default
+  // to the current URL path.
+  // """Defaults to the path of the request URL that generated the
+  //    Set-Cookie response, up to, but not including, the
+  //    right-most /."""
+  // How would this work for a cookie on /?  We will include it then.
+  const std::string& url_path = url.path();
+
+  size_t idx = url_path.find_last_of('/');
+
+  // The cookie path was invalid or a single '/'.
+  if (idx == 0 || idx == std::string::npos)
+    return std::string("/");
+
+  // Return up to the rightmost '/'.
+  return url_path.substr(0, idx);
+}
+
+std::string CanonPath(const GURL& url,
+                      const CookieMonster::ParsedCookie& pc) {
+  std::string path_string;
+  if (pc.HasPath())
+    path_string = pc.Path();
+  return CanonPathWithString(url, path_string);
+}
+
+Time CanonExpirationInternal(const CookieMonster::ParsedCookie& pc,
+                             const Time& current) {
+  // First, try the Max-Age attribute.
+  uint64 max_age = 0;
+  if (pc.HasMaxAge() &&
+#ifdef COMPILER_MSVC
+      sscanf_s(
+#else
+      sscanf(
+#endif
+             pc.MaxAge().c_str(), " %" PRIu64, &max_age) == 1) {
+    return current + TimeDelta::FromSeconds(max_age);
+  }
+
+  // Try the Expires attribute.
+  if (pc.HasExpires())
+    return CookieMonster::ParseCookieTime(pc.Expires());
+
+  // Invalid or no expiration, persistent cookie.
+  return Time();
+}
+
+Time CanonExpiration(const CookieMonster::ParsedCookie& pc,
+                     const Time& current,
+                     const CookieOptions& options) {
+  Time expiration_time = CanonExpirationInternal(pc, current);
+
+  if (options.force_session()) {
+    // Only override the expiry  adte if it's in the future. If the expiry date
+    // is before the creation date, the cookie is supposed to be deleted.
+    if (expiration_time.is_null() || expiration_time > current)
+      return Time();
+  }
+
+  return expiration_time;
+}
+
+// Helper for GarbageCollection.  If |cookie_its->size() > num_max|, remove the
+// |num_max - num_purge| most recently accessed cookies from cookie_its.
+// (In other words, leave the entries that are candidates for
+// eviction in cookie_its.)  The cookies returned will be in order sorted by
+// access time, least recently accessed first.  The access time of the least
+// recently accessed entry not returned will be placed in
+// |*lra_removed| if that pointer is set.  FindLeastRecentlyAccessed
+// returns false if no manipulation is done (because the list size is less
+// than num_max), true otherwise.
+bool FindLeastRecentlyAccessed(
+    size_t num_max,
+    size_t num_purge,
+    Time* lra_removed,
+    std::vector<CookieMonster::CookieMap::iterator>* cookie_its) {
+  DCHECK_LE(num_purge, num_max);
+  if (cookie_its->size() > num_max) {
+    VLOG(kVlogGarbageCollection)
+        << "FindLeastRecentlyAccessed() Deep Garbage Collect.";
+    num_purge += cookie_its->size() - num_max;
+    DCHECK_GT(cookie_its->size(), num_purge);
+
+    // Add 1 so that we can get the last time left in the store.
+    std::partial_sort(cookie_its->begin(), cookie_its->begin() + num_purge + 1,
+                      cookie_its->end(), LRUCookieSorter);
+    *lra_removed =
+        (*(cookie_its->begin() + num_purge))->second->LastAccessDate();
+    cookie_its->erase(cookie_its->begin() + num_purge, cookie_its->end());
+    return true;
+  }
+  return false;
+}
+
+// Mapping between DeletionCause and Delegate::ChangeCause; the mapping also
+// provides a boolean that specifies whether or not an OnCookieChanged
+// notification ought to be generated.
+typedef struct ChangeCausePair_struct {
+  CookieMonster::Delegate::ChangeCause cause;
+  bool notify;
+} ChangeCausePair;
+ChangeCausePair ChangeCauseMapping[] = {
+  // DELETE_COOKIE_EXPLICIT
+  { CookieMonster::Delegate::CHANGE_COOKIE_EXPLICIT, true },
+  // DELETE_COOKIE_OVERWRITE
+  { CookieMonster::Delegate::CHANGE_COOKIE_OVERWRITE, true },
+  // DELETE_COOKIE_EXPIRED
+  { CookieMonster::Delegate::CHANGE_COOKIE_EXPIRED, true },
+  // DELETE_COOKIE_EVICTED
+  { CookieMonster::Delegate::CHANGE_COOKIE_EVICTED, true },
+  // DELETE_COOKIE_DUPLICATE_IN_BACKING_STORE
+  { CookieMonster::Delegate::CHANGE_COOKIE_EXPLICIT, false },
+  // DELETE_COOKIE_DONT_RECORD
+  { CookieMonster::Delegate::CHANGE_COOKIE_EXPLICIT, false },
+  // DELETE_COOKIE_EVICTED_DOMAIN
+  { CookieMonster::Delegate::CHANGE_COOKIE_EVICTED, true },
+  // DELETE_COOKIE_EVICTED_GLOBAL
+  { CookieMonster::Delegate::CHANGE_COOKIE_EVICTED, true },
+  // DELETE_COOKIE_EVICTED_DOMAIN_PRE_SAFE
+  { CookieMonster::Delegate::CHANGE_COOKIE_EVICTED, true },
+  // DELETE_COOKIE_EVICTED_DOMAIN_POST_SAFE
+  { CookieMonster::Delegate::CHANGE_COOKIE_EVICTED, true },
+  // DELETE_COOKIE_EXPIRED_OVERWRITE
+  { CookieMonster::Delegate::CHANGE_COOKIE_EXPIRED_OVERWRITE, true },
+  // DELETE_COOKIE_LAST_ENTRY
+  { CookieMonster::Delegate::CHANGE_COOKIE_EXPLICIT, false }
+};
+
+}  // namespace
 
 // static
 bool CookieMonster::enable_file_scheme_ = false;
 
-// static
-void CookieMonster::EnableFileScheme() {
-  enable_file_scheme_ = true;
-}
-
-CookieMonster::CookieMonster()
+CookieMonster::CookieMonster(PersistentCookieStore* store, Delegate* delegate)
     : initialized_(false),
-      store_(NULL),
-      last_access_threshold_(
-          TimeDelta::FromSeconds(kDefaultAccessUpdateThresholdSeconds)) {
-  SetDefaultCookieableSchemes();
-}
-
-CookieMonster::CookieMonster(PersistentCookieStore* store)
-    : initialized_(false),
+      expiry_and_key_scheme_(expiry_and_key_default_),
       store_(store),
       last_access_threshold_(
-          TimeDelta::FromSeconds(kDefaultAccessUpdateThresholdSeconds)) {
+          TimeDelta::FromSeconds(kDefaultAccessUpdateThresholdSeconds)),
+      delegate_(delegate),
+      last_statistic_record_time_(Time::Now()),
+      keep_expired_cookies_(false) {
+  InitializeHistograms();
   SetDefaultCookieableSchemes();
 }
 
-CookieMonster::~CookieMonster() {
-  DeleteAll(false);
-}
-
-void CookieMonster::InitStore() {
-  DCHECK(store_) << "Store must exist to initialize";
-
-  // Initialize the store and sync in any saved persistent cookies.  We don't
-  // care if it's expired, insert it so it can be garbage collected, removed,
-  // and sync'd.
-  std::vector<KeyedCanonicalCookie> cookies;
-  // Reserve space for the maximum amount of cookies a database should have.
-  // This prevents multiple vector growth / copies as we append cookies.
-  cookies.reserve(kNumCookiesTotal);
-  store_->Load(&cookies);
-  for (std::vector<KeyedCanonicalCookie>::const_iterator it = cookies.begin();
-       it != cookies.end(); ++it) {
-    InternalInsertCookie(it->first, it->second, false);
-  }
-}
-
-void CookieMonster::SetDefaultCookieableSchemes() {
-  // Note: file must be the last scheme.
-  static const char* kDefaultCookieableSchemes[] = { "http", "https", "file" };
-  int num_schemes = enable_file_scheme_ ? 3 : 2;
-  SetCookieableSchemes(kDefaultCookieableSchemes, num_schemes);
-}
-
-// The system resolution is not high enough, so we can have multiple
-// set cookies that result in the same system time.  When this happens, we
-// increment by one Time unit.  Let's hope computers don't get too fast.
-Time CookieMonster::CurrentTime() {
-  return std::max(Time::Now(),
-      Time::FromInternalValue(last_time_seen_.ToInternalValue() + 1));
+CookieMonster::CookieMonster(PersistentCookieStore* store,
+                             Delegate* delegate,
+                             int last_access_threshold_milliseconds)
+    : initialized_(false),
+      expiry_and_key_scheme_(expiry_and_key_default_),
+      store_(store),
+      last_access_threshold_(base::TimeDelta::FromMilliseconds(
+          last_access_threshold_milliseconds)),
+      delegate_(delegate),
+      last_statistic_record_time_(base::Time::Now()),
+      keep_expired_cookies_(false) {
+  InitializeHistograms();
+  SetDefaultCookieableSchemes();
 }
 
 // Parse a cookie expiration time.  We try to be lenient, but we need to
@@ -260,380 +531,109 @@ Time CookieMonster::ParseCookieTime(const std::string& time_string) {
   return Time();
 }
 
-// Returns the effective TLD+1 for a given host. This only makes sense for http
-// and https schemes. For other schemes, the host will be returned unchanged
-// (minus any leading .).
-static std::string GetEffectiveDomain(const std::string& scheme,
-                                      const std::string& host) {
-  if (scheme == "http" || scheme == "https")
-    return RegistryControlledDomainService::GetDomainAndRegistry(host);
-
-  if (!host.empty() && host[0] == '.')
-    return host.substr(1);
-  return host;
+bool CookieMonster::DomainIsHostOnly(const std::string& domain_string) {
+  return (domain_string.empty() || domain_string[0] != '.');
 }
 
-// Determine the cookie domain key to use for setting the specified cookie.
-// On success returns true, and sets cookie_domain_key to either a
-//   -host cookie key (ex: "google.com")
-//   -domain cookie key (ex: ".google.com")
-static bool GetCookieDomainKey(const GURL& url,
-                               const CookieMonster::ParsedCookie& pc,
-                               std::string* cookie_domain_key) {
-  const std::string url_host(url.host());
+bool CookieMonster::SetCookieWithDetails(
+    const GURL& url, const std::string& name, const std::string& value,
+    const std::string& domain, const std::string& path,
+    const base::Time& expiration_time, bool secure, bool http_only) {
+  base::AutoLock autolock(lock_);
 
-  // If no domain was specified in the cookie, default to a host cookie.
-  // We match IE/Firefox in allowing a domain=IPADDR if it matches the url
-  // ip address hostname exactly.  It should be treated as a host cookie.
-  if (!pc.HasDomain() || pc.Domain().empty() ||
-      (url.HostIsIPAddress() && url_host == pc.Domain())) {
-    *cookie_domain_key = url_host;
-    DCHECK((*cookie_domain_key)[0] != '.');
-    return true;
-  }
-
-  // Get the normalized domain specified in cookie line.
-  // Note: The RFC says we can reject a cookie if the domain
-  // attribute does not start with a dot. IE/FF/Safari however, allow a cookie
-  // of the form domain=my.domain.com, treating it the same as
-  // domain=.my.domain.com -- for compatibility we do the same here.  Firefox
-  // also treats domain=.....my.domain.com like domain=.my.domain.com, but
-  // neither IE nor Safari do this, and we don't either.
-  url_canon::CanonHostInfo ignored;
-  std::string cookie_domain(net::CanonicalizeHost(pc.Domain(), &ignored));
-  if (cookie_domain.empty())
-    return false;
-  if (cookie_domain[0] != '.')
-    cookie_domain = "." + cookie_domain;
-
-  // Ensure |url| and |cookie_domain| have the same domain+registry.
-  const std::string url_scheme(url.scheme());
-  const std::string url_domain_and_registry(
-      GetEffectiveDomain(url_scheme, url_host));
-  if (url_domain_and_registry.empty())
-    return false;  // IP addresses/intranet hosts can't set domain cookies.
-  const std::string cookie_domain_and_registry(
-      GetEffectiveDomain(url_scheme, cookie_domain));
-  if (url_domain_and_registry != cookie_domain_and_registry)
-    return false;  // Can't set a cookie on a different domain + registry.
-
-  // Ensure |url_host| is |cookie_domain| or one of its subdomains.  Given that
-  // we know the domain+registry are the same from the above checks, this is
-  // basically a simple string suffix check.
-  if ((url_host.length() < cookie_domain.length()) ?
-      (cookie_domain != ("." + url_host)) :
-      url_host.compare(url_host.length() - cookie_domain.length(),
-                       cookie_domain.length(), cookie_domain))
+  if (!HasCookieableScheme(url))
     return false;
 
-  *cookie_domain_key = cookie_domain;
-  return true;
-}
-
-static std::string CanonPath(const GURL& url,
-                             const CookieMonster::ParsedCookie& pc) {
-  // The RFC says the path should be a prefix of the current URL path.
-  // However, Mozilla allows you to set any path for compatibility with
-  // broken websites.  We unfortunately will mimic this behavior.  We try
-  // to be generous and accept cookies with an invalid path attribute, and
-  // default the path to something reasonable.
-
-  // The path was supplied in the cookie, we'll take it.
-  if (pc.HasPath() && !pc.Path().empty() && pc.Path()[0] == '/')
-    return pc.Path();
-
-  // The path was not supplied in the cookie or invalid, we will default
-  // to the current URL path.
-  // """Defaults to the path of the request URL that generated the
-  //    Set-Cookie response, up to, but not including, the
-  //    right-most /."""
-  // How would this work for a cookie on /?  We will include it then.
-  const std::string& url_path = url.path();
-
-  size_t idx = url_path.find_last_of('/');
-
-  // The cookie path was invalid or a single '/'.
-  if (idx == 0 || idx == std::string::npos)
-    return std::string("/");
-
-  // Return up to the rightmost '/'.
-  return url_path.substr(0, idx);
-}
-
-static Time CanonExpiration(const CookieMonster::ParsedCookie& pc,
-                            const Time& current) {
-  // First, try the Max-Age attribute.
-  uint64 max_age = 0;
-  if (pc.HasMaxAge() &&
-#ifdef COMPILER_MSVC
-      sscanf_s(
-#else
-      sscanf(
-#endif
-             pc.MaxAge().c_str(), " %" PRIu64, &max_age) == 1) {
-    return current + TimeDelta::FromSeconds(max_age);
-  }
-
-  // Try the Expires attribute.
-  if (pc.HasExpires())
-    return CookieMonster::ParseCookieTime(pc.Expires());
-
-  // Invalid or no expiration, persistent cookie.
-  return Time();
-}
-
-bool CookieMonster::HasCookieableScheme(const GURL& url) {
-  // Make sure the request is on a cookie-able url scheme.
-  for (size_t i = 0; i < cookieable_schemes_.size(); ++i) {
-    // We matched a scheme.
-    if (url.SchemeIs(cookieable_schemes_[i].c_str())) {
-      // We've matched a supported scheme.
-      return true;
-    }
-  }
-
-  // The scheme didn't match any in our whitelist.
-  COOKIE_DLOG(WARNING) << "Unsupported cookie scheme: " << url.scheme();
-  return false;
-}
-
-void CookieMonster::SetCookieableSchemes(
-    const char* schemes[], size_t num_schemes) {
-  cookieable_schemes_.clear();
-  cookieable_schemes_.insert(cookieable_schemes_.end(),
-                             schemes, schemes + num_schemes);
-}
-
-bool CookieMonster::SetCookieWithCreationTimeAndOptions(
-    const GURL& url,
-    const std::string& cookie_line,
-    const Time& creation_time_or_null,
-    const CookieOptions& options) {
-  if (!HasCookieableScheme(url)) {
-    return false;
-  }
-
-  AutoLock autolock(lock_);
   InitIfNecessary();
 
-  COOKIE_DLOG(INFO) << "SetCookie() line: " << cookie_line;
-
-  Time creation_time = creation_time_or_null;
-  if (creation_time.is_null()) {
-    creation_time = CurrentTime();
-    last_time_seen_ = creation_time;
-  }
-
-  // Parse the cookie.
-  ParsedCookie pc(cookie_line);
-
-  if (!pc.IsValid()) {
-    COOKIE_DLOG(WARNING) << "Couldn't parse cookie";
-    return false;
-  }
-
-  if (options.exclude_httponly() && pc.IsHttpOnly()) {
-    COOKIE_DLOG(INFO) << "SetCookie() not setting httponly cookie";
-    return false;
-  }
-
-  std::string cookie_domain;
-  if (!GetCookieDomainKey(url, pc, &cookie_domain)) {
-    return false;
-  }
-
-  std::string cookie_path = CanonPath(url, pc);
+  Time creation_time = CurrentTime();
+  last_time_seen_ = creation_time;
 
   scoped_ptr<CanonicalCookie> cc;
-  Time cookie_expires = CanonExpiration(pc, creation_time);
+  cc.reset(CanonicalCookie::Create(
+      url, name, value, domain, path,
+      creation_time, expiration_time,
+      secure, http_only));
 
-  cc.reset(new CanonicalCookie(pc.Name(), pc.Value(), cookie_path,
-                               pc.IsSecure(), pc.IsHttpOnly(),
-                               creation_time, creation_time,
-                               !cookie_expires.is_null(), cookie_expires));
-
-  if (!cc.get()) {
-    COOKIE_DLOG(WARNING) << "Failed to allocate CanonicalCookie";
+  if (!cc.get())
     return false;
-  }
 
-  if (DeleteAnyEquivalentCookie(cookie_domain,
-                                *cc,
-                                options.exclude_httponly())) {
-    COOKIE_DLOG(INFO) << "SetCookie() not clobbering httponly cookie";
-    return false;
-  }
-
-  COOKIE_DLOG(INFO) << "SetCookie() cc: " << cc->DebugString();
-
-  // Realize that we might be setting an expired cookie, and the only point
-  // was to delete the cookie which we've already done.
-  if (!cc->IsExpired(creation_time))
-    InternalInsertCookie(cookie_domain, cc.release(), true);
-
-  // We assume that hopefully setting a cookie will be less common than
-  // querying a cookie.  Since setting a cookie can put us over our limits,
-  // make sure that we garbage collect...  We can also make the assumption that
-  // if a cookie was set, in the common case it will be used soon after,
-  // and we will purge the expired cookies in GetCookies().
-  GarbageCollect(creation_time, cookie_domain);
-
-  return true;
+  CookieOptions options;
+  options.set_include_httponly();
+  return SetCanonicalCookie(&cc, creation_time, options);
 }
 
-void CookieMonster::InternalInsertCookie(const std::string& key,
-                                         CanonicalCookie* cc,
-                                         bool sync_to_store) {
-  if (cc->IsPersistent() && store_ && sync_to_store)
-    store_->AddCookie(key, *cc);
-  cookies_.insert(CookieMap::value_type(key, cc));
+
+CookieList CookieMonster::GetAllCookies() {
+  base::AutoLock autolock(lock_);
+  InitIfNecessary();
+
+  // This function is being called to scrape the cookie list for management UI
+  // or similar.  We shouldn't show expired cookies in this list since it will
+  // just be confusing to users, and this function is called rarely enough (and
+  // is already slow enough) that it's OK to take the time to garbage collect
+  // the expired cookies now.
+  //
+  // Note that this does not prune cookies to be below our limits (if we've
+  // exceeded them) the way that calling GarbageCollect() would.
+  GarbageCollectExpired(Time::Now(),
+                        CookieMapItPair(cookies_.begin(), cookies_.end()),
+                        NULL);
+
+  // Copy the CanonicalCookie pointers from the map so that we can use the same
+  // sorter as elsewhere, then copy the result out.
+  std::vector<CanonicalCookie*> cookie_ptrs;
+  cookie_ptrs.reserve(cookies_.size());
+  for (CookieMap::iterator it = cookies_.begin(); it != cookies_.end(); ++it)
+    cookie_ptrs.push_back(it->second);
+  std::sort(cookie_ptrs.begin(), cookie_ptrs.end(), CookieSorter);
+
+  CookieList cookie_list;
+  cookie_list.reserve(cookie_ptrs.size());
+  for (std::vector<CanonicalCookie*>::const_iterator it = cookie_ptrs.begin();
+       it != cookie_ptrs.end(); ++it)
+    cookie_list.push_back(**it);
+
+  return cookie_list;
 }
 
-void CookieMonster::InternalUpdateCookieAccessTime(CanonicalCookie* cc) {
-  // Based off the Mozilla code.  When a cookie has been accessed recently,
-  // don't bother updating its access time again.  This reduces the number of
-  // updates we do during pageload, which in turn reduces the chance our storage
-  // backend will hit its batch thresholds and be forced to update.
-  const Time current = Time::Now();
-  if ((current - cc->LastAccessDate()) < last_access_threshold_)
-    return;
+CookieList CookieMonster::GetAllCookiesForURLWithOptions(
+    const GURL& url,
+    const CookieOptions& options) {
+  base::AutoLock autolock(lock_);
+  InitIfNecessary();
 
-  cc->SetLastAccessDate(current);
-  if (cc->IsPersistent() && store_)
-    store_->UpdateCookieAccessTime(*cc);
+  std::vector<CanonicalCookie*> cookie_ptrs;
+  FindCookiesForHostAndDomain(url, options, false, &cookie_ptrs);
+  std::sort(cookie_ptrs.begin(), cookie_ptrs.end(), CookieSorter);
+
+  CookieList cookies;
+  for (std::vector<CanonicalCookie*>::const_iterator it = cookie_ptrs.begin();
+       it != cookie_ptrs.end(); it++)
+    cookies.push_back(**it);
+
+  return cookies;
 }
 
-void CookieMonster::InternalDeleteCookie(CookieMap::iterator it,
-                                         bool sync_to_store) {
-  CanonicalCookie* cc = it->second;
-  COOKIE_DLOG(INFO) << "InternalDeleteCookie() cc: " << cc->DebugString();
-  if (cc->IsPersistent() && store_ && sync_to_store)
-    store_->DeleteCookie(*cc);
-  cookies_.erase(it);
-  delete cc;
-}
+CookieList CookieMonster::GetAllCookiesForURL(const GURL& url) {
+  CookieOptions options;
+  options.set_include_httponly();
 
-bool CookieMonster::DeleteAnyEquivalentCookie(const std::string& key,
-                                              const CanonicalCookie& ecc,
-                                              bool skip_httponly) {
-  bool found_equivalent_cookie = false;
-  bool skipped_httponly = false;
-  for (CookieMapItPair its = cookies_.equal_range(key);
-       its.first != its.second; ) {
-    CookieMap::iterator curit = its.first;
-    CanonicalCookie* cc = curit->second;
-    ++its.first;
-
-    if (ecc.IsEquivalent(*cc)) {
-      // We should never have more than one equivalent cookie, since they should
-      // overwrite each other.
-      DCHECK(!found_equivalent_cookie) <<
-          "Duplicate equivalent cookies found, cookie store is corrupted.";
-      if (skip_httponly && cc->IsHttpOnly()) {
-        skipped_httponly = true;
-      } else {
-        InternalDeleteCookie(curit, true);
-      }
-      found_equivalent_cookie = true;
-#ifdef NDEBUG
-      // Speed optimization: No point looping through the rest of the cookies
-      // since we're only doing it as a consistency check.
-      break;
-#endif
-    }
-  }
-  return skipped_httponly;
-}
-
-int CookieMonster::GarbageCollect(const Time& current,
-                                  const std::string& key) {
-  int num_deleted = 0;
-
-  // Collect garbage for this key.
-  if (cookies_.count(key) > kNumCookiesPerHost) {
-    COOKIE_DLOG(INFO) << "GarbageCollect() key: " << key;
-    num_deleted += GarbageCollectRange(current, cookies_.equal_range(key),
-        kNumCookiesPerHost, kNumCookiesPerHostPurge);
-  }
-
-  // Collect garbage for everything.
-  if (cookies_.size() > kNumCookiesTotal) {
-    COOKIE_DLOG(INFO) << "GarbageCollect() everything";
-    num_deleted += GarbageCollectRange(current,
-        CookieMapItPair(cookies_.begin(), cookies_.end()), kNumCookiesTotal,
-        kNumCookiesTotalPurge);
-  }
-
-  return num_deleted;
-}
-
-static bool LRUCookieSorter(const CookieMonster::CookieMap::iterator& it1,
-                            const CookieMonster::CookieMap::iterator& it2) {
-  // Cookies accessed less recently should be deleted first.
-  if (it1->second->LastAccessDate() != it2->second->LastAccessDate())
-    return it1->second->LastAccessDate() < it2->second->LastAccessDate();
-
-  // In rare cases we might have two cookies with identical last access times.
-  // To preserve the stability of the sort, in these cases prefer to delete
-  // older cookies over newer ones.  CreationDate() is guaranteed to be unique.
-  return it1->second->CreationDate() < it2->second->CreationDate();
-}
-
-int CookieMonster::GarbageCollectRange(const Time& current,
-                                       const CookieMapItPair& itpair,
-                                       size_t num_max,
-                                       size_t num_purge) {
-  // First, delete anything that's expired.
-  std::vector<CookieMap::iterator> cookie_its;
-  int num_deleted = GarbageCollectExpired(current, itpair, &cookie_its);
-
-  // If the range still has too many cookies, delete the least recently used.
-  if (cookie_its.size() > num_max) {
-    COOKIE_DLOG(INFO) << "GarbageCollectRange() Deep Garbage Collect.";
-    // Purge down to (|num_max| - |num_purge|) total cookies.
-    DCHECK(num_purge <= num_max);
-    num_purge += cookie_its.size() - num_max;
-
-    std::partial_sort(cookie_its.begin(), cookie_its.begin() + num_purge,
-                      cookie_its.end(), LRUCookieSorter);
-    for (size_t i = 0; i < num_purge; ++i)
-      InternalDeleteCookie(cookie_its[i], true);
-
-    num_deleted += num_purge;
-  }
-
-  return num_deleted;
-}
-
-int CookieMonster::GarbageCollectExpired(
-    const Time& current,
-    const CookieMapItPair& itpair,
-    std::vector<CookieMap::iterator>* cookie_its) {
-  int num_deleted = 0;
-  for (CookieMap::iterator it = itpair.first, end = itpair.second; it != end;) {
-    CookieMap::iterator curit = it;
-    ++it;
-
-    if (curit->second->IsExpired(current)) {
-      InternalDeleteCookie(curit, true);
-      ++num_deleted;
-    } else if (cookie_its) {
-      cookie_its->push_back(curit);
-    }
-  }
-
-  return num_deleted;
+  return GetAllCookiesForURLWithOptions(url, options);
 }
 
 int CookieMonster::DeleteAll(bool sync_to_store) {
-  AutoLock autolock(lock_);
-  InitIfNecessary();
+  base::AutoLock autolock(lock_);
+  if (sync_to_store)
+    InitIfNecessary();
 
   int num_deleted = 0;
   for (CookieMap::iterator it = cookies_.begin(); it != cookies_.end();) {
     CookieMap::iterator curit = it;
     ++it;
-    InternalDeleteCookie(curit, sync_to_store);
+    InternalDeleteCookie(curit, sync_to_store,
+                         sync_to_store ? DELETE_COOKIE_EXPLICIT :
+                             DELETE_COOKIE_DONT_RECORD /* Destruction. */);
     ++num_deleted;
   }
 
@@ -643,7 +643,7 @@ int CookieMonster::DeleteAll(bool sync_to_store) {
 int CookieMonster::DeleteAllCreatedBetween(const Time& delete_begin,
                                            const Time& delete_end,
                                            bool sync_to_store) {
-  AutoLock autolock(lock_);
+  base::AutoLock autolock(lock_);
   InitIfNecessary();
 
   int num_deleted = 0;
@@ -654,7 +654,7 @@ int CookieMonster::DeleteAllCreatedBetween(const Time& delete_begin,
 
     if (cc->CreationDate() >= delete_begin &&
         (delete_end.is_null() || cc->CreationDate() < delete_end)) {
-      InternalDeleteCookie(curit, sync_to_store);
+      InternalDeleteCookie(curit, sync_to_store, DELETE_COOKIE_EXPLICIT);
       ++num_deleted;
     }
   }
@@ -667,60 +667,119 @@ int CookieMonster::DeleteAllCreatedAfter(const Time& delete_begin,
   return DeleteAllCreatedBetween(delete_begin, Time(), sync_to_store);
 }
 
-bool CookieMonster::DeleteCookie(const std::string& domain,
-                                 const CanonicalCookie& cookie,
-                                 bool sync_to_store) {
-  AutoLock autolock(lock_);
+int CookieMonster::DeleteAllForHost(const GURL& url) {
+  base::AutoLock autolock(lock_);
   InitIfNecessary();
 
-  for (CookieMapItPair its = cookies_.equal_range(domain);
+  if (!HasCookieableScheme(url))
+    return 0;
+
+  const std::string scheme(url.scheme());
+  const std::string host(url.host());
+
+  // We store host cookies in the store by their canonical host name;
+  // domain cookies are stored with a leading ".".  So this is a pretty
+  // simple lookup and per-cookie delete.
+  int num_deleted = 0;
+  for (CookieMapItPair its = cookies_.equal_range(GetKey(host));
+       its.first != its.second;) {
+    CookieMap::iterator curit = its.first;
+    ++its.first;
+
+    const CanonicalCookie* const cc = curit->second;
+
+    // Delete only on a match as a host cookie.
+    if (cc->IsHostCookie() && cc->IsDomainMatch(scheme, host)) {
+      num_deleted++;
+
+      InternalDeleteCookie(curit, true, DELETE_COOKIE_EXPLICIT);
+    }
+  }
+  return num_deleted;
+}
+
+bool CookieMonster::DeleteCanonicalCookie(const CanonicalCookie& cookie) {
+  base::AutoLock autolock(lock_);
+  InitIfNecessary();
+
+  for (CookieMapItPair its = cookies_.equal_range(GetKey(cookie.Domain()));
        its.first != its.second; ++its.first) {
     // The creation date acts as our unique index...
     if (its.first->second->CreationDate() == cookie.CreationDate()) {
-      InternalDeleteCookie(its.first, sync_to_store);
+      InternalDeleteCookie(its.first, true, DELETE_COOKIE_EXPLICIT);
       return true;
     }
   }
   return false;
 }
 
-// Mozilla sorts on the path length (longest first), and then it
-// sorts by creation time (oldest first).
-// The RFC says the sort order for the domain attribute is undefined.
-static bool CookieSorter(CookieMonster::CanonicalCookie* cc1,
-                         CookieMonster::CanonicalCookie* cc2) {
-  if (cc1->Path().length() == cc2->Path().length())
-    return cc1->CreationDate() < cc2->CreationDate();
-  return cc1->Path().length() > cc2->Path().length();
+void CookieMonster::SetCookieableSchemes(
+    const char* schemes[], size_t num_schemes) {
+  base::AutoLock autolock(lock_);
+
+  // Cookieable Schemes must be set before first use of function.
+  DCHECK(!initialized_);
+
+  cookieable_schemes_.clear();
+  cookieable_schemes_.insert(cookieable_schemes_.end(),
+                             schemes, schemes + num_schemes);
+}
+
+void CookieMonster::SetExpiryAndKeyScheme(ExpiryAndKeyScheme key_scheme) {
+  DCHECK(!initialized_);
+  expiry_and_key_scheme_ = key_scheme;
+}
+
+void CookieMonster::SetKeepExpiredCookies() {
+  keep_expired_cookies_ = true;
+}
+
+void CookieMonster::SetClearPersistentStoreOnExit(bool clear_local_store) {
+  if (store_)
+    store_->SetClearLocalStateOnExit(clear_local_store);
+}
+
+// static
+void CookieMonster::EnableFileScheme() {
+  enable_file_scheme_ = true;
+}
+
+void CookieMonster::FlushStore(Task* completion_task) {
+  base::AutoLock autolock(lock_);
+  if (initialized_ && store_)
+    store_->Flush(completion_task);
+  else if (completion_task)
+    MessageLoop::current()->PostTask(FROM_HERE, completion_task);
 }
 
 bool CookieMonster::SetCookieWithOptions(const GURL& url,
                                          const std::string& cookie_line,
                                          const CookieOptions& options) {
+  base::AutoLock autolock(lock_);
+
+  if (!HasCookieableScheme(url)) {
+    return false;
+  }
+
+  InitIfNecessary();
+
   return SetCookieWithCreationTimeAndOptions(url, cookie_line, Time(), options);
 }
 
-// Currently our cookie datastructure is based on Mozilla's approach.  We have a
-// hash keyed on the cookie's domain, and for any query we walk down the domain
-// components and probe for cookies until we reach the TLD, where we stop.
-// For example, a.b.blah.com, we would probe
-//   - a.b.blah.com
-//   - .a.b.blah.com (TODO should we check this first or second?)
-//   - .b.blah.com
-//   - .blah.com
-// There are some alternative datastructures we could try, like a
-// search/prefix trie, where we reverse the hostname and query for all
-// keys that are a prefix of our hostname.  I think the hash probing
-// should be fast and simple enough for now.
 std::string CookieMonster::GetCookiesWithOptions(const GURL& url,
                                                  const CookieOptions& options) {
+  base::AutoLock autolock(lock_);
+  InitIfNecessary();
+
   if (!HasCookieableScheme(url)) {
     return std::string();
   }
 
+  TimeTicks start_time(TimeTicks::Now());
+
   // Get the cookies for this host and its domain(s).
   std::vector<CanonicalCookie*> cookies;
-  FindCookiesForHostAndDomain(url, options, &cookies);
+  FindCookiesForHostAndDomain(url, options, true, &cookies);
   std::sort(cookies.begin(), cookies.end(), CookieSorter);
 
   std::string cookie_line;
@@ -736,13 +795,18 @@ std::string CookieMonster::GetCookiesWithOptions(const GURL& url,
     cookie_line += (*it)->Value();
   }
 
-  COOKIE_DLOG(INFO) << "GetCookies() result: " << cookie_line;
+  histogram_time_get_->AddTime(TimeTicks::Now() - start_time);
+
+  VLOG(kVlogGetCookies) << "GetCookies() result: " << cookie_line;
 
   return cookie_line;
 }
 
 void CookieMonster::DeleteCookie(const GURL& url,
                                  const std::string& cookie_name) {
+  base::AutoLock autolock(lock_);
+  InitIfNecessary();
+
   if (!HasCookieableScheme(url))
     return;
 
@@ -750,7 +814,7 @@ void CookieMonster::DeleteCookie(const GURL& url,
   options.set_include_httponly();
   // Get the cookies for this host and its domain(s).
   std::vector<CanonicalCookie*> cookies;
-  FindCookiesForHostAndDomain(url, options, &cookies);
+  FindCookiesForHostAndDomain(url, options, true, &cookies);
   std::set<CanonicalCookie*> matching_cookies;
 
   for (std::vector<CanonicalCookie*>::const_iterator it = cookies.begin();
@@ -765,100 +829,256 @@ void CookieMonster::DeleteCookie(const GURL& url,
   for (CookieMap::iterator it = cookies_.begin(); it != cookies_.end();) {
     CookieMap::iterator curit = it;
     ++it;
-    if (matching_cookies.find(curit->second) != matching_cookies.end())
-      InternalDeleteCookie(curit, true);
+    if (matching_cookies.find(curit->second) != matching_cookies.end()) {
+      InternalDeleteCookie(curit, true, DELETE_COOKIE_EXPLICIT);
+    }
   }
 }
 
-CookieMonster::CookieList CookieMonster::GetAllCookies() {
-  AutoLock autolock(lock_);
-  InitIfNecessary();
+CookieMonster* CookieMonster::GetCookieMonster() {
+  return this;
+}
 
-  // This function is being called to scrape the cookie list for management UI
-  // or similar.  We shouldn't show expired cookies in this list since it will
-  // just be confusing to users, and this function is called rarely enough (and
-  // is already slow enough) that it's OK to take the time to garbage collect
-  // the expired cookies now.
+CookieMonster::~CookieMonster() {
+  DeleteAll(false);
+}
+
+bool CookieMonster::SetCookieWithCreationTime(const GURL& url,
+                                              const std::string& cookie_line,
+                                              const base::Time& creation_time) {
+  base::AutoLock autolock(lock_);
+
+  if (!HasCookieableScheme(url)) {
+    return false;
+  }
+
+  InitIfNecessary();
+  return SetCookieWithCreationTimeAndOptions(url, cookie_line, creation_time,
+                                             CookieOptions());
+}
+
+void CookieMonster::InitStore() {
+  DCHECK(store_) << "Store must exist to initialize";
+
+  TimeTicks beginning_time(TimeTicks::Now());
+
+  // Initialize the store and sync in any saved persistent cookies.  We don't
+  // care if it's expired, insert it so it can be garbage collected, removed,
+  // and sync'd.
+  std::vector<CanonicalCookie*> cookies;
+  // Reserve space for the maximum amount of cookies a database should have.
+  // This prevents multiple vector growth / copies as we append cookies.
+  cookies.reserve(kMaxCookies);
+  store_->Load(&cookies);
+
+  // Avoid ever letting cookies with duplicate creation times into the store;
+  // that way we don't have to worry about what sections of code are safe
+  // to call while it's in that state.
+  std::set<int64> creation_times;
+
+  // Presumably later than any access time in the store.
+  Time earliest_access_time;
+
+  for (std::vector<CanonicalCookie*>::const_iterator it = cookies.begin();
+       it != cookies.end(); ++it) {
+    int64 cookie_creation_time = (*it)->CreationDate().ToInternalValue();
+
+    if (creation_times.insert(cookie_creation_time).second) {
+      InternalInsertCookie(GetKey((*it)->Domain()), *it, false);
+      const Time cookie_access_time((*it)->LastAccessDate());
+      if (earliest_access_time.is_null() ||
+          cookie_access_time < earliest_access_time)
+        earliest_access_time = cookie_access_time;
+    } else {
+      LOG(ERROR) << base::StringPrintf("Found cookies with duplicate creation "
+                                       "times in backing store: "
+                                       "{name='%s', domain='%s', path='%s'}",
+                                       (*it)->Name().c_str(),
+                                       (*it)->Domain().c_str(),
+                                       (*it)->Path().c_str());
+      // We've been given ownership of the cookie and are throwing it
+      // away; reclaim the space.
+      delete (*it);
+    }
+  }
+  earliest_access_time_= earliest_access_time;
+
+  // After importing cookies from the PersistentCookieStore, verify that
+  // none of our other constraints are violated.
   //
-  // Note that this does not prune cookies to be below our limits (if we've
-  // exceeded them) the way that calling GarbageCollect() would.
-  GarbageCollectExpired(Time::Now(),
-                        CookieMapItPair(cookies_.begin(), cookies_.end()),
-                        NULL);
+  // In particular, the backing store might have given us duplicate cookies.
+  EnsureCookiesMapIsValid();
 
-  CookieList cookie_list;
-  for (CookieMap::iterator it = cookies_.begin(); it != cookies_.end(); ++it)
-    cookie_list.push_back(CookieListPair(it->first, *it->second));
-
-  return cookie_list;
+  histogram_time_load_->AddTime(TimeTicks::Now() - beginning_time);
 }
 
-CookieMonster::CookieList CookieMonster::GetAllCookiesForURL(const GURL& url) {
-  AutoLock autolock(lock_);
-  InitIfNecessary();
+void CookieMonster::EnsureCookiesMapIsValid() {
+  lock_.AssertAcquired();
 
-  // Do not return removed cookies.
-  GarbageCollectExpired(Time::Now(),
-                        CookieMapItPair(cookies_.begin(), cookies_.end()),
-                        NULL);
+  int num_duplicates_trimmed = 0;
 
-  CookieList cookie_list;
-  if (!HasCookieableScheme(url))
-    return cookie_list;
+  // Iterate through all the of the cookies, grouped by host.
+  CookieMap::iterator prev_range_end = cookies_.begin();
+  while (prev_range_end != cookies_.end()) {
+    CookieMap::iterator cur_range_begin = prev_range_end;
+    const std::string key = cur_range_begin->first;  // Keep a copy.
+    CookieMap::iterator cur_range_end = cookies_.upper_bound(key);
+    prev_range_end = cur_range_end;
 
-  bool secure = url.SchemeIsSecure();
-
-  // Query for the full host, For example: 'a.c.blah.com'.
-  std::string key(url.host());
-  FindRawCookies(key, secure, &cookie_list);
-
-  // See if we can search for domain cookies, i.e. if the host has a TLD + 1.
-  const std::string domain(GetEffectiveDomain(url.scheme(), key));
-  if (domain.empty())
-    return cookie_list;
-
-  // Use same logic as in FindCookiesForHostAndDomain.
-  DCHECK_LE(domain.length(), key.length());
-  DCHECK_EQ(0, key.compare(key.length() - domain.length(), domain.length(),
-                           domain));
-  for (key = "." + key; key.length() > domain.length(); ) {
-    FindRawCookies(key, secure, &cookie_list);
-    const size_t next_dot = key.find('.', 1);  // Skip over leading dot.
-    key.erase(0, next_dot);
+    // Ensure no equivalent cookies for this host.
+    num_duplicates_trimmed +=
+        TrimDuplicateCookiesForKey(key, cur_range_begin, cur_range_end);
   }
-  return cookie_list;
+
+  // Record how many duplicates were found in the database.
+  // See InitializeHistograms() for details.
+  histogram_cookie_deletion_cause_->Add(num_duplicates_trimmed);
 }
+
+int CookieMonster::TrimDuplicateCookiesForKey(
+    const std::string& key,
+    CookieMap::iterator begin,
+    CookieMap::iterator end) {
+  lock_.AssertAcquired();
+
+  // Set of cookies ordered by creation time.
+  typedef std::set<CookieMap::iterator, OrderByCreationTimeDesc> CookieSet;
+
+  // Helper map we populate to find the duplicates.
+  typedef std::map<CookieSignature, CookieSet> EquivalenceMap;
+  EquivalenceMap equivalent_cookies;
+
+  // The number of duplicate cookies that have been found.
+  int num_duplicates = 0;
+
+  // Iterate through all of the cookies in our range, and insert them into
+  // the equivalence map.
+  for (CookieMap::iterator it = begin; it != end; ++it) {
+    DCHECK_EQ(key, it->first);
+    CanonicalCookie* cookie = it->second;
+
+    CookieSignature signature(cookie->Name(), cookie->Domain(),
+                              cookie->Path());
+    CookieSet& set = equivalent_cookies[signature];
+
+    // We found a duplicate!
+    if (!set.empty())
+      num_duplicates++;
+
+    // We save the iterator into |cookies_| rather than the actual cookie
+    // pointer, since we may need to delete it later.
+    bool insert_success = set.insert(it).second;
+    DCHECK(insert_success) <<
+        "Duplicate creation times found in duplicate cookie name scan.";
+  }
+
+  // If there were no duplicates, we are done!
+  if (num_duplicates == 0)
+    return 0;
+
+  // Make sure we find everything below that we did above.
+  int num_duplicates_found = 0;
+
+  // Otherwise, delete all the duplicate cookies, both from our in-memory store
+  // and from the backing store.
+  for (EquivalenceMap::iterator it = equivalent_cookies.begin();
+       it != equivalent_cookies.end();
+       ++it) {
+    const CookieSignature& signature = it->first;
+    CookieSet& dupes = it->second;
+
+    if (dupes.size() <= 1)
+      continue;  // This cookiename/path has no duplicates.
+    num_duplicates_found += dupes.size() - 1;
+
+    // Since |dups| is sorted by creation time (descending), the first cookie
+    // is the most recent one, so we will keep it. The rest are duplicates.
+    dupes.erase(dupes.begin());
+
+    LOG(ERROR) << base::StringPrintf(
+        "Found %d duplicate cookies for host='%s', "
+        "with {name='%s', domain='%s', path='%s'}",
+        static_cast<int>(dupes.size()),
+        key.c_str(),
+        signature.name.c_str(),
+        signature.domain.c_str(),
+        signature.path.c_str());
+
+    // Remove all the cookies identified by |dupes|. It is valid to delete our
+    // list of iterators one at a time, since |cookies_| is a multimap (they
+    // don't invalidate existing iterators following deletion).
+    for (CookieSet::iterator dupes_it = dupes.begin();
+         dupes_it != dupes.end();
+         ++dupes_it) {
+      InternalDeleteCookie(*dupes_it, true /*sync_to_store*/,
+                           DELETE_COOKIE_DUPLICATE_IN_BACKING_STORE);
+    }
+  }
+  DCHECK_EQ(num_duplicates, num_duplicates_found);
+
+  return num_duplicates;
+}
+
+// Note: file must be the last scheme.
+const char* CookieMonster::kDefaultCookieableSchemes[] =
+    { "http", "https", "file" };
+const int CookieMonster::kDefaultCookieableSchemesCount =
+    arraysize(CookieMonster::kDefaultCookieableSchemes);
+
+void CookieMonster::SetDefaultCookieableSchemes() {
+  int num_schemes = enable_file_scheme_ ?
+      kDefaultCookieableSchemesCount : kDefaultCookieableSchemesCount - 1;
+  SetCookieableSchemes(kDefaultCookieableSchemes, num_schemes);
+}
+
 
 void CookieMonster::FindCookiesForHostAndDomain(
     const GURL& url,
     const CookieOptions& options,
+    bool update_access_time,
     std::vector<CanonicalCookie*>* cookies) {
-  AutoLock autolock(lock_);
-  InitIfNecessary();
+  lock_.AssertAcquired();
 
   const Time current_time(CurrentTime());
 
-  // Query for the full host, For example: 'a.c.blah.com'.
-  std::string key(url.host());
-  FindCookiesForKey(key, url, options, current_time, cookies);
+  // Probe to save statistics relatively frequently.  We do it here rather
+  // than in the set path as many websites won't set cookies, and we
+  // want to collect statistics whenever the browser's being used.
+  RecordPeriodicStats(current_time);
 
-  // See if we can search for domain cookies, i.e. if the host has a TLD + 1.
-  const std::string domain(GetEffectiveDomain(url.scheme(), key));
-  if (domain.empty())
-    return;
-  DCHECK_LE(domain.length(), key.length());
-  DCHECK_EQ(0, key.compare(key.length() - domain.length(), domain.length(),
-                           domain));
+  if (expiry_and_key_scheme_ == EKS_DISCARD_RECENT_AND_PURGE_DOMAIN) {
+    // Can just dispatch to FindCookiesForKey
+    const std::string key(GetKey(url.host()));
+    FindCookiesForKey(key, url, options, current_time,
+                      update_access_time, cookies);
+  } else {
+    // Need to probe for all domains that might have relevant
+    // cookies for us.
 
-  // Walk through the string and query at the dot points (GURL should have
-  // canonicalized the dots, so this should be safe).  Stop once we reach the
-  // domain + registry; we can't write cookies past this point, and with some
-  // registrars other domains can, in which case we don't want to read their
-  // cookies.
-  for (key = "." + key; key.length() > domain.length(); ) {
-    FindCookiesForKey(key, url, options, current_time, cookies);
-    const size_t next_dot = key.find('.', 1);  // Skip over leading dot.
-    key.erase(0, next_dot);
+    // Query for the full host, For example: 'a.c.blah.com'.
+    std::string key(GetKey(url.host()));
+    FindCookiesForKey(key, url, options, current_time, update_access_time,
+                      cookies);
+
+    // See if we can search for domain cookies, i.e. if the host has a TLD + 1.
+    const std::string domain(GetEffectiveDomain(url.scheme(), key));
+    if (domain.empty())
+      return;
+    DCHECK_LE(domain.length(), key.length());
+    DCHECK_EQ(0, key.compare(key.length() - domain.length(), domain.length(),
+                             domain));
+
+    // Walk through the string and query at the dot points (GURL should have
+    // canonicalized the dots, so this should be safe).  Stop once we reach the
+    // domain + registry; we can't write cookies past this point, and with some
+    // registrars other domains can, in which case we don't want to read their
+    // cookies.
+    for (key = "." + key; key.length() > domain.length(); ) {
+      FindCookiesForKey(key, url, options, current_time, update_access_time,
+                        cookies);
+      const size_t next_dot = key.find('.', 1);  // Skip over leading dot.
+      key.erase(0, next_dot);
+    }
   }
 }
 
@@ -867,7 +1087,12 @@ void CookieMonster::FindCookiesForKey(
     const GURL& url,
     const CookieOptions& options,
     const Time& current,
+    bool update_access_time,
     std::vector<CanonicalCookie*>* cookies) {
+  lock_.AssertAcquired();
+
+  const std::string scheme(url.scheme());
+  const std::string host(url.host());
   bool secure = url.SchemeIsSecure();
 
   for (CookieMapItPair its = cookies_.equal_range(key);
@@ -877,8 +1102,8 @@ void CookieMonster::FindCookiesForKey(
     ++its.first;
 
     // If the cookie is expired, delete it.
-    if (cc->IsExpired(current)) {
-      InternalDeleteCookie(curit, true);
+    if (cc->IsExpired(current) && !keep_expired_cookies_) {
+      InternalDeleteCookie(curit, true, DELETE_COOKIE_EXPIRED);
       continue;
     }
 
@@ -890,27 +1115,520 @@ void CookieMonster::FindCookiesForKey(
     if (!secure && cc->IsSecure())
       continue;
 
+    // Filter out cookies that don't apply to this domain.
+    if (expiry_and_key_scheme_ == EKS_KEEP_RECENT_AND_PURGE_ETLDP1
+        && !cc->IsDomainMatch(scheme, host))
+      continue;
+
     if (!cc->IsOnPath(url.path()))
       continue;
 
-    // Add this cookie to the set of matching cookies.  Since we're reading the
-    // cookie, update its last access time.
-    InternalUpdateCookieAccessTime(cc);
+    // Add this cookie to the set of matching cookies.  Update the access
+    // time if we've been requested to do so.
+    if (update_access_time) {
+      InternalUpdateCookieAccessTime(cc, current);
+    }
     cookies->push_back(cc);
   }
 }
 
-void CookieMonster::FindRawCookies(const std::string& key,
-                                   bool include_secure,
-                                   CookieList* list) {
+bool CookieMonster::DeleteAnyEquivalentCookie(const std::string& key,
+                                              const CanonicalCookie& ecc,
+                                              bool skip_httponly,
+                                              bool already_expired) {
+  lock_.AssertAcquired();
+
+  bool found_equivalent_cookie = false;
+  bool skipped_httponly = false;
   for (CookieMapItPair its = cookies_.equal_range(key);
-       its.first != its.second; ++its.first) {
-    CanonicalCookie* cc = its.first->second;
-    if (include_secure || !cc->IsSecure())
-      list->push_back(CookieListPair(key, *cc));
+       its.first != its.second; ) {
+    CookieMap::iterator curit = its.first;
+    CanonicalCookie* cc = curit->second;
+    ++its.first;
+
+    if (ecc.IsEquivalent(*cc)) {
+      // We should never have more than one equivalent cookie, since they should
+      // overwrite each other.
+      CHECK(!found_equivalent_cookie) <<
+          "Duplicate equivalent cookies found, cookie store is corrupted.";
+      if (skip_httponly && cc->IsHttpOnly()) {
+        skipped_httponly = true;
+      } else {
+        InternalDeleteCookie(curit, true, already_expired ?
+            DELETE_COOKIE_EXPIRED_OVERWRITE : DELETE_COOKIE_OVERWRITE);
+      }
+      found_equivalent_cookie = true;
+    }
+  }
+  return skipped_httponly;
+}
+
+void CookieMonster::InternalInsertCookie(const std::string& key,
+                                         CanonicalCookie* cc,
+                                         bool sync_to_store) {
+  lock_.AssertAcquired();
+
+  if (cc->IsPersistent() && store_ && sync_to_store)
+    store_->AddCookie(*cc);
+  cookies_.insert(CookieMap::value_type(key, cc));
+  if (delegate_.get()) {
+    delegate_->OnCookieChanged(
+        *cc, false, CookieMonster::Delegate::CHANGE_COOKIE_EXPLICIT);
   }
 }
 
+bool CookieMonster::SetCookieWithCreationTimeAndOptions(
+    const GURL& url,
+    const std::string& cookie_line,
+    const Time& creation_time_or_null,
+    const CookieOptions& options) {
+  lock_.AssertAcquired();
+
+  VLOG(kVlogSetCookies) << "SetCookie() line: " << cookie_line;
+
+  Time creation_time = creation_time_or_null;
+  if (creation_time.is_null()) {
+    creation_time = CurrentTime();
+    last_time_seen_ = creation_time;
+  }
+
+  // Parse the cookie.
+  ParsedCookie pc(cookie_line);
+
+  if (!pc.IsValid()) {
+    VLOG(kVlogSetCookies) << "WARNING: Couldn't parse cookie";
+    return false;
+  }
+
+  if (options.exclude_httponly() && pc.IsHttpOnly()) {
+    VLOG(kVlogSetCookies) << "SetCookie() not setting httponly cookie";
+    return false;
+  }
+
+  std::string cookie_domain;
+  if (!GetCookieDomain(url, pc, &cookie_domain)) {
+    return false;
+  }
+
+  std::string cookie_path = CanonPath(url, pc);
+
+  scoped_ptr<CanonicalCookie> cc;
+  Time cookie_expires = CanonExpiration(pc, creation_time, options);
+
+  cc.reset(new CanonicalCookie(url, pc.Name(), pc.Value(), cookie_domain,
+                               cookie_path, creation_time, cookie_expires,
+                               creation_time, pc.IsSecure(), pc.IsHttpOnly(),
+                               !cookie_expires.is_null()));
+
+  if (!cc.get()) {
+    VLOG(kVlogSetCookies) << "WARNING: Failed to allocate CanonicalCookie";
+    return false;
+  }
+  return SetCanonicalCookie(&cc, creation_time, options);
+}
+
+bool CookieMonster::SetCanonicalCookie(scoped_ptr<CanonicalCookie>* cc,
+                                       const Time& creation_time,
+                                       const CookieOptions& options) {
+  const std::string key(GetKey((*cc)->Domain()));
+  bool already_expired = (*cc)->IsExpired(creation_time);
+  if (DeleteAnyEquivalentCookie(key, **cc, options.exclude_httponly(),
+                                already_expired)) {
+    VLOG(kVlogSetCookies) << "SetCookie() not clobbering httponly cookie";
+    return false;
+  }
+
+  VLOG(kVlogSetCookies) << "SetCookie() key: " << key << " cc: "
+                        << (*cc)->DebugString();
+
+  // Realize that we might be setting an expired cookie, and the only point
+  // was to delete the cookie which we've already done.
+  if (!already_expired || keep_expired_cookies_) {
+    // See InitializeHistograms() for details.
+    if ((*cc)->DoesExpire()) {
+      histogram_expiration_duration_minutes_->Add(
+          ((*cc)->ExpiryDate() - creation_time).InMinutes());
+    }
+
+    InternalInsertCookie(key, cc->release(), true);
+  }
+
+  // We assume that hopefully setting a cookie will be less common than
+  // querying a cookie.  Since setting a cookie can put us over our limits,
+  // make sure that we garbage collect...  We can also make the assumption that
+  // if a cookie was set, in the common case it will be used soon after,
+  // and we will purge the expired cookies in GetCookies().
+  GarbageCollect(creation_time, key);
+
+  return true;
+}
+
+void CookieMonster::InternalUpdateCookieAccessTime(CanonicalCookie* cc,
+                                                   const Time& current) {
+  lock_.AssertAcquired();
+
+  // Based off the Mozilla code.  When a cookie has been accessed recently,
+  // don't bother updating its access time again.  This reduces the number of
+  // updates we do during pageload, which in turn reduces the chance our storage
+  // backend will hit its batch thresholds and be forced to update.
+  if ((current - cc->LastAccessDate()) < last_access_threshold_)
+    return;
+
+  // See InitializeHistograms() for details.
+  histogram_between_access_interval_minutes_->Add(
+      (current - cc->LastAccessDate()).InMinutes());
+
+  cc->SetLastAccessDate(current);
+  if (cc->IsPersistent() && store_)
+    store_->UpdateCookieAccessTime(*cc);
+}
+
+void CookieMonster::InternalDeleteCookie(CookieMap::iterator it,
+                                         bool sync_to_store,
+                                         DeletionCause deletion_cause) {
+  lock_.AssertAcquired();
+
+  // Ideally, this would be asserted up where we define ChangeCauseMapping,
+  // but DeletionCause's visibility (or lack thereof) forces us to make
+  // this check here.
+  COMPILE_ASSERT(arraysize(ChangeCauseMapping) == DELETE_COOKIE_LAST_ENTRY + 1,
+                 ChangeCauseMapping_size_not_eq_DeletionCause_enum_size);
+
+  // See InitializeHistograms() for details.
+  if (deletion_cause != DELETE_COOKIE_DONT_RECORD)
+    histogram_cookie_deletion_cause_->Add(deletion_cause);
+
+  CanonicalCookie* cc = it->second;
+  VLOG(kVlogSetCookies) << "InternalDeleteCookie() cc: " << cc->DebugString();
+
+  if (cc->IsPersistent() && store_ && sync_to_store)
+    store_->DeleteCookie(*cc);
+  if (delegate_.get()) {
+    ChangeCausePair mapping = ChangeCauseMapping[deletion_cause];
+
+    if (mapping.notify)
+      delegate_->OnCookieChanged(*cc, true, mapping.cause);
+  }
+  cookies_.erase(it);
+  delete cc;
+}
+
+// Domain expiry behavior is unchanged by key/expiry scheme (the
+// meaning of the key is different, but that's not visible to this
+// routine).  Global garbage collection is dependent on key/expiry
+// scheme in that recently touched cookies are not saved if
+// expiry_and_key_scheme_ == EKS_DISCARD_RECENT_AND_PURGE_DOMAIN.
+int CookieMonster::GarbageCollect(const Time& current,
+                                  const std::string& key) {
+  lock_.AssertAcquired();
+
+  int num_deleted = 0;
+
+  // Collect garbage for this key.
+  if (cookies_.count(key) > kDomainMaxCookies) {
+    VLOG(kVlogGarbageCollection) << "GarbageCollect() key: " << key;
+
+    std::vector<CookieMap::iterator> cookie_its;
+    num_deleted += GarbageCollectExpired(
+        current, cookies_.equal_range(key), &cookie_its);
+    base::Time oldest_removed;
+    if (FindLeastRecentlyAccessed(kDomainMaxCookies, kDomainPurgeCookies,
+                                  &oldest_removed, &cookie_its)) {
+      // Delete in two passes so we can figure out what we're nuking
+      // that would be kept at the global level.
+      int num_subject_to_global_purge =
+          GarbageCollectDeleteList(
+              current,
+              Time::Now() - TimeDelta::FromDays(kSafeFromGlobalPurgeDays),
+              DELETE_COOKIE_EVICTED_DOMAIN_PRE_SAFE,
+              cookie_its);
+      num_deleted += num_subject_to_global_purge;
+      // Correct because FindLeastRecentlyAccessed returns a sorted list.
+      cookie_its.erase(cookie_its.begin(),
+                       cookie_its.begin() + num_subject_to_global_purge);
+      num_deleted +=
+          GarbageCollectDeleteList(
+              current,
+              Time(),
+              DELETE_COOKIE_EVICTED_DOMAIN_POST_SAFE,
+              cookie_its);
+    }
+  }
+
+  // Collect garbage for everything.  With firefox style we want to
+  // preserve cookies touched in kSafeFromGlobalPurgeDays, otherwise
+  // not.
+  if (cookies_.size() > kMaxCookies &&
+      (expiry_and_key_scheme_ == EKS_DISCARD_RECENT_AND_PURGE_DOMAIN ||
+       earliest_access_time_ <
+       Time::Now() - TimeDelta::FromDays(kSafeFromGlobalPurgeDays))) {
+    VLOG(kVlogGarbageCollection) << "GarbageCollect() everything";
+    std::vector<CookieMap::iterator> cookie_its;
+    base::Time oldest_left;
+    num_deleted += GarbageCollectExpired(
+        current, CookieMapItPair(cookies_.begin(), cookies_.end()),
+        &cookie_its);
+    if (FindLeastRecentlyAccessed(kMaxCookies, kPurgeCookies,
+                                  &oldest_left, &cookie_its)) {
+      Time oldest_safe_cookie(
+          expiry_and_key_scheme_ == EKS_KEEP_RECENT_AND_PURGE_ETLDP1 ?
+              (Time::Now() - TimeDelta::FromDays(kSafeFromGlobalPurgeDays)) :
+              Time());                  // Null time == ignore access time.
+      int num_evicted = GarbageCollectDeleteList(
+          current,
+          oldest_safe_cookie,
+          DELETE_COOKIE_EVICTED_GLOBAL,
+          cookie_its);
+
+      // If no cookies were preserved by the time limit, the global last
+      // access is set to the value returned from FindLeastRecentlyAccessed.
+      // If the time limit preserved some cookies, we use the last access of
+      // the oldest preserved cookie.
+      if (num_evicted == static_cast<int>(cookie_its.size())) {
+        earliest_access_time_ = oldest_left;
+      } else {
+        earliest_access_time_ =
+            (*(cookie_its.begin() + num_evicted))->second->LastAccessDate();
+      }
+      num_deleted += num_evicted;
+    }
+  }
+
+  return num_deleted;
+}
+
+int CookieMonster::GarbageCollectExpired(
+    const Time& current,
+    const CookieMapItPair& itpair,
+    std::vector<CookieMap::iterator>* cookie_its) {
+  if (keep_expired_cookies_)
+    return 0;
+
+  lock_.AssertAcquired();
+
+  int num_deleted = 0;
+  for (CookieMap::iterator it = itpair.first, end = itpair.second; it != end;) {
+    CookieMap::iterator curit = it;
+    ++it;
+
+    if (curit->second->IsExpired(current)) {
+      InternalDeleteCookie(curit, true, DELETE_COOKIE_EXPIRED);
+      ++num_deleted;
+    } else if (cookie_its) {
+      cookie_its->push_back(curit);
+    }
+  }
+
+  return num_deleted;
+}
+
+int CookieMonster::GarbageCollectDeleteList(
+    const Time& current,
+    const Time& keep_accessed_after,
+    DeletionCause cause,
+    std::vector<CookieMap::iterator>& cookie_its) {
+  int num_deleted = 0;
+  for (std::vector<CookieMap::iterator>::iterator it = cookie_its.begin();
+       it != cookie_its.end(); it++) {
+    if (keep_accessed_after.is_null() ||
+        (*it)->second->LastAccessDate() < keep_accessed_after) {
+      histogram_evicted_last_access_minutes_->Add(
+          (current - (*it)->second->LastAccessDate()).InMinutes());
+      InternalDeleteCookie((*it), true, cause);
+      num_deleted++;
+    }
+  }
+  return num_deleted;
+}
+
+// A wrapper around RegistryControlledDomainService::GetDomainAndRegistry
+// to make clear we're creating a key for our local map.  Here and
+// in FindCookiesForHostAndDomain() are the only two places where
+// we need to conditionalize based on key type.
+//
+// Note that this key algorithm explicitly ignores the scheme.  This is
+// because when we're entering cookies into the map from the backing store,
+// we in general won't have the scheme at that point.
+// In practical terms, this means that file cookies will be stored
+// in the map either by an empty string or by UNC name (and will be
+// limited by kMaxCookiesPerHost), and extension cookies will be stored
+// based on the single extension id, as the extension id won't have the
+// form of a DNS host and hence GetKey() will return it unchanged.
+//
+// Arguably the right thing to do here is to make the key
+// algorithm dependent on the scheme, and make sure that the scheme is
+// available everywhere the key must be obtained (specfically at backing
+// store load time).  This would require either changing the backing store
+// database schema to include the scheme (far more trouble than it's worth), or
+// separating out file cookies into their own CookieMonster instance and
+// thus restricting each scheme to a single cookie monster (which might
+// be worth it, but is still too much trouble to solve what is currently a
+// non-problem).
+std::string CookieMonster::GetKey(const std::string& domain) const {
+  if (expiry_and_key_scheme_ == EKS_DISCARD_RECENT_AND_PURGE_DOMAIN)
+    return domain;
+
+  std::string effective_domain(
+      RegistryControlledDomainService::GetDomainAndRegistry(domain));
+  if (effective_domain.empty())
+    effective_domain = domain;
+
+  if (!effective_domain.empty() && effective_domain[0] == '.')
+    return effective_domain.substr(1);
+  return effective_domain;
+}
+
+bool CookieMonster::HasCookieableScheme(const GURL& url) {
+  lock_.AssertAcquired();
+
+  // Make sure the request is on a cookie-able url scheme.
+  for (size_t i = 0; i < cookieable_schemes_.size(); ++i) {
+    // We matched a scheme.
+    if (url.SchemeIs(cookieable_schemes_[i].c_str())) {
+      // We've matched a supported scheme.
+      return true;
+    }
+  }
+
+  // The scheme didn't match any in our whitelist.
+  VLOG(kVlogPerCookieMonster) << "WARNING: Unsupported cookie scheme: "
+                              << url.scheme();
+  return false;
+}
+
+// Test to see if stats should be recorded, and record them if so.
+// The goal here is to get sampling for the average browser-hour of
+// activity.  We won't take samples when the web isn't being surfed,
+// and when the web is being surfed, we'll take samples about every
+// kRecordStatisticsIntervalSeconds.
+// last_statistic_record_time_ is initialized to Now() rather than null
+// in the constructor so that we won't take statistics right after
+// startup, to avoid bias from browsers that are started but not used.
+void CookieMonster::RecordPeriodicStats(const base::Time& current_time) {
+  const base::TimeDelta kRecordStatisticsIntervalTime(
+      base::TimeDelta::FromSeconds(kRecordStatisticsIntervalSeconds));
+
+  // If we've taken statistics recently, return.
+  if (current_time - last_statistic_record_time_ <=
+      kRecordStatisticsIntervalTime) {
+    return;
+  }
+
+  // See InitializeHistograms() for details.
+  histogram_count_->Add(cookies_.size());
+
+  // More detailed statistics on cookie counts at different granularities.
+  TimeTicks beginning_of_time(TimeTicks::Now());
+
+  for (CookieMap::const_iterator it_key = cookies_.begin();
+       it_key != cookies_.end(); ) {
+    const std::string& key(it_key->first);
+
+    int key_count = 0;
+    typedef std::map<std::string, unsigned int> DomainMap;
+    DomainMap domain_map;
+    CookieMapItPair its_cookies = cookies_.equal_range(key);
+    while (its_cookies.first != its_cookies.second) {
+      key_count++;
+      const std::string& cookie_domain(its_cookies.first->second->Domain());
+      domain_map[cookie_domain]++;
+
+      its_cookies.first++;
+    }
+    histogram_etldp1_count_->Add(key_count);
+    histogram_domain_per_etldp1_count_->Add(domain_map.size());
+    for (DomainMap::const_iterator domain_map_it = domain_map.begin();
+         domain_map_it != domain_map.end(); domain_map_it++)
+      histogram_domain_count_->Add(domain_map_it->second);
+
+    it_key = its_cookies.second;
+  }
+
+  VLOG(kVlogPeriodic)
+      << "Time for recording cookie stats (us): "
+      << (TimeTicks::Now() - beginning_of_time).InMicroseconds();
+
+  last_statistic_record_time_ = current_time;
+}
+
+// Initialize all histogram counter variables used in this class.
+//
+// Normal histogram usage involves using the macros defined in
+// histogram.h, which automatically takes care of declaring these
+// variables (as statics), initializing them, and accumulating into
+// them, all from a single entry point.  Unfortunately, that solution
+// doesn't work for the CookieMonster, as it's vulnerable to races between
+// separate threads executing the same functions and hence initializing the
+// same static variables.  There isn't a race danger in the histogram
+// accumulation calls; they are written to be resilient to simultaneous
+// calls from multiple threads.
+//
+// The solution taken here is to have per-CookieMonster instance
+// variables that are constructed during CookieMonster construction.
+// Note that these variables refer to the same underlying histogram,
+// so we still race (but safely) with other CookieMonster instances
+// for accumulation.
+//
+// To do this we've expanded out the individual histogram macros calls,
+// with declarations of the variables in the class decl, initialization here
+// (done from the class constructor) and direct calls to the accumulation
+// methods where needed.  The specific histogram macro calls on which the
+// initialization is based are included in comments below.
+void CookieMonster::InitializeHistograms() {
+  // From UMA_HISTOGRAM_CUSTOM_COUNTS
+  histogram_expiration_duration_minutes_ = base::Histogram::FactoryGet(
+      "Cookie.ExpirationDurationMinutes",
+      1, kMinutesInTenYears, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+  histogram_between_access_interval_minutes_ = base::Histogram::FactoryGet(
+      "Cookie.BetweenAccessIntervalMinutes",
+      1, kMinutesInTenYears, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+  histogram_evicted_last_access_minutes_ = base::Histogram::FactoryGet(
+      "Cookie.EvictedLastAccessMinutes",
+      1, kMinutesInTenYears, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+  histogram_count_ = base::Histogram::FactoryGet(
+      "Cookie.Count", 1, 4000, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+  histogram_domain_count_ = base::Histogram::FactoryGet(
+      "Cookie.DomainCount", 1, 4000, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+  histogram_etldp1_count_ = base::Histogram::FactoryGet(
+      "Cookie.Etldp1Count", 1, 4000, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+  histogram_domain_per_etldp1_count_ = base::Histogram::FactoryGet(
+      "Cookie.DomainPerEtldp1Count", 1, 4000, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+
+  // From UMA_HISTOGRAM_COUNTS_10000 & UMA_HISTOGRAM_CUSTOM_COUNTS
+  histogram_number_duplicate_db_cookies_ = base::Histogram::FactoryGet(
+      "Net.NumDuplicateCookiesInDb", 1, 10000, 50,
+      base::Histogram::kUmaTargetedHistogramFlag);
+
+  // From UMA_HISTOGRAM_ENUMERATION
+  histogram_cookie_deletion_cause_ = base::LinearHistogram::FactoryGet(
+      "Cookie.DeletionCause", 1,
+      DELETE_COOKIE_LAST_ENTRY - 1, DELETE_COOKIE_LAST_ENTRY,
+      base::Histogram::kUmaTargetedHistogramFlag);
+
+  // From UMA_HISTOGRAM_{CUSTOM_,}TIMES
+  histogram_time_get_ = base::Histogram::FactoryTimeGet("Cookie.TimeGet",
+      base::TimeDelta::FromMilliseconds(1), base::TimeDelta::FromMinutes(1),
+      50, base::Histogram::kUmaTargetedHistogramFlag);
+  histogram_time_load_ = base::Histogram::FactoryTimeGet("Cookie.TimeLoad",
+      base::TimeDelta::FromMilliseconds(1), base::TimeDelta::FromMinutes(1),
+      50, base::Histogram::kUmaTargetedHistogramFlag);
+}
+
+
+// The system resolution is not high enough, so we can have multiple
+// set cookies that result in the same system time.  When this happens, we
+// increment by one Time unit.  Let's hope computers don't get too fast.
+Time CookieMonster::CurrentTime() {
+  return std::max(Time::Now(),
+      Time::FromInternalValue(last_time_seen_.ToInternalValue() + 1));
+}
 
 CookieMonster::ParsedCookie::ParsedCookie(const std::string& cookie_line)
     : is_valid_(false),
@@ -922,15 +1640,18 @@ CookieMonster::ParsedCookie::ParsedCookie(const std::string& cookie_line)
       httponly_index_(0) {
 
   if (cookie_line.size() > kMaxCookieSize) {
-    LOG(INFO) << "Not parsing cookie, too large: " << cookie_line.size();
+    VLOG(1) << "Not parsing cookie, too large: " << cookie_line.size();
     return;
   }
 
   ParseTokenValuePairs(cookie_line);
-  if (pairs_.size() > 0) {
+  if (!pairs_.empty()) {
     is_valid_ = true;
     SetupAttributes();
   }
+}
+
+CookieMonster::ParsedCookie::~ParsedCookie() {
 }
 
 // Returns true if |c| occurs in |chars|
@@ -943,7 +1664,7 @@ static inline bool CharIsA(const char c, const char* chars) {
 static inline bool SeekTo(std::string::const_iterator* it,
                           const std::string::const_iterator& end,
                           const char* chars) {
-  for (; *it != end && !CharIsA(**it, chars); ++(*it));
+  for (; *it != end && !CharIsA(**it, chars); ++(*it)) {}
   return *it == end;
 }
 // Seek the iterator to the first occurrence of a character not in |chars|.
@@ -951,72 +1672,195 @@ static inline bool SeekTo(std::string::const_iterator* it,
 static inline bool SeekPast(std::string::const_iterator* it,
                             const std::string::const_iterator& end,
                             const char* chars) {
-  for (; *it != end && CharIsA(**it, chars); ++(*it));
+  for (; *it != end && CharIsA(**it, chars); ++(*it)) {}
   return *it == end;
 }
 static inline bool SeekBackPast(std::string::const_iterator* it,
                                 const std::string::const_iterator& end,
                                 const char* chars) {
-  for (; *it != end && CharIsA(**it, chars); --(*it));
+  for (; *it != end && CharIsA(**it, chars); --(*it)) {}
   return *it == end;
+}
+
+const char CookieMonster::ParsedCookie::kTerminator[] = "\n\r\0";
+const int CookieMonster::ParsedCookie::kTerminatorLen =
+    sizeof(kTerminator) - 1;
+const char CookieMonster::ParsedCookie::kWhitespace[] = " \t";
+const char CookieMonster::ParsedCookie::kValueSeparator[] = ";";
+const char CookieMonster::ParsedCookie::kTokenSeparator[] = ";=";
+
+// Create a cookie-line for the cookie.  For debugging only!
+// If we want to use this for something more than debugging, we
+// should rewrite it better...
+std::string CookieMonster::ParsedCookie::DebugString() const {
+  std::string out;
+  for (PairList::const_iterator it = pairs_.begin();
+       it != pairs_.end(); ++it) {
+    out.append(it->first);
+    out.append("=");
+    out.append(it->second);
+    out.append("; ");
+  }
+  return out;
+}
+
+std::string::const_iterator CookieMonster::ParsedCookie::FindFirstTerminator(
+    const std::string& s) {
+  std::string::const_iterator end = s.end();
+  size_t term_pos =
+      s.find_first_of(std::string(kTerminator, kTerminatorLen));
+  if (term_pos != std::string::npos) {
+    // We found a character we should treat as an end of string.
+    end = s.begin() + term_pos;
+  }
+  return end;
+}
+
+bool CookieMonster::ParsedCookie::ParseToken(
+    std::string::const_iterator* it,
+    const std::string::const_iterator& end,
+    std::string::const_iterator* token_start,
+    std::string::const_iterator* token_end) {
+  DCHECK(it && token_start && token_end);
+  std::string::const_iterator token_real_end;
+
+  // Seek past any whitespace before the "token" (the name).
+  // token_start should point at the first character in the token
+  if (SeekPast(it, end, kWhitespace))
+    return false;  // No token, whitespace or empty.
+  *token_start = *it;
+
+  // Seek over the token, to the token separator.
+  // token_real_end should point at the token separator, i.e. '='.
+  // If it == end after the seek, we probably have a token-value.
+  SeekTo(it, end, kTokenSeparator);
+  token_real_end = *it;
+
+  // Ignore any whitespace between the token and the token separator.
+  // token_end should point after the last interesting token character,
+  // pointing at either whitespace, or at '=' (and equal to token_real_end).
+  if (*it != *token_start) {  // We could have an empty token name.
+    --(*it);  // Go back before the token separator.
+    // Skip over any whitespace to the first non-whitespace character.
+    SeekBackPast(it, *token_start, kWhitespace);
+    // Point after it.
+    ++(*it);
+  }
+  *token_end = *it;
+
+  // Seek us back to the end of the token.
+  *it = token_real_end;
+  return true;
+}
+
+void CookieMonster::ParsedCookie::ParseValue(
+    std::string::const_iterator* it,
+    const std::string::const_iterator& end,
+    std::string::const_iterator* value_start,
+    std::string::const_iterator* value_end) {
+  DCHECK(it && value_start && value_end);
+
+  // Seek past any whitespace that might in-between the token and value.
+  SeekPast(it, end, kWhitespace);
+  // value_start should point at the first character of the value.
+  *value_start = *it;
+
+#ifdef ANDROID
+  // It is unclear exactly how quoted string values should be handled.
+  // Major browsers do different things, for example, Firefox and Safari support
+  // semicolons embedded in a quoted value, while IE does not.  Looking at
+  // the specs, RFC 2109 and 2965 allow for a quoted-string as the value.
+  // However, these specs were apparently written after browsers had
+  // implemented cookies, and they seem very distant from the reality of
+  // what is actually implemented and used on the web.  The original spec
+  // from Netscape is possibly what is closest to the cookies used today.
+  // This spec didn't have explicit support for double quoted strings, and
+  // states that ; is not allowed as part of a value.
+
+  // The spec disallows control characters and separators in the unquoted value,
+  // but we allow all of these, other than the value separator ';'.
+#ifdef ALLOW_QUOTED_COOKIE_VALUES
+  // When a value is quoted, the spec states that any text (other than a double
+  // quote character, but including an escaped double quote character) is
+  // treated as an opaque part of the value. The spec allows for exactly one
+  // such quoted string for the value, but we allow multiple such strings,
+  // possibly with intermediate separators. This matches our policy of allowing
+  // separators in the unquoted value. This matches the behaviour of Safari, but
+  // not that of FF.
+  bool isInQuotedString = false;
+  for (; *it != end && (isInQuotedString || !CharIsA(**it, kValueSeparator)); ++(*it)) {
+    // Inside a quoted string, a backslash esacpes the next character, which can
+    // be any character and should be ignored.
+    if (isInQuotedString && **it == '\\') {
+      ++(*it);
+      // If this backslash is the last character, we just take what we have.
+      if (*it == end)
+        break;
+      continue;
+    }
+
+    if (**it == '\"')
+      isInQuotedString = !isInQuotedString;
+  }
+#else
+  // Just look for ';' to terminate ('=' allowed).
+  // We can hit the end, maybe they didn't terminate.
+  SeekTo(it, end, kValueSeparator);
+#endif
+#endif // ANDROID
+
+  // Will be pointed at the ; seperator or the end.
+  *value_end = *it;
+
+  // Ignore any unwanted whitespace after the value.
+  if (*value_end != *value_start) {  // Could have an empty value
+    --(*value_end);
+    SeekBackPast(value_end, *value_start, kWhitespace);
+    ++(*value_end);
+  }
+}
+
+std::string CookieMonster::ParsedCookie::ParseTokenString(
+    const std::string& token) {
+  std::string::const_iterator it = token.begin();
+  std::string::const_iterator end = FindFirstTerminator(token);
+
+  std::string::const_iterator token_start, token_end;
+  if (ParseToken(&it, end, &token_start, &token_end))
+    return std::string(token_start, token_end);
+  return std::string();
+}
+
+std::string CookieMonster::ParsedCookie::ParseValueString(
+    const std::string& value) {
+  std::string::const_iterator it = value.begin();
+  std::string::const_iterator end = FindFirstTerminator(value);
+
+  std::string::const_iterator value_start, value_end;
+  ParseValue(&it, end, &value_start, &value_end);
+  return std::string(value_start, value_end);
 }
 
 // Parse all token/value pairs and populate pairs_.
 void CookieMonster::ParsedCookie::ParseTokenValuePairs(
     const std::string& cookie_line) {
-  static const char kTerminator[]      = "\n\r\0";
-  static const int  kTerminatorLen     = sizeof(kTerminator) - 1;
-  static const char kWhitespace[]      = " \t";
-  static const char kValueSeparator[]  = ";";
-  static const char kTokenSeparator[]  = ";=";
-
   pairs_.clear();
 
   // Ok, here we go.  We should be expecting to be starting somewhere
   // before the cookie line, not including any header name...
   std::string::const_iterator start = cookie_line.begin();
-  std::string::const_iterator end = cookie_line.end();
   std::string::const_iterator it = start;
 
   // TODO Make sure we're stripping \r\n in the network code.  Then we
   // can log any unexpected terminators.
-  size_t term_pos =
-      cookie_line.find_first_of(std::string(kTerminator, kTerminatorLen));
-  if (term_pos != std::string::npos) {
-    // We found a character we should treat as an end of string.
-    end = start + term_pos;
-  }
+  std::string::const_iterator end = FindFirstTerminator(cookie_line);
 
   for (int pair_num = 0; pair_num < kMaxPairs && it != end; ++pair_num) {
     TokenValuePair pair;
-    std::string::const_iterator token_start, token_real_end, token_end;
 
-    // Seek past any whitespace before the "token" (the name).
-    // token_start should point at the first character in the token
-    if (SeekPast(&it, end, kWhitespace))
-      break;  // No token, whitespace or empty.
-    token_start = it;
-
-    // Seek over the token, to the token separator.
-    // token_real_end should point at the token separator, i.e. '='.
-    // If it == end after the seek, we probably have a token-value.
-    SeekTo(&it, end, kTokenSeparator);
-    token_real_end = it;
-
-    // Ignore any whitespace between the token and the token separator.
-    // token_end should point after the last interesting token character,
-    // pointing at either whitespace, or at '=' (and equal to token_real_end).
-    if (it != token_start) {  // We could have an empty token name.
-      --it;  // Go back before the token separator.
-      // Skip over any whitespace to the first non-whitespace character.
-      SeekBackPast(&it, token_start, kWhitespace);
-      // Point after it.
-      ++it;
-    }
-    token_end = it;
-
-    // Seek us back to the end of the token.
-    it = token_real_end;
+    std::string::const_iterator token_start, token_end;
+    if (!ParseToken(&it, end, &token_start, &token_end))
+      break;
 
     if (it == end || *it != '=') {
       // We have a token-value, we didn't have any token name.
@@ -1043,45 +1887,10 @@ void CookieMonster::ParsedCookie::ParseTokenValuePairs(
 
     // OK, now try to parse a value.
     std::string::const_iterator value_start, value_end;
-
-    // Seek past any whitespace that might in-between the token and value.
-    SeekPast(&it, end, kWhitespace);
-    // value_start should point at the first character of the value.
-    value_start = it;
-
-    // It is unclear exactly how quoted string values should be handled.
-    // Major browsers do different things, for example, Firefox supports
-    // semicolons embedded in a quoted value, while IE does not.  Looking at
-    // the specs, RFC 2109 and 2965 allow for a quoted-string as the value.
-    // However, these specs were apparently written after browsers had
-    // implemented cookies, and they seem very distant from the reality of
-    // what is actually implemented and used on the web.  The original spec
-    // from Netscape is possibly what is closest to the cookies used today.
-    // This spec didn't have explicit support for double quoted strings, and
-    // states that ; is not allowed as part of a value.  We had originally
-    // implement the Firefox behavior (A="B;C"; -> A="B;C";).  However, since
-    // there is no standard that makes sense, we decided to follow the behavior
-    // of IE and Safari, which is closer to the original Netscape proposal.
-    // This means that A="B;C" -> A="B;.  This also makes the code much simpler
-    // and reduces the possibility for invalid cookies, where other browsers
-    // like Opera currently reject those invalid cookies (ex A="B" "C";).
-
-    // Just look for ';' to terminate ('=' allowed).
-    // We can hit the end, maybe they didn't terminate.
-    SeekTo(&it, end, kValueSeparator);
-
-    // Will be pointed at the ; seperator or the end.
-    value_end = it;
-
-    // Ignore any unwanted whitespace after the value.
-    if (value_end != value_start) {  // Could have an empty value
-      --value_end;
-      SeekBackPast(&value_end, value_start, kWhitespace);
-      ++value_end;
-    }
-
+    ParseValue(&it, end, &value_start, &value_end);
     // OK, we're finished with a Token/Value.
     pair.second = std::string(value_start, value_end);
+
     // From RFC2109: "Attributes (names) (attr) are case-insensitive."
     if (pair_num != 0)
       StringToLowerASCII(&pair.first);
@@ -1104,35 +1913,144 @@ void CookieMonster::ParsedCookie::SetupAttributes() {
 
   // We skip over the first token/value, the user supplied one.
   for (size_t i = 1; i < pairs_.size(); ++i) {
-    if (pairs_[i].first == kPathTokenName)
+    if (pairs_[i].first == kPathTokenName) {
       path_index_ = i;
-    else if (pairs_[i].first == kDomainTokenName)
+    } else if (pairs_[i].first == kDomainTokenName) {
       domain_index_ = i;
-    else if (pairs_[i].first == kExpiresTokenName)
+    } else if (pairs_[i].first == kExpiresTokenName) {
       expires_index_ = i;
-    else if (pairs_[i].first == kMaxAgeTokenName)
+    } else if (pairs_[i].first == kMaxAgeTokenName) {
       maxage_index_ = i;
-    else if (pairs_[i].first == kSecureTokenName)
+    } else if (pairs_[i].first == kSecureTokenName) {
       secure_index_ = i;
-    else if (pairs_[i].first == kHttpOnlyTokenName)
+    } else if (pairs_[i].first == kHttpOnlyTokenName) {
       httponly_index_ = i;
-    else { /* some attribute we don't know or don't care about. */ }
+    } else {
+      /* some attribute we don't know or don't care about. */
+    }
   }
 }
 
-// Create a cookie-line for the cookie.  For debugging only!
-// If we want to use this for something more than debugging, we
-// should rewrite it better...
-std::string CookieMonster::ParsedCookie::DebugString() const {
-  std::string out;
-  for (PairList::const_iterator it = pairs_.begin();
-       it != pairs_.end(); ++it) {
-    out.append(it->first);
-    out.append("=");
-    out.append(it->second);
-    out.append("; ");
+CookieMonster::CanonicalCookie::CanonicalCookie()
+    : secure_(false),
+      httponly_(false),
+      has_expires_(false) {
+}
+
+CookieMonster::CanonicalCookie::CanonicalCookie(const GURL& url,
+                                                const std::string& name,
+                                                const std::string& value,
+                                                const std::string& domain,
+                                                const std::string& path,
+                                                const base::Time& creation,
+                                                const base::Time& expiration,
+                                                const base::Time& last_access,
+                                                bool secure,
+                                                bool httponly,
+                                                bool has_expires)
+    : source_(GetCookieSourceFromURL(url)),
+      name_(name),
+      value_(value),
+      domain_(domain),
+      path_(path),
+      creation_date_(creation),
+      expiry_date_(expiration),
+      last_access_date_(last_access),
+      secure_(secure),
+      httponly_(httponly),
+      has_expires_(has_expires) {
+}
+
+CookieMonster::CanonicalCookie::CanonicalCookie(const GURL& url,
+                                                const ParsedCookie& pc)
+    : source_(GetCookieSourceFromURL(url)),
+      name_(pc.Name()),
+      value_(pc.Value()),
+      path_(CanonPath(url, pc)),
+      creation_date_(Time::Now()),
+      last_access_date_(Time()),
+      secure_(pc.IsSecure()),
+      httponly_(pc.IsHttpOnly()),
+      has_expires_(pc.HasExpires()) {
+  if (has_expires_)
+    expiry_date_ = CanonExpiration(pc, creation_date_, CookieOptions());
+
+  // Do the best we can with the domain.
+  std::string cookie_domain;
+  std::string domain_string;
+  if (pc.HasDomain()) {
+    domain_string = pc.Domain();
   }
-  return out;
+  bool result
+      = GetCookieDomainWithString(url, domain_string,
+                                  &cookie_domain);
+  // Caller is responsible for passing in good arguments.
+  DCHECK(result);
+  domain_ = cookie_domain;
+}
+
+CookieMonster::CanonicalCookie::~CanonicalCookie() {
+}
+
+std::string CookieMonster::CanonicalCookie::GetCookieSourceFromURL(
+    const GURL& url) {
+  if (url.SchemeIsFile())
+    return url.spec();
+
+  url_canon::Replacements<char> replacements;
+  replacements.ClearPort();
+  if (url.SchemeIsSecure())
+    replacements.SetScheme("http", url_parse::Component(0, 4));
+
+  return url.GetOrigin().ReplaceComponents(replacements).spec();
+}
+
+CookieMonster::CanonicalCookie* CookieMonster::CanonicalCookie::Create(
+      const GURL& url,
+      const std::string& name,
+      const std::string& value,
+      const std::string& domain,
+      const std::string& path,
+      const base::Time& creation,
+      const base::Time& expiration,
+      bool secure,
+      bool http_only) {
+  // Expect valid attribute tokens and values, as defined by the ParsedCookie
+  // logic, otherwise don't create the cookie.
+  std::string parsed_name = ParsedCookie::ParseTokenString(name);
+  if (parsed_name != name)
+    return NULL;
+  std::string parsed_value = ParsedCookie::ParseValueString(value);
+  if (parsed_value != value)
+    return NULL;
+
+  std::string parsed_domain = ParsedCookie::ParseValueString(domain);
+  if (parsed_domain != domain)
+    return NULL;
+  std::string cookie_domain;
+  if (!GetCookieDomainWithString(url, parsed_domain, &cookie_domain))
+    return NULL;
+
+  std::string parsed_path = ParsedCookie::ParseValueString(path);
+  if (parsed_path != path)
+    return NULL;
+
+  std::string cookie_path = CanonPathWithString(url, parsed_path);
+  // Expect that the path was either not specified (empty), or is valid.
+  if (!parsed_path.empty() && cookie_path != parsed_path)
+    return NULL;
+  // Canonicalize path again to make sure it escapes characters as needed.
+  url_parse::Component path_component(0, cookie_path.length());
+  url_canon::RawCanonOutputT<char> canon_path;
+  url_parse::Component canon_path_component;
+  url_canon::CanonicalizePath(cookie_path.data(), path_component,
+                              &canon_path, &canon_path_component);
+  cookie_path = std::string(canon_path.data() + canon_path_component.begin,
+                            canon_path_component.len);
+
+  return new CanonicalCookie(url, parsed_name, parsed_value, cookie_domain,
+                             cookie_path, creation, expiration, creation,
+                             secure, http_only, !expiration.is_null());
 }
 
 bool CookieMonster::CanonicalCookie::IsOnPath(
@@ -1171,10 +2089,48 @@ bool CookieMonster::CanonicalCookie::IsOnPath(
   return true;
 }
 
+bool CookieMonster::CanonicalCookie::IsDomainMatch(
+    const std::string& scheme,
+    const std::string& host) const {
+  // Can domain match in two ways; as a domain cookie (where the cookie
+  // domain begins with ".") or as a host cookie (where it doesn't).
+
+  // Some consumers of the CookieMonster expect to set cookies on
+  // URLs like http://.strange.url.  To retrieve cookies in this instance,
+  // we allow matching as a host cookie even when the domain_ starts with
+  // a period.
+  if (host == domain_)
+    return true;
+
+  // Domain cookie must have an initial ".".  To match, it must be
+  // equal to url's host with initial period removed, or a suffix of
+  // it.
+
+  // Arguably this should only apply to "http" or "https" cookies, but
+  // extension cookie tests currently use the funtionality, and if we
+  // ever decide to implement that it should be done by preventing
+  // such cookies from being set.
+  if (domain_.empty() || domain_[0] != '.')
+    return false;
+
+  // The host with a "." prefixed.
+  if (domain_.compare(1, std::string::npos, host) == 0)
+    return true;
+
+  // A pure suffix of the host (ok since we know the domain already
+  // starts with a ".")
+  return (host.length() > domain_.length() &&
+          host.compare(host.length() - domain_.length(),
+                       domain_.length(), domain_) == 0);
+}
+
 std::string CookieMonster::CanonicalCookie::DebugString() const {
-  return StringPrintf("name: %s value: %s path: %s creation: %" PRId64,
-                      name_.c_str(), value_.c_str(), path_.c_str(),
-                      static_cast<int64>(creation_date_.ToTimeT()));
+  return base::StringPrintf(
+      "name: %s value: %s domain: %s path: %s creation: %"
+      PRId64,
+      name_.c_str(), value_.c_str(),
+      domain_.c_str(), path_.c_str(),
+      static_cast<int64>(creation_date_.ToTimeT()));
 }
 
 }  // namespace

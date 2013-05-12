@@ -1,15 +1,17 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_ID_MAP_H_
 #define BASE_ID_MAP_H_
+#pragma once
 
 #include <set>
 
 #include "base/basictypes.h"
 #include "base/hash_tables.h"
 #include "base/logging.h"
+#include "base/threading/non_thread_safe.h"
 
 // Ownership semantics - own pointer means the pointer is deleted in Remove()
 // & during destruction
@@ -30,16 +32,23 @@ enum IDMapOwnershipSemantics {
 // This class does not have a virtual destructor, do not inherit from it when
 // ownership semantics are set to own because pointers will leak.
 template<typename T, IDMapOwnershipSemantics OS = IDMapExternalPointer>
-class IDMap {
+class IDMap : public base::NonThreadSafe {
  private:
   typedef int32 KeyType;
   typedef base::hash_map<KeyType, T*> HashTable;
 
  public:
   IDMap() : iteration_depth_(0), next_id_(1), check_on_null_data_(false) {
+    // A number of consumers of IDMap create it on one thread but always access
+    // it from a different, but consitent, thread post-construction.
+    DetachFromThread();
   }
 
   ~IDMap() {
+    // Many IDMap's are static, and hence will be destroyed on the main thread.
+    // However, all the accesses may take place on another thread, such as the
+    // IO thread. Detaching again to clean this up.
+    DetachFromThread();
     Releaser<OS, 0>::release_all(&data_);
   }
 
@@ -48,6 +57,7 @@ class IDMap {
 
   // Adds a view with an automatically generated unique ID. See AddWithID.
   KeyType Add(T* data) {
+    DCHECK(CalledOnValidThread());
     CHECK(!check_on_null_data_ || data);
     KeyType this_id = next_id_;
     DCHECK(data_.find(this_id) == data_.end()) << "Inserting duplicate item";
@@ -61,12 +71,14 @@ class IDMap {
   // this function, or allow this object to generate IDs and call Add. These
   // two methods may not be mixed, or duplicate IDs may be generated
   void AddWithID(T* data, KeyType id) {
+    DCHECK(CalledOnValidThread());
     CHECK(!check_on_null_data_ || data);
     DCHECK(data_.find(id) == data_.end()) << "Inserting duplicate item";
     data_[id] = data;
   }
 
   void Remove(KeyType id) {
+    DCHECK(CalledOnValidThread());
     typename HashTable::iterator i = data_.find(id);
     if (i == data_.end()) {
       NOTREACHED() << "Attempting to remove an item not in the list";
@@ -82,10 +94,12 @@ class IDMap {
   }
 
   bool IsEmpty() const {
-    return data_.empty();
+    DCHECK(CalledOnValidThread());
+    return size() == 0u;
   }
 
   T* Lookup(KeyType id) const {
+    DCHECK(CalledOnValidThread());
     typename HashTable::const_iterator i = data_.find(id);
     if (i == data_.end())
       return NULL;
@@ -93,7 +107,8 @@ class IDMap {
   }
 
   size_t size() const {
-    return data_.size();
+    DCHECK(CalledOnValidThread());
+    return data_.size() - removed_ids_.size();
   }
 
   // It is safe to remove elements from the map during iteration. All iterators
@@ -101,31 +116,37 @@ class IDMap {
   template<class ReturnType>
   class Iterator {
    public:
-    Iterator(IDMap<T>* map)
+    Iterator(IDMap<T, OS>* map)
         : map_(map),
           iter_(map_->data_.begin()) {
+      DCHECK(map->CalledOnValidThread());
       ++map_->iteration_depth_;
       SkipRemovedEntries();
     }
 
     ~Iterator() {
+      DCHECK(map_->CalledOnValidThread());
       if (--map_->iteration_depth_ == 0)
         map_->Compact();
     }
 
     bool IsAtEnd() const {
+      DCHECK(map_->CalledOnValidThread());
       return iter_ == map_->data_.end();
     }
 
     KeyType GetCurrentKey() const {
+      DCHECK(map_->CalledOnValidThread());
       return iter_->first;
     }
 
     ReturnType* GetCurrentValue() const {
+      DCHECK(map_->CalledOnValidThread());
       return iter_->second;
     }
 
     void Advance() {
+      DCHECK(map_->CalledOnValidThread());
       ++iter_;
       SkipRemovedEntries();
     }
@@ -139,7 +160,7 @@ class IDMap {
       }
     }
 
-    IDMap<T>* map_;
+    IDMap<T, OS>* map_;
     typename HashTable::const_iterator iter_;
   };
 

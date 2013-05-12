@@ -1,9 +1,10 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_BASE_LOAD_STATES_H__
 #define NET_BASE_LOAD_STATES_H__
+#pragma once
 
 namespace net {
 
@@ -29,6 +30,10 @@ enum LoadState {
   // host before deciding what proxy to use.
   LOAD_STATE_RESOLVING_PROXY_FOR_URL,
 
+  // This state indicates that we're in the process of establishing a tunnel
+  // through the proxy server.
+  LOAD_STATE_ESTABLISHING_PROXY_TUNNEL,
+
   // This state corresponds to a resource load that is blocked waiting for a
   // host name to be resolved.  This could either indicate resolution of the
   // origin server corresponding to the resource or to the host name of a proxy
@@ -39,6 +44,10 @@ enum LoadState {
   // TCP connection (or other network connection) to be established.  HTTP
   // requests that reuse a keep-alive connection skip this state.
   LOAD_STATE_CONNECTING,
+
+  // This state corresponds to a resource load that is blocked waiting for the
+  // SSL handshake to complete.
+  LOAD_STATE_SSL_HANDSHAKE,
 
   // This state corresponds to a resource load that is blocked waiting to
   // completely upload a request to a server.  In the case of a HTTP POST

@@ -1,14 +1,33 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "net/base/ssl_client_auth_cache.h"
 
+#include "base/logging.h"
+#include "net/base/x509_certificate.h"
+
 namespace net {
 
-X509Certificate* SSLClientAuthCache::Lookup(const std::string& server) {
+SSLClientAuthCache::SSLClientAuthCache() {
+  CertDatabase::AddObserver(this);
+}
+
+SSLClientAuthCache::~SSLClientAuthCache() {
+  CertDatabase::RemoveObserver(this);
+}
+
+bool SSLClientAuthCache::Lookup(
+    const std::string& server,
+    scoped_refptr<X509Certificate>* certificate) {
+  DCHECK(certificate);
+
   AuthCacheMap::iterator iter = cache_.find(server);
-  return (iter == cache_.end()) ? NULL : iter->second;
+  if (iter == cache_.end())
+    return false;
+
+  *certificate = iter->second;
+  return true;
 }
 
 void SSLClientAuthCache::Add(const std::string& server,
@@ -20,6 +39,10 @@ void SSLClientAuthCache::Add(const std::string& server,
 
 void SSLClientAuthCache::Remove(const std::string& server) {
   cache_.erase(server);
+}
+
+void SSLClientAuthCache::OnUserCertAdded(const X509Certificate* cert) {
+  cache_.clear();
 }
 
 }  // namespace net

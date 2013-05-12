@@ -13,7 +13,6 @@
 
 #include "base/logging.h"
 #include "base/timer.h"
-#include "net/tools/flip_server/other_defines.h"
 
 // Design notes: An efficient implementation of ready list has the following
 // desirable properties:
@@ -222,6 +221,10 @@ void EpollServer::RegisterFD(int fd, CB* cb, int event_mask) {
   cb->OnRegistration(this, fd, event_mask);
 }
 
+int EpollServer::GetFlags(int fd) {
+  return fcntl(fd, F_GETFL, 0);
+}
+
 void EpollServer::SetNonblocking(int fd) {
   int flags = GetFlags(fd);
   if (flags == -1) {
@@ -243,6 +246,13 @@ void EpollServer::SetNonblocking(int fd) {
         << strerror_r(saved_errno, buf, sizeof(buf));
     }
   }
+}
+
+int EpollServer::epoll_wait_impl(int epfd,
+                                 struct epoll_event* events,
+                                 int max_events,
+                                 int timeout_in_ms) {
+  return epoll_wait(epfd, events, max_events, timeout_in_ms);
 }
 
 void EpollServer::RegisterFDForWrite(int fd, CB* cb) {
@@ -478,11 +488,19 @@ int EpollServer::NumFDsRegistered() const {
 
 void EpollServer::Wake() {
   char data = 'd';  // 'd' is for data.  It's good enough for me.
-  write(write_fd_, &data, 1);
+  int rv = write(write_fd_, &data, 1);
+  DCHECK(rv == 1);
 }
 
 int64 EpollServer::NowInUsec() const {
   return base::Time::Now().ToInternalValue();
+}
+
+int64 EpollServer::ApproximateNowInUsec() const {
+  if (recorded_now_in_us_ != 0) {
+    return recorded_now_in_us_;
+  }
+  return this->NowInUsec();
 }
 
 std::string EpollServer::EventMaskToString(int event_mask) {

@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,10 +6,9 @@
 
 #include <math.h>
 
-#include "base/histogram.h"
-#include "base/win_util.h"
-
-using base::Time;
+#include "base/message_loop.h"
+#include "base/metrics/histogram.h"
+#include "base/win/wrapped_window_proc.h"
 
 namespace base {
 
@@ -69,7 +68,8 @@ int MessagePumpWin::GetCurrentDelay() const {
   // Be careful here.  TimeDelta has a precision of microseconds, but we want a
   // value in milliseconds.  If there are 5.5ms left, should the delay be 5 or
   // 6?  It should be 6 to avoid executing delayed work too early.
-  double timeout = ceil((delayed_work_time_ - Time::Now()).InMillisecondsF());
+  double timeout =
+      ceil((delayed_work_time_ - TimeTicks::Now()).InMillisecondsF());
 
   // If this value is negative, then we need to run delayed work soon.
   int delay = static_cast<int>(timeout);
@@ -99,7 +99,7 @@ void MessagePumpForUI::ScheduleWork() {
   PostMessage(message_hwnd_, kMsgHaveWork, reinterpret_cast<WPARAM>(this), 0);
 }
 
-void MessagePumpForUI::ScheduleDelayedWork(const Time& delayed_work_time) {
+void MessagePumpForUI::ScheduleDelayedWork(const TimeTicks& delayed_work_time) {
   //
   // We would *like* to provide high resolution timers.  Windows timers using
   // SetTimer() have a 10ms granularity.  We have to use WM_TIMER as a wakeup
@@ -123,7 +123,7 @@ void MessagePumpForUI::ScheduleDelayedWork(const Time& delayed_work_time) {
   delayed_work_time_ = delayed_work_time;
 
   int delay_msec = GetCurrentDelay();
-  DCHECK(delay_msec >= 0);
+  DCHECK_GE(delay_msec, 0);
   if (delay_msec < USER_TIMER_MINIMUM)
     delay_msec = USER_TIMER_MINIMUM;
 
@@ -143,17 +143,11 @@ void MessagePumpForUI::PumpOutPendingPaintMessages() {
   // to get the job done.  Actual common max is 4 peeks, but we'll be a little
   // safe here.
   const int kMaxPeekCount = 20;
-  bool win2k = win_util::GetWinVersion() <= win_util::WINVERSION_2000;
   int peek_count;
   for (peek_count = 0; peek_count < kMaxPeekCount; ++peek_count) {
     MSG msg;
-    if (win2k) {
-      if (!PeekMessage(&msg, NULL, WM_PAINT, WM_PAINT, PM_REMOVE))
-        break;
-    } else {
-      if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE | PM_QS_PAINT))
-        break;
-    }
+    if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE | PM_QS_PAINT))
+      break;
     ProcessMessageHelper(msg);
     if (state_->should_quit)  // Handle WM_QUIT.
       break;
@@ -240,7 +234,7 @@ void MessagePumpForUI::InitMessageWnd() {
 
   WNDCLASSEX wc = {0};
   wc.cbSize = sizeof(wc);
-  wc.lpfnWndProc = WndProcThunk;
+  wc.lpfnWndProc = base::win::WrappedWindowProc<WndProcThunk>;
   wc.hInstance = hinst;
   wc.lpszClassName = kWndClass;
   RegisterClassEx(&wc);
@@ -378,8 +372,19 @@ bool MessagePumpForUI::ProcessPumpReplacementMessage() {
   // possibly be posted), and finally dispatches that peeked replacement.  Note
   // that the re-post of kMsgHaveWork may be asynchronous to this thread!!
 
+  bool have_message = false;
   MSG msg;
-  bool have_message = (0 != PeekMessage(&msg, NULL, 0, 0, PM_REMOVE));
+  // We should not process all window messages if we are in the context of an
+  // OS modal loop, i.e. in the context of a windows API call like MessageBox.
+  // This is to ensure that these messages are peeked out by the OS modal loop.
+  if (MessageLoop::current()->os_modal_loop()) {
+    // We only peek out WM_PAINT and WM_TIMER here for reasons mentioned above.
+    have_message = PeekMessage(&msg, NULL, WM_PAINT, WM_PAINT, PM_REMOVE) ||
+                   PeekMessage(&msg, NULL, WM_TIMER, WM_TIMER, PM_REMOVE);
+  } else {
+    have_message = (0 != PeekMessage(&msg, NULL, 0, 0, PM_REMOVE));
+  }
+
   DCHECK(!have_message || kMsgHaveWork != msg.message ||
          msg.hwnd != message_hwnd_);
 
@@ -418,7 +423,7 @@ void MessagePumpForIO::ScheduleWork() {
   DCHECK(ret);
 }
 
-void MessagePumpForIO::ScheduleDelayedWork(const Time& delayed_work_time) {
+void MessagePumpForIO::ScheduleDelayedWork(const TimeTicks& delayed_work_time) {
   // We know that we can't be blocked right now since this method can only be
   // called on the same thread as Run, so we only need to update our record of
   // how long to sleep when we do sleep.
@@ -429,7 +434,7 @@ void MessagePumpForIO::RegisterIOHandler(HANDLE file_handle,
                                          IOHandler* handler) {
   ULONG_PTR key = reinterpret_cast<ULONG_PTR>(handler);
   HANDLE port = CreateIoCompletionPort(file_handle, port_, key, 1);
-  DCHECK(port == port_.Get());
+  DPCHECK(port);
 }
 
 //-----------------------------------------------------------------------------
@@ -478,7 +483,7 @@ void MessagePumpForIO::DoRunLoop() {
 void MessagePumpForIO::WaitForWork() {
   // We do not support nested IO message loops. This is to avoid messy
   // recursion problems.
-  DCHECK(state_->run_depth == 1) << "Cannot nest an IO message loop!";
+  DCHECK_EQ(1, state_->run_depth) << "Cannot nest an IO message loop!";
 
   int timeout = GetCurrentDelay();
   if (timeout < 0)  // Negative value means no timers waiting.
@@ -503,9 +508,11 @@ bool MessagePumpForIO::WaitForIOCompletion(DWORD timeout, IOHandler* filter) {
       // Save this item for later
       completed_io_.push_back(item);
     } else {
-      DCHECK(item.context->handler == item.handler);
+      DCHECK_EQ(item.context->handler, item.handler);
+      WillProcessIOEvent();
       item.handler->OnIOCompleted(item.context, item.bytes_transfered,
                                   item.error);
+      DidProcessIOEvent();
     }
   } else {
     // The handler must be gone by now, just cleanup the mess.
@@ -555,6 +562,22 @@ bool MessagePumpForIO::MatchCompletedIOItem(IOHandler* filter, IOItem* item) {
     }
   }
   return false;
+}
+
+void MessagePumpForIO::AddIOObserver(IOObserver *obs) {
+  io_observers_.AddObserver(obs);
+}
+
+void MessagePumpForIO::RemoveIOObserver(IOObserver *obs) {
+  io_observers_.RemoveObserver(obs);
+}
+
+void MessagePumpForIO::WillProcessIOEvent() {
+  FOR_EACH_OBSERVER(IOObserver, io_observers_, WillProcessIOEvent());
+}
+
+void MessagePumpForIO::DidProcessIOEvent() {
+  FOR_EACH_OBSERVER(IOObserver, io_observers_, DidProcessIOEvent());
 }
 
 }  // namespace base

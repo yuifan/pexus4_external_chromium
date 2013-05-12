@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,10 +6,11 @@
 
 #ifndef NET_DISK_CACHE_RANKINGS_H_
 #define NET_DISK_CACHE_RANKINGS_H_
+#pragma once
 
 #include <list>
 
-#include "base/scoped_ptr.h"
+#include "base/memory/scoped_ptr.h"
 #include "net/disk_cache/addr.h"
 #include "net/disk_cache/mapped_file.h"
 #include "net/disk_cache/storage_block.h"
@@ -86,27 +87,22 @@ class Rankings {
 
    private:
     Rankings* rankings_;
-    DISALLOW_EVIL_CONSTRUCTORS(ScopedRankingsBlock);
+    DISALLOW_COPY_AND_ASSIGN(ScopedRankingsBlock);
   };
 
   // If we have multiple lists, we have to iterate through all at the same time.
   // This structure keeps track of where we are on the iteration.
   struct Iterator {
+    explicit Iterator(Rankings* rankings);
+    ~Iterator();
+
     List list;                     // Which entry was returned to the user.
     CacheRankingsBlock* nodes[3];  // Nodes on the first three lists.
     Rankings* my_rankings;
-    explicit Iterator(Rankings* rankings) {
-      memset(this, 0, sizeof(Iterator));
-      my_rankings = rankings;
-    }
-    ~Iterator() {
-      for (int i = 0; i < 3; i++)
-        ScopedRankingsBlock(my_rankings, nodes[i]);
-    }
   };
 
-  Rankings() : init_(false) {}
-  ~Rankings() {}
+  Rankings();
+  ~Rankings();
 
   bool Init(BackendImpl* backend, bool count_lists);
 
@@ -116,8 +112,12 @@ class Rankings {
   // Inserts a given entry at the head of the queue.
   void Insert(CacheRankingsBlock* node, bool modified, List list);
 
-  // Removes a given entry from the LRU list.
-  void Remove(CacheRankingsBlock* node, List list);
+  // Removes a given entry from the LRU list. If |strict| is true, this method
+  // assumes that |node| is not pointed to by an active iterator. On the other
+  // hand, removing that restriction allows the current "head" of an iterator
+  // to be removed from the list (basically without control of the code that is
+  // performing the iteration), so it should be used with extra care.
+  void Remove(CacheRankingsBlock* node, List list, bool strict);
 
   // Moves a given entry to the head.
   void UpdateRank(CacheRankingsBlock* node, bool modified, List list);
@@ -136,7 +136,11 @@ class Rankings {
 
   // Returns false if the entry is clearly invalid. from_list is true if the
   // node comes from the LRU list.
-  bool SanityCheck(CacheRankingsBlock* node, bool from_list);
+  bool SanityCheck(CacheRankingsBlock* node, bool from_list) const;
+  bool DataSanityCheck(CacheRankingsBlock* node, bool from_list) const;
+
+  // Sets the |contents| field of |node| to |address|.
+  void SetContents(CacheRankingsBlock* node, CacheAddr address);
 
  private:
   typedef std::pair<CacheAddr, CacheRankingsBlock*> IteratorPair;
@@ -164,9 +168,10 @@ class Rankings {
   // selfcheck).
   bool CheckEntry(CacheRankingsBlock* rankings);
 
-  // Returns false if node is not properly linked.
+  // Returns false if node is not properly linked. This method may change the
+  // provided |list| to reflect the list where this node is actually stored.
   bool CheckLinks(CacheRankingsBlock* node, CacheRankingsBlock* prev,
-                  CacheRankingsBlock* next, List list);
+                  CacheRankingsBlock* next, List* list);
 
   // Checks the links between two consecutive nodes.
   bool CheckSingleLink(CacheRankingsBlock* prev, CacheRankingsBlock* next);
@@ -175,9 +180,10 @@ class Rankings {
   // error code (negative value).
   int CheckList(List list);
 
-  // Returns true if addr is the head or tail of any list.
-  bool IsHead(CacheAddr addr);
-  bool IsTail(CacheAddr addr);
+  // Returns true if addr is the head or tail of any list. When there is a
+  // match |list| will contain the list number for |addr|.
+  bool IsHead(CacheAddr addr, List* list) const;
+  bool IsTail(CacheAddr addr, List* list) const;
 
   // Updates the iterators whenever node is being changed.
   void UpdateIterators(CacheRankingsBlock* node);

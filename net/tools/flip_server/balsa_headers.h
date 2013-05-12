@@ -4,9 +4,10 @@
 
 #ifndef NET_TOOLS_FLIP_SERVER_BALSA_HEADERS_H_
 #define NET_TOOLS_FLIP_SERVER_BALSA_HEADERS_H_
+#pragma once
 
 #include <algorithm>
-#include <iostream>
+#include <iosfwd>
 #include <iterator>
 #include <string>
 #include <utility>
@@ -95,20 +96,10 @@ class BalsaBuffer {
 
   typedef std::vector<BufferBlock> Blocks;
 
-  ~BalsaBuffer() {
-    CleanupBlocksStartingFrom(0);
-  }
+  ~BalsaBuffer();
 
   // Returns the total amount of memory used by the buffer blocks.
-  size_t GetTotalBufferBlockSize() const {
-    size_t buffer_size = 0;
-    for (Blocks::const_iterator iter = blocks_.begin();
-         iter != blocks_.end();
-         ++iter) {
-      buffer_size += iter->buffer_size;
-    }
-    return buffer_size;
-  }
+  size_t GetTotalBufferBlockSize() const;
 
   const char* GetPtr(Blocks::size_type block_idx) const {
     DCHECK_LT(block_idx, blocks_.size())
@@ -143,34 +134,7 @@ class BalsaBuffer {
   // for reasons of efficiency, requires that the buffer from which it parses
   // the headers be contiguous.
   //
-  void WriteToContiguousBuffer(const base::StringPiece& sp) {
-    if (sp.empty()) {
-      return;
-    }
-    CHECK(can_write_to_contiguous_buffer_);
-    DCHECK_GE(blocks_.size(), 1u);
-    if (blocks_[0].buffer == NULL && sp.size() <= blocksize_) {
-      blocks_[0] = AllocBlock();
-      memcpy(blocks_[0].start_of_unused_bytes(), sp.data(), sp.size());
-    } else if (blocks_[0].bytes_free < sp.size()) {
-      // the first block isn't big enough, resize it.
-      const size_t old_storage_size_used = blocks_[0].bytes_used();
-      const size_t new_storage_size = old_storage_size_used + sp.size();
-      char* new_storage = new char[new_storage_size];
-      char* old_storage = blocks_[0].buffer;
-      if (old_storage_size_used) {
-        memcpy(new_storage, old_storage, old_storage_size_used);
-      }
-      memcpy(new_storage + old_storage_size_used, sp.data(), sp.size());
-      blocks_[0].buffer = new_storage;
-      blocks_[0].bytes_free = sp.size();
-      blocks_[0].buffer_size = new_storage_size;
-      delete[] old_storage;
-    } else {
-      memcpy(blocks_[0].start_of_unused_bytes(), sp.data(), sp.size());
-    }
-    blocks_[0].bytes_free -= sp.size();
-  }
+  void WriteToContiguousBuffer(const base::StringPiece& sp);
 
   void NoMoreWriteToContiguousBuffer() {
     can_write_to_contiguous_buffer_ = false;
@@ -183,79 +147,20 @@ class BalsaBuffer {
   // the first block IFF the NoMoreWriteToContiguousBuffer function has
   // been called since the last Clear/Construction.
   base::StringPiece Write(const base::StringPiece& sp,
-                    Blocks::size_type* block_buffer_idx) {
-    if (sp.empty()) {
-      return sp;
-    }
-    char* storage = Reserve(sp.size(), block_buffer_idx);
-    memcpy(storage, sp.data(), sp.size());
-    return base::StringPiece(storage, sp.size());
-  }
+                          Blocks::size_type* block_buffer_idx);
 
   // Reserves "permanent" storage of the size indicated. Returns a pointer to
   // the beginning of that storage, and assigns the index of the block used to
   // block_buffer_idx. This function uses the first block IFF the
   // NoMoreWriteToContiguousBuffer function has been called since the last
   // Clear/Construction.
-  char* Reserve(size_t size,
-                Blocks::size_type* block_buffer_idx) {
-    // There should always be a 'first_block', even if it
-    // contains nothing.
-    DCHECK_GE(blocks_.size(), 1u);
-    BufferBlock* block = NULL;
-    Blocks::size_type block_idx = can_write_to_contiguous_buffer_ ? 1 : 0;
-    for (; block_idx < blocks_.size(); ++block_idx) {
-      if (blocks_[block_idx].bytes_free >= size) {
-        block = &blocks_[block_idx];
-        break;
-      }
-    }
-    if (block == NULL) {
-      if (blocksize_ < size) {
-        blocks_.push_back(AllocCustomBlock(size));
-      } else {
-        blocks_.push_back(AllocBlock());
-      }
-      block = &blocks_.back();
-    }
+  char* Reserve(size_t size, Blocks::size_type* block_buffer_idx);
 
-    char* storage = block->start_of_unused_bytes();
-    block->bytes_free -= size;
-    if (block_buffer_idx) {
-      *block_buffer_idx = block_idx;
-    }
-    return storage;
-  }
+  void Clear();
 
-  void Clear() {
-    CHECK(!blocks_.empty());
-    if (blocksize_ == blocks_[0].buffer_size) {
-      CleanupBlocksStartingFrom(1);
-      blocks_[0].bytes_free = blocks_[0].buffer_size;
-    } else {
-      CleanupBlocksStartingFrom(0);
-      blocks_.push_back(AllocBlock());
-    }
-    DCHECK_GE(blocks_.size(), 1u);
-    can_write_to_contiguous_buffer_ = true;
-  }
+  void Swap(BalsaBuffer* b);
 
-  void Swap(BalsaBuffer* b) {
-    blocks_.swap(b->blocks_);
-    std::swap(can_write_to_contiguous_buffer_,
-              b->can_write_to_contiguous_buffer_);
-    std::swap(blocksize_, b->blocksize_);
-  }
-
-  void CopyFrom(const BalsaBuffer& b) {
-    CleanupBlocksStartingFrom(0);
-    blocks_.resize(b.blocks_.size());
-    for (Blocks::size_type i = 0; i < blocks_.size(); ++i) {
-      blocks_[i] = CopyBlock(b.blocks_[i]);
-    }
-    blocksize_ = b.blocksize_;
-    can_write_to_contiguous_buffer_ = b.can_write_to_contiguous_buffer_;
-  }
+  void CopyFrom(const BalsaBuffer& b);
 
   const char* StartOfFirstBlock() const {
     return blocks_[0].buffer;
@@ -274,44 +179,20 @@ class BalsaBuffer {
   size_t bytes_used(size_t idx) const { return blocks_[idx].bytes_used(); }
 
  protected:
-  BalsaBuffer() :
-      blocksize_(kDefaultBlocksize), can_write_to_contiguous_buffer_(true) {
-    blocks_.push_back(AllocBlock());
-  }
+  BalsaBuffer();
 
-  explicit BalsaBuffer(size_t blocksize) :
-      blocksize_(blocksize), can_write_to_contiguous_buffer_(true) {
-    blocks_.push_back(AllocBlock());
-  }
+  explicit BalsaBuffer(size_t blocksize);
 
-  BufferBlock AllocBlock() {
-    return AllocCustomBlock(blocksize_);
-  }
+  BufferBlock AllocBlock();
 
-  BufferBlock AllocCustomBlock(size_t blocksize) {
-    return BufferBlock(new char[blocksize], blocksize, blocksize);
-  }
+  BufferBlock AllocCustomBlock(size_t blocksize);
 
-  BufferBlock CopyBlock(const BufferBlock& b) {
-    BufferBlock block = b;
-    if (b.buffer == NULL) {
-      return block;
-    }
-
-    block.buffer = new char[b.buffer_size];
-    memcpy(block.buffer, b.buffer, b.bytes_used());
-    return block;
-  }
+  BufferBlock CopyBlock(const BufferBlock& b);
 
   // Cleans up the object.
   // The block at start_idx, and all subsequent blocks
   // will be cleared and have associated memory deleted.
-  void CleanupBlocksStartingFrom(Blocks::size_type start_idx) {
-    for (Blocks::size_type i = start_idx; i < blocks_.size(); ++i) {
-      delete[] blocks_[i].buffer;
-    }
-    blocks_.resize(start_idx);
-  }
+  void CleanupBlocksStartingFrom(Blocks::size_type start_idx);
 
   // A container of BufferBlocks
   Blocks blocks_;
@@ -391,12 +272,12 @@ class BalsaHeaders {
   };
 
   typedef std::vector<base::StringPiece> HeaderTokenList;
-  friend bool net::ParseHTTPFirstLine(const char* begin,
-                                       const char* end,
-                                       bool is_request,
-                                       size_t max_request_uri_length,
-                                       BalsaHeaders* headers,
-                                       BalsaFrameEnums::ErrorCode* error_code);
+  friend bool ParseHTTPFirstLine(const char* begin,
+                                 const char* end,
+                                 bool is_request,
+                                 size_t max_request_uri_length,
+                                 BalsaHeaders* headers,
+                                 BalsaFrameEnums::ErrorCode* error_code);
 
  protected:
   typedef std::vector<HeaderLineDescription> HeaderLines;
@@ -470,10 +351,7 @@ class BalsaHeaders {
     // operator<< work for the classes it sees.  It would be better if there
     // was an additional traits-like system for the gUnit output... but oh
     // well.
-    friend std::ostream& operator<<(std::ostream& os, const iterator_base& it) {
-      os << "[" << it.headers_ << ", " << it.idx_ << "]";
-      return os;
-    }
+    std::ostream& operator<<(std::ostream& os) const;
 
    protected:
     iterator_base(const BalsaHeaders* headers, HeaderLines::size_type index) :
@@ -504,16 +382,14 @@ class BalsaHeaders {
       const HeaderLines::size_type original_idx = idx_;
       do {
         --idx_;
-      } while (idx_ >= 0 &&
-              idx_ < header_lines_size &&
-              header_lines[idx_].skip == true);
+      } while (idx_ < header_lines_size && header_lines[idx_].skip == true);
       // The condition below exists so that --(rbegin() + 1) == rbegin(), even
       // if there are only 'skip == true' elements between the rbegin() iterator
       // and the beginning of the vector of HeaderLineDescriptions.
       // TODO(fenix): refactor this list so that we don't have to do
       // linear scanning through skipped headers (and this condition is
       // then unnecessary)
-      if (idx_ < 0 || idx_ > header_lines_size) {
+      if (idx_ > header_lines_size) {
         idx_ = original_idx - 1;
       }
     }
@@ -700,21 +576,8 @@ class BalsaHeaders {
   // TODO(fenix): Revisit the amount of bytes initially allocated to the second
   // block of the balsa_buffer_. It may make sense to pre-allocate some amount
   // (roughly the amount we'd append in new headers such as X-User-Ip, etc.)
-  BalsaHeaders() :
-      balsa_buffer_(4096),
-      content_length_(0),
-      content_length_status_(BalsaHeadersEnums::NO_CONTENT_LENGTH),
-      parsed_response_code_(0),
-      firstline_buffer_base_idx_(0),
-      whitespace_1_idx_(0),
-      non_whitespace_1_idx_(0),
-      whitespace_2_idx_(0),
-      non_whitespace_2_idx_(0),
-      whitespace_3_idx_(0),
-      non_whitespace_3_idx_(0),
-      whitespace_4_idx_(0),
-      end_of_firstline_idx_(0),
-      transfer_encoding_is_chunked_(false) { }
+  BalsaHeaders();
+  ~BalsaHeaders();
 
   const_header_lines_iterator header_lines_begin() {
     return HeaderLinesBeginHelper<const_header_lines_iterator>();
@@ -953,7 +816,7 @@ class BalsaHeaders {
                                       const base::StringPiece& value) {
     // if the key is empty, we don't want to write the rest because it
     // will not be a well-formed header line.
-    if (key.size() > 0) {
+    if (!key.empty()) {
       buffer->Write(key.data(), key.size());
       buffer->Write(": ", 2);
       buffer->Write(value.data(), value.size());
@@ -1117,7 +980,7 @@ class BalsaHeaders {
 
  protected:
   friend class BalsaFrame;
-  friend class FlipFrame;
+  friend class SpdyFrame;
   friend class HTTPMessage;
   friend class BalsaHeadersTokenUtils;
 
@@ -1281,4 +1144,3 @@ class BalsaHeaders {
 }  // namespace net
 
 #endif  // NET_TOOLS_FLIP_SERVER_BALSA_HEADERS_H_
-

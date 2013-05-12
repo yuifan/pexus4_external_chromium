@@ -1,8 +1,12 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "base/at_exit.h"
+
+#include <stddef.h>
+#include <ostream>
+
 #include "base/logging.h"
 
 namespace base {
@@ -15,11 +19,6 @@ static AtExitManager* g_top_manager = NULL;
 
 AtExitManager::AtExitManager() : next_manager_(NULL) {
   DCHECK(!g_top_manager);
-  g_top_manager = this;
-}
-
-AtExitManager::AtExitManager(bool shadow) : next_manager_(g_top_manager) {
-  DCHECK(shadow || !g_top_manager);
   g_top_manager = this;
 }
 
@@ -62,6 +61,11 @@ void AtExitManager::ProcessCallbacksNow() {
 
     callback_and_param.func_(callback_and_param.param_);
   }
+}
+
+AtExitManager::AtExitManager(bool shadow) : next_manager_(g_top_manager) {
+  DCHECK(shadow || !g_top_manager);
+  g_top_manager = this;
 }
 
 }  // namespace base

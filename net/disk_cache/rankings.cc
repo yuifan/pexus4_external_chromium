@@ -1,16 +1,17 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "net/disk_cache/rankings.h"
 
-#include "base/histogram.h"
+#include "base/metrics/histogram.h"
 #include "net/disk_cache/backend_impl.h"
 #include "net/disk_cache/entry_impl.h"
 #include "net/disk_cache/errors.h"
 #include "net/disk_cache/histogram_macros.h"
 
 using base::Time;
+using base::TimeTicks;
 
 // This is used by crash_cache.exe to generate unit test files.
 disk_cache::RankCrashes g_rankings_crash = disk_cache::NO_CRASH;
@@ -64,16 +65,22 @@ enum CrashLocation {
   ON_REMOVE_3, ON_REMOVE_4, ON_REMOVE_5, ON_REMOVE_6, ON_REMOVE_7, ON_REMOVE_8
 };
 
+#ifndef NDEBUG
 void TerminateSelf() {
 #if defined(OS_WIN)
   // Windows does more work on _exit() than we would like, so we force exit.
   TerminateProcess(GetCurrentProcess(), 0);
 #elif defined(OS_POSIX)
+#if defined(ANDROID)
+  abort();
+#else
   // On POSIX, _exit() will terminate the process with minimal cleanup,
   // and it is cleaner than killing.
   _exit(0);
 #endif
+#endif
 }
+#endif  // NDEBUG
 
 // Generates a crash on debug builds, acording to the value of g_rankings_crash.
 // This used by crash_cache.exe to generate unit-test files.
@@ -171,9 +178,31 @@ void GenerateCrash(CrashLocation location) {
 #endif  // NDEBUG
 }
 
+// Update the timestamp fields of |node|.
+void UpdateTimes(disk_cache::CacheRankingsBlock* node, bool modified) {
+  base::Time now = base::Time::Now();
+  node->Data()->last_used = now.ToInternalValue();
+  if (modified)
+    node->Data()->last_modified = now.ToInternalValue();
+}
+
 }  // namespace
 
 namespace disk_cache {
+
+Rankings::Iterator::Iterator(Rankings* rankings) {
+  memset(this, 0, sizeof(Iterator));
+  my_rankings = rankings;
+}
+
+Rankings::Iterator::~Iterator() {
+  for (int i = 0; i < 3; i++)
+    ScopedRankingsBlock(my_rankings, nodes[i]);
+}
+
+Rankings::Rankings() : init_(false) {}
+
+Rankings::~Rankings() {}
 
 bool Rankings::Init(BackendImpl* backend, bool count_lists) {
   DCHECK(!init_);
@@ -203,60 +232,8 @@ void Rankings::Reset() {
   control_data_ = NULL;
 }
 
-bool Rankings::GetRanking(CacheRankingsBlock* rankings) {
-  if (!rankings->address().is_initialized())
-    return false;
-
-  Time start = Time::Now();
-  if (!rankings->Load())
-    return false;
-
-  if (!SanityCheck(rankings, true)) {
-    backend_->CriticalError(ERR_INVALID_LINKS);
-    return false;
-  }
-
-  backend_->OnEvent(Stats::OPEN_RANKINGS);
-
-  // "dummy" is the old "pointer" value, so it has to be 0.
-  if (!rankings->Data()->dirty && !rankings->Data()->dummy)
-    return true;
-
-  EntryImpl* entry = backend_->GetOpenEntry(rankings);
-  if (backend_->GetCurrentEntryId() != rankings->Data()->dirty || !entry) {
-    // We cannot trust this entry, but we cannot initiate a cleanup from this
-    // point (we may be in the middle of a cleanup already). Just get rid of
-    // the invalid pointer and continue; the entry will be deleted when detected
-    // from a regular open/create path.
-    rankings->Data()->dummy = 0;
-    rankings->Data()->dirty = backend_->GetCurrentEntryId() - 1;
-    if (!rankings->Data()->dirty)
-      rankings->Data()->dirty--;
-    return true;
-  }
-
-  // Note that we should not leave this module without deleting rankings first.
-  rankings->SetData(entry->rankings()->Data());
-
-  CACHE_UMA(AGE_MS, "GetRankings", 0, start);
-  return true;
-}
-
-void Rankings::ConvertToLongLived(CacheRankingsBlock* rankings) {
-  if (rankings->own_data())
-    return;
-
-  // We cannot return a shared node because we are not keeping a reference
-  // to the entry that owns the buffer. Make this node a copy of the one that
-  // we have, and let the iterator logic update it when the entry changes.
-  CacheRankingsBlock temp(NULL, Addr(0));
-  *temp.Data() = *rankings->Data();
-  rankings->StopSharingData();
-  *rankings->Data() = *temp.Data();
-}
-
 void Rankings::Insert(CacheRankingsBlock* node, bool modified, List list) {
-  Trace("Insert 0x%x", node->address().value());
+  Trace("Insert 0x%x l %d", node->address().value(), list);
   DCHECK(node->HasData());
   Addr& my_head = heads_[list];
   Addr& my_tail = tails_[list];
@@ -289,10 +266,7 @@ void Rankings::Insert(CacheRankingsBlock* node, bool modified, List list) {
     GenerateCrash(ON_INSERT_2);
   }
 
-  Time now = Time::Now();
-  node->Data()->last_used = now.ToInternalValue();
-  if (modified)
-    node->Data()->last_modified = now.ToInternalValue();
+  UpdateTimes(node, modified);
   node->Store();
   GenerateCrash(ON_INSERT_3);
 
@@ -328,16 +302,20 @@ void Rankings::Insert(CacheRankingsBlock* node, bool modified, List list) {
 //    2. a(x, r), r(a, r), head(x), tail(a)           WriteTail()
 //    3. a(x, a), r(a, r), head(x), tail(a)           prev.Store()
 //    4. a(x, a), r(0, 0), head(x), tail(a)           next.Store()
-void Rankings::Remove(CacheRankingsBlock* node, List list) {
-  Trace("Remove 0x%x (0x%x 0x%x)", node->address().value(), node->Data()->next,
-        node->Data()->prev);
+void Rankings::Remove(CacheRankingsBlock* node, List list, bool strict) {
+  Trace("Remove 0x%x (0x%x 0x%x) l %d", node->address().value(),
+        node->Data()->next, node->Data()->prev, list);
   DCHECK(node->HasData());
+  if (strict)
   InvalidateIterators(node);
+
   Addr next_addr(node->Data()->next);
   Addr prev_addr(node->Data()->prev);
   if (!next_addr.is_initialized() || next_addr.is_separate_file() ||
       !prev_addr.is_initialized() || prev_addr.is_separate_file()) {
-    LOG(WARNING) << "Invalid rankings info.";
+    if (next_addr.is_initialized() || prev_addr.is_initialized()) {
+      LOG(ERROR) << "Invalid rankings info.";
+    }
     return;
   }
 
@@ -346,7 +324,7 @@ void Rankings::Remove(CacheRankingsBlock* node, List list) {
   if (!GetRanking(&next) || !GetRanking(&prev))
     return;
 
-  if (!CheckLinks(node, &prev, &next, list))
+  if (!CheckLinks(node, &prev, &next, &list))
     return;
 
   Transaction lock(control_data_, node->address(), REMOVE, list);
@@ -406,10 +384,227 @@ void Rankings::Remove(CacheRankingsBlock* node, List list) {
 // but the net effect is just an assert on debug when attempting to remove the
 // entry. Otherwise we'll need reentrant transactions, which is an overkill.
 void Rankings::UpdateRank(CacheRankingsBlock* node, bool modified, List list) {
-  Time start = Time::Now();
-  Remove(node, list);
+  Addr& my_head = heads_[list];
+  if (my_head.value() == node->address().value()) {
+    UpdateTimes(node, modified);
+    node->set_modified();
+    return;
+  }
+
+  TimeTicks start = TimeTicks::Now();
+  Remove(node, list, true);
   Insert(node, modified, list);
   CACHE_UMA(AGE_MS, "UpdateRank", 0, start);
+}
+
+CacheRankingsBlock* Rankings::GetNext(CacheRankingsBlock* node, List list) {
+  ScopedRankingsBlock next(this);
+  if (!node) {
+    Addr& my_head = heads_[list];
+    if (!my_head.is_initialized())
+      return NULL;
+    next.reset(new CacheRankingsBlock(backend_->File(my_head), my_head));
+  } else {
+    if (!node->HasData())
+      node->Load();
+    Addr& my_tail = tails_[list];
+    if (!my_tail.is_initialized())
+      return NULL;
+    if (my_tail.value() == node->address().value())
+      return NULL;
+    Addr address(node->Data()->next);
+    if (address.value() == node->address().value())
+      return NULL;  // Another tail? fail it.
+    next.reset(new CacheRankingsBlock(backend_->File(address), address));
+  }
+
+  TrackRankingsBlock(next.get(), true);
+
+  if (!GetRanking(next.get()))
+    return NULL;
+
+  ConvertToLongLived(next.get());
+  if (node && !CheckSingleLink(node, next.get()))
+    return NULL;
+
+  return next.release();
+}
+
+CacheRankingsBlock* Rankings::GetPrev(CacheRankingsBlock* node, List list) {
+  ScopedRankingsBlock prev(this);
+  if (!node) {
+    Addr& my_tail = tails_[list];
+    if (!my_tail.is_initialized())
+      return NULL;
+    prev.reset(new CacheRankingsBlock(backend_->File(my_tail), my_tail));
+  } else {
+    if (!node->HasData())
+      node->Load();
+    Addr& my_head = heads_[list];
+    if (!my_head.is_initialized())
+      return NULL;
+    if (my_head.value() == node->address().value())
+      return NULL;
+    Addr address(node->Data()->prev);
+    if (address.value() == node->address().value())
+      return NULL;  // Another head? fail it.
+    prev.reset(new CacheRankingsBlock(backend_->File(address), address));
+  }
+
+  TrackRankingsBlock(prev.get(), true);
+
+  if (!GetRanking(prev.get()))
+    return NULL;
+
+  ConvertToLongLived(prev.get());
+  if (node && !CheckSingleLink(prev.get(), node))
+    return NULL;
+
+  return prev.release();
+}
+
+void Rankings::FreeRankingsBlock(CacheRankingsBlock* node) {
+  TrackRankingsBlock(node, false);
+}
+
+void Rankings::TrackRankingsBlock(CacheRankingsBlock* node,
+                                  bool start_tracking) {
+  if (!node)
+    return;
+
+  IteratorPair current(node->address().value(), node);
+
+  if (start_tracking)
+    iterators_.push_back(current);
+  else
+    iterators_.remove(current);
+}
+
+int Rankings::SelfCheck() {
+  int total = 0;
+  for (int i = 0; i < LAST_ELEMENT; i++) {
+    int partial = CheckList(static_cast<List>(i));
+    if (partial < 0)
+      return partial;
+    total += partial;
+  }
+  return total;
+}
+
+bool Rankings::SanityCheck(CacheRankingsBlock* node, bool from_list) const {
+  const RankingsNode* data = node->Data();
+
+  if ((!data->next && data->prev) || (data->next && !data->prev))
+    return false;
+
+  // Both pointers on zero is a node out of the list.
+  if (!data->next && !data->prev && from_list)
+    return false;
+
+  List list = NO_USE;  // Initialize it to something.
+  if ((node->address().value() == data->prev) && !IsHead(data->prev, &list))
+    return false;
+
+  if ((node->address().value() == data->next) && !IsTail(data->next, &list))
+    return false;
+
+  if (!data->next && !data->prev)
+    return true;
+
+  Addr next_addr(data->next);
+  Addr prev_addr(data->prev);
+  if (!next_addr.SanityCheck() || next_addr.file_type() != RANKINGS ||
+      !prev_addr.SanityCheck() || prev_addr.file_type() != RANKINGS)
+    return false;
+
+  return true;
+}
+
+bool Rankings::DataSanityCheck(CacheRankingsBlock* node, bool from_list) const {
+  const RankingsNode* data = node->Data();
+  if (!data->contents)
+    return false;
+
+  // It may have never been inserted.
+  if (from_list && (!data->last_used || !data->last_modified))
+    return false;
+
+  return true;
+}
+
+void Rankings::SetContents(CacheRankingsBlock* node, CacheAddr address) {
+  node->Data()->contents = address;
+  node->Store();
+}
+
+void Rankings::ReadHeads() {
+  for (int i = 0; i < LAST_ELEMENT; i++)
+    heads_[i] = Addr(control_data_->heads[i]);
+}
+
+void Rankings::ReadTails() {
+  for (int i = 0; i < LAST_ELEMENT; i++)
+    tails_[i] = Addr(control_data_->tails[i]);
+}
+
+void Rankings::WriteHead(List list) {
+  control_data_->heads[list] = heads_[list].value();
+}
+
+void Rankings::WriteTail(List list) {
+  control_data_->tails[list] = tails_[list].value();
+}
+
+bool Rankings::GetRanking(CacheRankingsBlock* rankings) {
+  if (!rankings->address().is_initialized())
+    return false;
+
+  TimeTicks start = TimeTicks::Now();
+  if (!rankings->Load())
+    return false;
+
+  if (!SanityCheck(rankings, true)) {
+    backend_->CriticalError(ERR_INVALID_LINKS);
+    return false;
+  }
+
+  backend_->OnEvent(Stats::OPEN_RANKINGS);
+
+  // "dummy" is the old "pointer" value, so it has to be 0.
+  if (!rankings->Data()->dirty && !rankings->Data()->dummy)
+    return true;
+
+  EntryImpl* entry = backend_->GetOpenEntry(rankings);
+  if (!entry) {
+    // We cannot trust this entry, but we cannot initiate a cleanup from this
+    // point (we may be in the middle of a cleanup already). Just get rid of
+    // the invalid pointer and continue; the entry will be deleted when detected
+    // from a regular open/create path.
+    rankings->Data()->dummy = 0;
+    rankings->Data()->dirty = backend_->GetCurrentEntryId() - 1;
+    if (!rankings->Data()->dirty)
+      rankings->Data()->dirty--;
+    return true;
+  }
+
+  // Note that we should not leave this module without deleting rankings first.
+  rankings->SetData(entry->rankings()->Data());
+
+  CACHE_UMA(AGE_MS, "GetRankings", 0, start);
+  return true;
+}
+
+void Rankings::ConvertToLongLived(CacheRankingsBlock* rankings) {
+  if (rankings->own_data())
+    return;
+
+  // We cannot return a shared node because we are not keeping a reference
+  // to the entry that owns the buffer. Make this node a copy of the one that
+  // we have, and let the iterator logic update it when the entry changes.
+  CacheRankingsBlock temp(NULL, Addr(0));
+  *temp.Data() = *rankings->Data();
+  rankings->StopSharingData();
+  *rankings->Data() = *temp.Data();
 }
 
 void Rankings::CompleteTransaction() {
@@ -522,143 +717,6 @@ void Rankings::RevertRemove(CacheRankingsBlock* node) {
   control_data_->operation = 0;
 }
 
-CacheRankingsBlock* Rankings::GetNext(CacheRankingsBlock* node, List list) {
-  ScopedRankingsBlock next(this);
-  if (!node) {
-    Addr& my_head = heads_[list];
-    if (!my_head.is_initialized())
-      return NULL;
-    next.reset(new CacheRankingsBlock(backend_->File(my_head), my_head));
-  } else {
-    if (!node->HasData())
-      node->Load();
-    Addr& my_tail = tails_[list];
-    if (!my_tail.is_initialized())
-      return NULL;
-    if (my_tail.value() == node->address().value())
-      return NULL;
-    Addr address(node->Data()->next);
-    if (address.value() == node->address().value())
-      return NULL;  // Another tail? fail it.
-    next.reset(new CacheRankingsBlock(backend_->File(address), address));
-  }
-
-  TrackRankingsBlock(next.get(), true);
-
-  if (!GetRanking(next.get()))
-    return NULL;
-
-  ConvertToLongLived(next.get());
-  if (node && !CheckSingleLink(node, next.get()))
-    return NULL;
-
-  return next.release();
-}
-
-CacheRankingsBlock* Rankings::GetPrev(CacheRankingsBlock* node, List list) {
-  ScopedRankingsBlock prev(this);
-  if (!node) {
-    Addr& my_tail = tails_[list];
-    if (!my_tail.is_initialized())
-      return NULL;
-    prev.reset(new CacheRankingsBlock(backend_->File(my_tail), my_tail));
-  } else {
-    if (!node->HasData())
-      node->Load();
-    Addr& my_head = heads_[list];
-    if (!my_head.is_initialized())
-      return NULL;
-    if (my_head.value() == node->address().value())
-      return NULL;
-    Addr address(node->Data()->prev);
-    if (address.value() == node->address().value())
-      return NULL;  // Another head? fail it.
-    prev.reset(new CacheRankingsBlock(backend_->File(address), address));
-  }
-
-  TrackRankingsBlock(prev.get(), true);
-
-  if (!GetRanking(prev.get()))
-    return NULL;
-
-  ConvertToLongLived(prev.get());
-  if (node && !CheckSingleLink(prev.get(), node))
-    return NULL;
-
-  return prev.release();
-}
-
-void Rankings::FreeRankingsBlock(CacheRankingsBlock* node) {
-  TrackRankingsBlock(node, false);
-}
-
-void Rankings::TrackRankingsBlock(CacheRankingsBlock* node,
-                                  bool start_tracking) {
-  if (!node)
-    return;
-
-  IteratorPair current(node->address().value(), node);
-
-  if (start_tracking)
-    iterators_.push_back(current);
-  else
-    iterators_.remove(current);
-}
-
-int Rankings::SelfCheck() {
-  int total = 0;
-  for (int i = 0; i < LAST_ELEMENT; i++) {
-    int partial = CheckList(static_cast<List>(i));
-    if (partial < 0)
-      return partial;
-    total += partial;
-  }
-  return total;
-}
-
-bool Rankings::SanityCheck(CacheRankingsBlock* node, bool from_list) {
-  const RankingsNode* data = node->Data();
-  if (!data->contents)
-    return false;
-
-  // It may have never been inserted.
-  if (from_list && (!data->last_used || !data->last_modified))
-    return false;
-
-  if ((!data->next && data->prev) || (data->next && !data->prev))
-    return false;
-
-  // Both pointers on zero is a node out of the list.
-  if (!data->next && !data->prev && from_list)
-    return false;
-
-  if ((node->address().value() == data->prev) && !IsHead(data->prev))
-    return false;
-
-  if ((node->address().value() == data->next) && !IsTail(data->next))
-    return false;
-
-  return true;
-}
-
-void Rankings::ReadHeads() {
-  for (int i = 0; i < LAST_ELEMENT; i++)
-    heads_[i] = Addr(control_data_->heads[i]);
-}
-
-void Rankings::ReadTails() {
-  for (int i = 0; i < LAST_ELEMENT; i++)
-    tails_[i] = Addr(control_data_->tails[i]);
-}
-
-void Rankings::WriteHead(List list) {
-  control_data_->heads[list] = heads_[list].value();
-}
-
-void Rankings::WriteTail(List list) {
-  control_data_->tails[list] = tails_[list].value();
-}
-
 bool Rankings::CheckEntry(CacheRankingsBlock* rankings) {
   if (!rankings->Data()->dummy)
     return true;
@@ -668,26 +726,42 @@ bool Rankings::CheckEntry(CacheRankingsBlock* rankings) {
 }
 
 bool Rankings::CheckLinks(CacheRankingsBlock* node, CacheRankingsBlock* prev,
-                          CacheRankingsBlock* next, List list) {
-  if ((prev->Data()->next != node->address().value() &&
-       heads_[list].value() != node->address().value()) ||
-      (next->Data()->prev != node->address().value() &&
-       tails_[list].value() != node->address().value())) {
-    LOG(ERROR) << "Inconsistent LRU.";
+                          CacheRankingsBlock* next, List* list) {
+  CacheAddr node_addr = node->address().value();
+  if (prev->Data()->next == node_addr &&
+      next->Data()->prev == node_addr) {
+    // A regular linked node.
+    return true;
+  }
 
-    if (prev->Data()->next == next->address().value() &&
-        next->Data()->prev == prev->address().value()) {
-      // The list is actually ok, node is wrong.
-      node->Data()->next = 0;
-      node->Data()->prev = 0;
-      node->Store();
-      return false;
-    }
-    backend_->CriticalError(ERR_INVALID_LINKS);
+  Trace("CheckLinks 0x%x (0x%x 0x%x)", node_addr,
+        prev->Data()->next, next->Data()->prev);
+
+  if (node_addr != prev->address().value() &&
+      node_addr != next->address().value() &&
+      prev->Data()->next == next->address().value() &&
+      next->Data()->prev == prev->address().value()) {
+    // The list is actually ok, node is wrong.
+    Trace("node 0x%x out of list %d", node_addr, list);
+    node->Data()->next = 0;
+    node->Data()->prev = 0;
+    node->Store();
     return false;
   }
 
-  return true;
+  if (prev->Data()->next == node_addr ||
+      next->Data()->prev == node_addr) {
+    // Only one link is weird, lets double check.
+    if (prev->Data()->next != node_addr && IsHead(node_addr, list))
+      return true;
+
+    if (next->Data()->prev != node_addr && IsTail(node_addr, list))
+      return true;
+  }
+
+  LOG(ERROR) << "Inconsistent LRU.";
+  backend_->CriticalError(ERR_INVALID_LINKS);
+  return false;
 }
 
 bool Rankings::CheckSingleLink(CacheRankingsBlock* prev,
@@ -744,17 +818,27 @@ int Rankings::CheckList(List list) {
   return num_items;
 }
 
-bool Rankings::IsHead(CacheAddr addr) {
-  for (int i = 0; i < LAST_ELEMENT; i++)
-    if (addr == heads_[i].value())
+bool Rankings::IsHead(CacheAddr addr, List* list) const {
+  for (int i = 0; i < LAST_ELEMENT; i++) {
+    if (addr == heads_[i].value()) {
+      if (*list != i)
+        Trace("Changing list %d to %d", *list, i);
+      *list = static_cast<List>(i);
       return true;
+    }
+  }
   return false;
 }
 
-bool Rankings::IsTail(CacheAddr addr) {
-  for (int i = 0; i < LAST_ELEMENT; i++)
-    if (addr == tails_[i].value())
+bool Rankings::IsTail(CacheAddr addr, List* list) const {
+  for (int i = 0; i < LAST_ELEMENT; i++) {
+    if (addr == tails_[i].value()) {
+      if (*list != i)
+        Trace("Changing list %d to %d", *list, i);
+      *list = static_cast<List>(i);
       return true;
+    }
+  }
   return false;
 }
 
@@ -777,7 +861,11 @@ void Rankings::InvalidateIterators(CacheRankingsBlock* node) {
   for (IteratorList::iterator it = iterators_.begin(); it != iterators_.end();
        ++it) {
     if (it->first == address) {
+#ifndef ANDROID
+// Confirmed with chromium developers that this is normal, and removing from
+// Android to close bug 3239659
       LOG(WARNING) << "Invalidating iterator at 0x" << std::hex << address;
+#endif
       it->second->Discard();
     }
   }

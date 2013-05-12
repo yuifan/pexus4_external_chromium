@@ -8,9 +8,8 @@
 // generate a perfect hash map.  The benefit of this approach is that no time is
 // spent on program initialization to generate the map of this data.
 //
-// After running this program, "effective_tld_names.gperf" is generated.  Run
-// gperf using the following command line:
-//   gperf -a -L "C++" -C -c -o -t -k '*' -NFindDomain -D -m 5 effective_tld_names.gperf > effective_tld_names.c
+// Running this program finds "effective_tld_names.cc" in the expected location
+// in the source checkout and generates "effective_tld_names.gperf" next to it.
 //
 // Any errors or warnings from this program are recorded in tld_cleanup.log.
 //
@@ -28,6 +27,7 @@
 #include <string>
 
 #include "base/at_exit.h"
+#include "base/command_line.h"
 #include "base/file_util.h"
 #include "base/i18n/icu_util.h"
 #include "base/logging.h"
@@ -106,13 +106,13 @@ NormalizeResult NormalizeRule(std::string* domain, Rule* rule) {
   // Strip single leading and trailing dots.
   if (domain->at(0) == '.')
     domain->erase(0, 1);
-  if (domain->size() == 0) {
+  if (domain->empty()) {
     LOG(WARNING) << "Ignoring empty rule";
     return kWarning;
   }
   if (domain->at(domain->size() - 1) == '.')
     domain->erase(domain->size() - 1, 1);
-  if (domain->size() == 0) {
+  if (domain->empty()) {
     LOG(WARNING) << "Ignoring empty rule";
     return kWarning;
   }
@@ -126,7 +126,7 @@ NormalizeResult NormalizeRule(std::string* domain, Rule* rule) {
     domain->erase(0, 2);
     rule->wildcard = true;
   }
-  if (domain->size() == 0) {
+  if (domain->empty()) {
     LOG(WARNING) << "Ignoring empty rule";
     return kWarning;
   }
@@ -266,10 +266,12 @@ int main(int argc, const char* argv[]) {
   FilePath log_filename;
   PathService::Get(base::DIR_EXE, &log_filename);
   log_filename = log_filename.AppendASCII("tld_cleanup.log");
-  logging::InitLogging(log_filename.value().c_str(),
-                       destination,
-                       logging::LOCK_LOG_FILE,
-                       logging::DELETE_OLD_LOG_FILE);
+  logging::InitLogging(
+      log_filename.value().c_str(),
+      destination,
+      logging::LOCK_LOG_FILE,
+      logging::DELETE_OLD_LOG_FILE,
+      logging::DISABLE_DCHECK_FOR_NON_OFFICIAL_RELEASE_BUILDS);
 
   icu_util::Initialize();
 

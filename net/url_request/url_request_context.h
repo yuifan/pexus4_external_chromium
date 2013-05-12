@@ -1,4 +1,4 @@
-// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -9,96 +9,169 @@
 
 #ifndef NET_URL_REQUEST_URL_REQUEST_CONTEXT_H_
 #define NET_URL_REQUEST_URL_REQUEST_CONTEXT_H_
+#pragma once
 
-#include "base/ref_counted.h"
-#include "base/string_util.h"
-#include "net/base/cookie_store.h"
-#include "net/base/host_resolver.h"
+#include "base/memory/ref_counted.h"
+#include "base/threading/non_thread_safe.h"
+#include "net/base/net_export.h"
+#include "net/base/net_log.h"
 #include "net/base/ssl_config_service.h"
 #include "net/base/transport_security_state.h"
 #include "net/ftp/ftp_auth_cache.h"
 #include "net/proxy/proxy_service.h"
-#include "net/url_request/request_tracker.h"
+#include "net/socket/dns_cert_provenance_checker.h"
 
 namespace net {
+class CertVerifier;
 class CookiePolicy;
+class CookieStore;
+class DnsCertProvenanceChecker;
+class DnsRRResolver;
 class FtpTransactionFactory;
+class HostResolver;
+class HttpAuthHandlerFactory;
 class HttpTransactionFactory;
-class SocketStream;
-}
+class NetworkDelegate;
+class SSLConfigService;
 class URLRequest;
 
-// Subclass to provide application-specific context for URLRequest instances.
-class URLRequestContext :
-    public base::RefCountedThreadSafe<URLRequestContext> {
+// Subclass to provide application-specific context for URLRequest
+// instances. Note that URLRequestContext typically does not provide storage for
+// these member variables, since they may be shared. For the ones that aren't
+// shared, URLRequestContextStorage can be helpful in defining their storage.
+class NET_EXPORT URLRequestContext
+    : public base::RefCountedThreadSafe<URLRequestContext>,
+      public base::NonThreadSafe {
  public:
-  URLRequestContext()
-      : http_transaction_factory_(NULL),
-        ftp_transaction_factory_(NULL),
-        cookie_policy_(NULL),
-        transport_security_state_(NULL) {
+  URLRequestContext();
+
+  // Copies the state from |other| into this context.
+  void CopyFrom(URLRequestContext* other);
+
+  NetLog* net_log() const {
+    return net_log_;
   }
 
-  net::HostResolver* host_resolver() const {
+  void set_net_log(NetLog* net_log) {
+    net_log_ = net_log;
+  }
+
+  HostResolver* host_resolver() const {
     return host_resolver_;
   }
 
+  void set_host_resolver(HostResolver* host_resolver) {
+    host_resolver_ = host_resolver;
+  }
+
+  CertVerifier* cert_verifier() const {
+    return cert_verifier_;
+  }
+
+  void set_cert_verifier(CertVerifier* cert_verifier) {
+    cert_verifier_ = cert_verifier;
+  }
+
+  DnsRRResolver* dnsrr_resolver() const {
+    return dnsrr_resolver_;
+  }
+
+  void set_dnsrr_resolver(DnsRRResolver* dnsrr_resolver) {
+    dnsrr_resolver_ = dnsrr_resolver;
+  }
+
+  DnsCertProvenanceChecker* dns_cert_checker() const {
+    return dns_cert_checker_;
+  }
+  void set_dns_cert_checker(DnsCertProvenanceChecker* dns_cert_checker) {
+    dns_cert_checker_ = dns_cert_checker;
+  }
+
   // Get the proxy service for this context.
-  net::ProxyService* proxy_service() const {
-    return proxy_service_;
+  ProxyService* proxy_service() const { return proxy_service_; }
+  void set_proxy_service(ProxyService* proxy_service) {
+    proxy_service_ = proxy_service;
   }
 
   // Get the ssl config service for this context.
-  net::SSLConfigService* ssl_config_service() const {
-    return ssl_config_service_;
+  SSLConfigService* ssl_config_service() const { return ssl_config_service_; }
+  void set_ssl_config_service(SSLConfigService* service) {
+    ssl_config_service_ = service;
+  }
+
+  // Gets the HTTP Authentication Handler Factory for this context.
+  // The factory is only valid for the lifetime of this URLRequestContext
+  HttpAuthHandlerFactory* http_auth_handler_factory() {
+    return http_auth_handler_factory_;
+  }
+  void set_http_auth_handler_factory(HttpAuthHandlerFactory* factory) {
+    http_auth_handler_factory_ = factory;
   }
 
   // Gets the http transaction factory for this context.
-  net::HttpTransactionFactory* http_transaction_factory() const {
+  HttpTransactionFactory* http_transaction_factory() const {
     return http_transaction_factory_;
+  }
+  void set_http_transaction_factory(HttpTransactionFactory* factory) {
+    http_transaction_factory_ = factory;
   }
 
   // Gets the ftp transaction factory for this context.
-  net::FtpTransactionFactory* ftp_transaction_factory() {
+  FtpTransactionFactory* ftp_transaction_factory() {
     return ftp_transaction_factory_;
   }
+  void set_ftp_transaction_factory(FtpTransactionFactory* factory) {
+    ftp_transaction_factory_ = factory;
+  }
+
+  void set_network_delegate(NetworkDelegate* network_delegate) {
+    network_delegate_ = network_delegate;
+  }
+  NetworkDelegate* network_delegate() const { return network_delegate_; }
 
   // Gets the cookie store for this context (may be null, in which case
   // cookies are not stored).
-  net::CookieStore* cookie_store() { return cookie_store_.get(); }
+  CookieStore* cookie_store() const { return cookie_store_.get(); }
+  void set_cookie_store(CookieStore* cookie_store);
 
   // Gets the cookie policy for this context (may be null, in which case
   // cookies are allowed).
-  net::CookiePolicy* cookie_policy() { return cookie_policy_; }
+  CookiePolicy* cookie_policy() const { return cookie_policy_; }
+  void set_cookie_policy(CookiePolicy* cookie_policy) {
+    cookie_policy_ = cookie_policy;
+  }
 
-  net::TransportSecurityState* transport_security_state() {
-      return transport_security_state_; }
+  TransportSecurityState* transport_security_state() const {
+      return transport_security_state_;
+  }
+  void set_transport_security_state(
+      TransportSecurityState* state) {
+    transport_security_state_ = state;
+  }
 
   // Gets the FTP authentication cache for this context.
-  net::FtpAuthCache* ftp_auth_cache() { return &ftp_auth_cache_; }
+  FtpAuthCache* ftp_auth_cache() { return &ftp_auth_cache_; }
 
   // Gets the value of 'Accept-Charset' header field.
   const std::string& accept_charset() const { return accept_charset_; }
-
-  // Gets the value of 'Accept-Language' header field.
-  const std::string& accept_language() const { return accept_language_; }
-
-  // Gets the tracker for URLRequests associated with this context.
-  RequestTracker<URLRequest>* url_request_tracker() {
-    return &url_request_tracker_;
+  void set_accept_charset(const std::string& accept_charset) {
+    accept_charset_ = accept_charset;
   }
 
-  // Gets the tracker for SocketStreams associated with this context.
-  RequestTracker<net::SocketStream>* socket_stream_tracker() {
-    return &socket_stream_tracker_;
+  // Gets the value of 'Accept-Language' header field.
+#ifdef ANDROID
+  virtual
+#endif
+  const std::string& accept_language() const { return accept_language_; }
+
+  void set_accept_language(const std::string& accept_language) {
+    accept_language_ = accept_language;
   }
 
   // Gets the UA string to use for the given URL.  Pass an invalid URL (such as
   // GURL()) to get the default UA string.  Subclasses should override this
   // method to provide a UA string.
-  virtual const std::string& GetUserAgent(const GURL& url) const {
-    return EmptyString();
-  }
+  virtual const std::string& GetUserAgent(const GURL& url) const;
 
   // In general, referrer_charset is not known when URLRequestContext is
   // constructed. So, we need a setter.
@@ -107,36 +180,49 @@ class URLRequestContext :
     referrer_charset_ = charset;
   }
 
-  // Called before adding cookies to requests. Returns true if cookie can
-  // be added to the request. The cookie might still be modified though.
-  virtual bool InterceptRequestCookies(const URLRequest* request,
-                                       const std::string& cookies) const {
-    return true;
-  }
+  // Controls whether or not the URLRequestContext considers itself to be the
+  // "main" URLRequestContext.
+  bool is_main() const { return is_main_; }
+  void set_is_main(bool is_main) { is_main_ = is_main; }
 
-  // Called before adding cookies from respones to the cookie monster. Returns
-  // true if the cookie can be added. The cookie might still be modified though.
-  virtual bool InterceptResponseCookie(const URLRequest* request,
-                                       const std::string& cookie) const {
-    return true;
-  }
+  // Is SNI available in this request context?
+  bool IsSNIAvailable() const;
+
+#ifdef ANDROID
+  // Gets the UID of the calling process
+  bool getUID(uid_t *uid) const;
+  void setUID(uid_t uid);
+#endif
 
  protected:
   friend class base::RefCountedThreadSafe<URLRequestContext>;
 
-  virtual ~URLRequestContext() {}
+  virtual ~URLRequestContext();
 
-  // The following members are expected to be initialized and owned by
-  // subclasses.
-  scoped_refptr<net::HostResolver> host_resolver_;
-  scoped_refptr<net::ProxyService> proxy_service_;
-  scoped_refptr<net::SSLConfigService> ssl_config_service_;
-  net::HttpTransactionFactory* http_transaction_factory_;
-  net::FtpTransactionFactory* ftp_transaction_factory_;
-  scoped_refptr<net::CookieStore> cookie_store_;
-  net::CookiePolicy* cookie_policy_;
-  scoped_refptr<net::TransportSecurityState> transport_security_state_;
-  net::FtpAuthCache ftp_auth_cache_;
+ private:
+  // ---------------------------------------------------------------------------
+  // Important: When adding any new members below, consider whether they need to
+  // be added to CopyFrom.
+  // ---------------------------------------------------------------------------
+
+  // Indicates whether or not this is the main URLRequestContext.
+  bool is_main_;
+
+  // Ownership for these members are not defined here. Clients should either
+  // provide storage elsewhere or have a subclass take ownership.
+  NetLog* net_log_;
+  HostResolver* host_resolver_;
+  CertVerifier* cert_verifier_;
+  DnsRRResolver* dnsrr_resolver_;
+  DnsCertProvenanceChecker* dns_cert_checker_;
+  HttpAuthHandlerFactory* http_auth_handler_factory_;
+  scoped_refptr<ProxyService> proxy_service_;
+  scoped_refptr<SSLConfigService> ssl_config_service_;
+  NetworkDelegate* network_delegate_;
+  scoped_refptr<CookieStore> cookie_store_;
+  CookiePolicy* cookie_policy_;
+  scoped_refptr<TransportSecurityState> transport_security_state_;
+  FtpAuthCache ftp_auth_cache_;
   std::string accept_language_;
   std::string accept_charset_;
   // The charset of the referrer where this request comes from. It's not
@@ -144,14 +230,22 @@ class URLRequestContext :
   // filename for file download.
   std::string referrer_charset_;
 
-  // Tracks the requests associated with this context.
-  RequestTracker<URLRequest> url_request_tracker_;
+  HttpTransactionFactory* http_transaction_factory_;
+  FtpTransactionFactory* ftp_transaction_factory_;
 
-  // Trakcs the socket streams associated with this context.
-  RequestTracker<net::SocketStream> socket_stream_tracker_;
+  // ---------------------------------------------------------------------------
+  // Important: When adding any new members below, consider whether they need to
+  // be added to CopyFrom.
+  // ---------------------------------------------------------------------------
 
- private:
+#ifdef ANDROID
+  bool valid_uid_;
+  uid_t calling_uid_;
+#endif
+
   DISALLOW_COPY_AND_ASSIGN(URLRequestContext);
 };
+
+}  // namespace net
 
 #endif  // NET_URL_REQUEST_URL_REQUEST_CONTEXT_H_

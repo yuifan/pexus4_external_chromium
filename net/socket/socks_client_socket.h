@@ -1,26 +1,29 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_SOCKET_SOCKS_CLIENT_SOCKET_H_
 #define NET_SOCKET_SOCKS_CLIENT_SOCKET_H_
+#pragma once
 
 #include <string>
 
-#include "base/logging.h"
-#include "base/ref_counted.h"
-#include "base/scoped_ptr.h"
+#include "base/basictypes.h"
+#include "base/gtest_prod_util.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/scoped_ptr.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/address_list.h"
 #include "net/base/completion_callback.h"
 #include "net/base/host_resolver.h"
 #include "net/base/net_errors.h"
+#include "net/base/net_log.h"
 #include "net/socket/client_socket.h"
-#include "testing/gtest/include/gtest/gtest_prod.h"
 
 namespace net {
 
-class LoadLog;
+class ClientSocketHandle;
+class BoundNetLog;
 
 // The SOCKS client socket implementation
 class SOCKSClientSocket : public ClientSocket {
@@ -30,6 +33,11 @@ class SOCKSClientSocket : public ClientSocket {
   //
   // |req_info| contains the hostname and port to which the socket above will
   // communicate to via the socks layer. For testing the referrer is optional.
+  SOCKSClientSocket(ClientSocketHandle* transport_socket,
+                    const HostResolver::RequestInfo& req_info,
+                    HostResolver* host_resolver);
+
+  // Deprecated constructor (http://crbug.com/37810) that takes a ClientSocket.
   SOCKSClientSocket(ClientSocket* transport_socket,
                     const HostResolver::RequestInfo& req_info,
                     HostResolver* host_resolver);
@@ -40,10 +48,21 @@ class SOCKSClientSocket : public ClientSocket {
   // ClientSocket methods:
 
   // Does the SOCKS handshake and completes the protocol.
-  virtual int Connect(CompletionCallback* callback, LoadLog* load_log);
+  virtual int Connect(CompletionCallback* callback
+#ifdef ANDROID
+                      , bool wait_for_connect
+                      , bool valid_uid
+                      , uid_t calling_uid
+#endif
+                     );
   virtual void Disconnect();
   virtual bool IsConnected() const;
   virtual bool IsConnectedAndIdle() const;
+  virtual const BoundNetLog& NetLog() const;
+  virtual void SetSubresourceSpeculation();
+  virtual void SetOmniboxSpeculation();
+  virtual bool WasEverUsed() const;
+  virtual bool UsingTCPFastOpen() const;
 
   // Socket methods:
   virtual int Read(IOBuffer* buf, int buf_len, CompletionCallback* callback);
@@ -52,12 +71,13 @@ class SOCKSClientSocket : public ClientSocket {
   virtual bool SetReceiveBufferSize(int32 size);
   virtual bool SetSendBufferSize(int32 size);
 
-  virtual int GetPeerName(struct sockaddr* name, socklen_t* namelen);
+  virtual int GetPeerAddress(AddressList* address) const;
+  virtual int GetLocalAddress(IPEndPoint* address) const;
 
  private:
-  FRIEND_TEST(SOCKSClientSocketTest, CompleteHandshake);
-  FRIEND_TEST(SOCKSClientSocketTest, SOCKS4AFailedDNS);
-  FRIEND_TEST(SOCKSClientSocketTest, SOCKS4AIfDomainInIPv6);
+  FRIEND_TEST_ALL_PREFIXES(SOCKSClientSocketTest, CompleteHandshake);
+  FRIEND_TEST_ALL_PREFIXES(SOCKSClientSocketTest, SOCKS4AFailedDNS);
+  FRIEND_TEST_ALL_PREFIXES(SOCKSClientSocketTest, SOCKS4AIfDomainInIPv6);
 
   enum State {
     STATE_RESOLVE_HOST,
@@ -67,16 +87,6 @@ class SOCKSClientSocket : public ClientSocket {
     STATE_HANDSHAKE_READ,
     STATE_HANDSHAKE_READ_COMPLETE,
     STATE_NONE,
-  };
-
-  // The SOCKS proxy connection either has the hostname resolved via the
-  // client or via the server. This enum stores the state of the SOCKS
-  // connection. If the client can resolve the hostname, the connection is
-  // SOCKS4, otherwise it is SOCKS4A.
-  enum SocksVersion {
-    kSOCKS4Unresolved,
-    kSOCKS4,
-    kSOCKS4a,
   };
 
   void DoCallback(int result);
@@ -95,10 +105,9 @@ class SOCKSClientSocket : public ClientSocket {
   CompletionCallbackImpl<SOCKSClientSocket> io_callback_;
 
   // Stores the underlying socket.
-  scoped_ptr<ClientSocket> transport_;
+  scoped_ptr<ClientSocketHandle> transport_;
 
   State next_state_;
-  SocksVersion socks_version_;
 
   // Stores the callback to the layer above, called on completing Connect().
   CompletionCallback* user_callback_;
@@ -125,7 +134,7 @@ class SOCKSClientSocket : public ClientSocket {
   AddressList addresses_;
   HostResolver::RequestInfo host_request_info_;
 
-  scoped_refptr<LoadLog> load_log_;
+  BoundNetLog net_log_;
 
   DISALLOW_COPY_AND_ASSIGN(SOCKSClientSocket);
 };

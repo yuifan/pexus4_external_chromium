@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,7 +6,8 @@
 
 #include "base/float_util.h"
 #include "base/logging.h"
-#include "base/scoped_ptr.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/string_number_conversions.h"
 #include "base/string_util.h"
 #include "base/utf_string_conversions.h"
 #include "base/values.h"
@@ -18,18 +19,6 @@ static const JSONReader::Token kInvalidToken(JSONReader::Token::INVALID_TOKEN,
 static const int kStackLimit = 100;
 
 namespace {
-
-inline int HexToInt(wchar_t c) {
-  if ('0' <= c && c <= '9') {
-    return c - '0';
-  } else if ('A' <= c && c <= 'F') {
-    return c - 'A' + 10;
-  } else if ('a' <= c && c <= 'f') {
-    return c - 'a' + 10;
-  }
-  NOTREACHED();
-  return 0;
-}
 
 // A helper method for ParseNumberToken.  It reads an int from the end of
 // token.  The method returns false if there is no valid integer at the end of
@@ -92,43 +81,72 @@ const char* JSONReader::kUnsupportedEncoding =
 const char* JSONReader::kUnquotedDictionaryKey =
     "Dictionary keys must be quoted.";
 
+JSONReader::JSONReader()
+    : start_pos_(NULL), json_pos_(NULL), stack_depth_(0),
+      allow_trailing_comma_(false),
+      error_code_(JSON_NO_ERROR), error_line_(0), error_col_(0) {}
+
 /* static */
 Value* JSONReader::Read(const std::string& json,
                         bool allow_trailing_comma) {
-  return ReadAndReturnError(json, allow_trailing_comma, NULL);
+  return ReadAndReturnError(json, allow_trailing_comma, NULL, NULL);
 }
 
 /* static */
 Value* JSONReader::ReadAndReturnError(const std::string& json,
                                       bool allow_trailing_comma,
-                                      std::string *error_message_out) {
+                                      int* error_code_out,
+                                      std::string* error_msg_out) {
   JSONReader reader = JSONReader();
   Value* root = reader.JsonToValue(json, true, allow_trailing_comma);
   if (root)
     return root;
 
-  if (error_message_out)
-    *error_message_out = reader.error_message();
+  if (error_code_out)
+    *error_code_out = reader.error_code();
+  if (error_msg_out)
+    *error_msg_out = reader.GetErrorMessage();
 
   return NULL;
 }
 
 /* static */
-std::string JSONReader::FormatErrorMessage(int line, int column,
-                                           const char* description) {
-  return StringPrintf("Line: %i, column: %i, %s",
-                      line, column, description);
+std::string JSONReader::ErrorCodeToString(JsonParseError error_code) {
+  switch (error_code) {
+    case JSON_NO_ERROR:
+      return std::string();
+    case JSON_BAD_ROOT_ELEMENT_TYPE:
+      return kBadRootElementType;
+    case JSON_INVALID_ESCAPE:
+      return kInvalidEscape;
+    case JSON_SYNTAX_ERROR:
+      return kSyntaxError;
+    case JSON_TRAILING_COMMA:
+      return kTrailingComma;
+    case JSON_TOO_MUCH_NESTING:
+      return kTooMuchNesting;
+    case JSON_UNEXPECTED_DATA_AFTER_ROOT:
+      return kUnexpectedDataAfterRoot;
+    case JSON_UNSUPPORTED_ENCODING:
+      return kUnsupportedEncoding;
+    case JSON_UNQUOTED_DICTIONARY_KEY:
+      return kUnquotedDictionaryKey;
+    default:
+      NOTREACHED();
+      return std::string();
+  }
 }
 
-JSONReader::JSONReader()
-    : start_pos_(NULL), json_pos_(NULL), stack_depth_(0),
-      allow_trailing_comma_(false) {}
+std::string JSONReader::GetErrorMessage() const {
+  return FormatErrorMessage(error_line_, error_col_,
+                            ErrorCodeToString(error_code_));
+}
 
 Value* JSONReader::JsonToValue(const std::string& json, bool check_root,
                                bool allow_trailing_comma) {
   // The input must be in UTF-8.
   if (!IsStringUTF8(json.c_str())) {
-    error_message_ = kUnsupportedEncoding;
+    error_code_ = JSON_UNSUPPORTED_ENCODING;
     return NULL;
   }
 
@@ -149,28 +167,38 @@ Value* JSONReader::JsonToValue(const std::string& json, bool check_root,
   json_pos_ = start_pos_;
   allow_trailing_comma_ = allow_trailing_comma;
   stack_depth_ = 0;
-  error_message_.clear();
+  error_code_ = JSON_NO_ERROR;
 
   scoped_ptr<Value> root(BuildValue(check_root));
   if (root.get()) {
     if (ParseToken().type == Token::END_OF_INPUT) {
       return root.release();
     } else {
-      SetErrorMessage(kUnexpectedDataAfterRoot, json_pos_);
+      SetErrorCode(JSON_UNEXPECTED_DATA_AFTER_ROOT, json_pos_);
     }
   }
 
   // Default to calling errors "syntax errors".
-  if (error_message_.empty())
-    SetErrorMessage(kSyntaxError, json_pos_);
+  if (error_code_ == 0)
+    SetErrorCode(JSON_SYNTAX_ERROR, json_pos_);
 
   return NULL;
+}
+
+/* static */
+std::string JSONReader::FormatErrorMessage(int line, int column,
+                                           const std::string& description) {
+  if (line || column) {
+    return StringPrintf("Line: %i, column: %i, %s",
+                        line, column, description.c_str());
+  }
+  return description;
 }
 
 Value* JSONReader::BuildValue(bool is_root) {
   ++stack_depth_;
   if (stack_depth_ > kStackLimit) {
-    SetErrorMessage(kTooMuchNesting, json_pos_);
+    SetErrorCode(JSON_TOO_MUCH_NESTING, json_pos_);
     return NULL;
   }
 
@@ -178,7 +206,7 @@ Value* JSONReader::BuildValue(bool is_root) {
   // The root token must be an array or an object.
   if (is_root && token.type != Token::OBJECT_BEGIN &&
       token.type != Token::ARRAY_BEGIN) {
-    SetErrorMessage(kBadRootElementType, json_pos_);
+    SetErrorCode(JSON_BAD_ROOT_ELEMENT_TYPE, json_pos_);
     return NULL;
   }
 
@@ -234,7 +262,7 @@ Value* JSONReader::BuildValue(bool is_root) {
             // consumers need the parsing leniency, so handle accordingly.
             if (token.type == Token::ARRAY_END) {
               if (!allow_trailing_comma_) {
-                SetErrorMessage(kTrailingComma, json_pos_);
+                SetErrorCode(JSON_TRAILING_COMMA, json_pos_);
                 return NULL;
               }
               // Trailing comma OK, stop parsing the Array.
@@ -259,7 +287,7 @@ Value* JSONReader::BuildValue(bool is_root) {
         node.reset(new DictionaryValue);
         while (token.type != Token::OBJECT_END) {
           if (token.type != Token::STRING) {
-            SetErrorMessage(kUnquotedDictionaryKey, json_pos_);
+            SetErrorCode(JSON_UNQUOTED_DICTIONARY_KEY, json_pos_);
             return NULL;
           }
           scoped_ptr<Value> dict_key_value(DecodeString(token));
@@ -267,7 +295,7 @@ Value* JSONReader::BuildValue(bool is_root) {
             return NULL;
 
           // Convert the key into a wstring.
-          std::wstring dict_key;
+          std::string dict_key;
           bool success = dict_key_value->GetAsString(&dict_key);
           DCHECK(success);
 
@@ -294,7 +322,7 @@ Value* JSONReader::BuildValue(bool is_root) {
             // consumers need the parsing leniency, so handle accordingly.
             if (token.type == Token::OBJECT_END) {
               if (!allow_trailing_comma_) {
-                SetErrorMessage(kTrailingComma, json_pos_);
+                SetErrorCode(JSON_TRAILING_COMMA, json_pos_);
                 return NULL;
               }
               // Trailing comma OK, stop parsing the Object.
@@ -362,13 +390,13 @@ Value* JSONReader::DecodeNumber(const Token& token) {
   const std::wstring num_string(token.begin, token.length);
 
   int num_int;
-  if (StringToInt(WideToUTF16Hack(num_string), &num_int))
+  if (StringToInt(WideToUTF8(num_string), &num_int))
     return Value::CreateIntegerValue(num_int);
 
   double num_double;
-  if (StringToDouble(WideToUTF16Hack(num_string), &num_double) &&
+  if (StringToDouble(WideToUTF8(num_string), &num_double) &&
       base::IsFinite(num_double))
-    return Value::CreateRealValue(num_double);
+    return Value::CreateDoubleValue(num_double);
 
   return NULL;
 }
@@ -384,13 +412,13 @@ JSONReader::Token JSONReader::ParseStringToken() {
       switch (c) {
         case 'x':
           if (!ReadHexDigits(token, 2)) {
-            SetErrorMessage(kInvalidEscape, json_pos_ + token.length);
+            SetErrorCode(JSON_INVALID_ESCAPE, json_pos_ + token.length);
             return kInvalidToken;
           }
           break;
         case 'u':
           if (!ReadHexDigits(token, 4)) {
-            SetErrorMessage(kInvalidEscape, json_pos_ + token.length);
+            SetErrorCode(JSON_INVALID_ESCAPE, json_pos_ + token.length);
             return kInvalidToken;
           }
           break;
@@ -405,7 +433,7 @@ JSONReader::Token JSONReader::ParseStringToken() {
         case '"':
           break;
         default:
-          SetErrorMessage(kInvalidEscape, json_pos_ + token.length);
+          SetErrorCode(JSON_INVALID_ESCAPE, json_pos_ + token.length);
           return kInvalidToken;
       }
     } else if ('"' == c) {
@@ -453,15 +481,15 @@ Value* JSONReader::DecodeString(const Token& token) {
           break;
 
         case 'x':
-          decoded_str.push_back((HexToInt(*(token.begin + i + 1)) << 4) +
-                                HexToInt(*(token.begin + i + 2)));
+          decoded_str.push_back((HexDigitToInt(*(token.begin + i + 1)) << 4) +
+                                HexDigitToInt(*(token.begin + i + 2)));
           i += 2;
           break;
         case 'u':
-          decoded_str.push_back((HexToInt(*(token.begin + i + 1)) << 12 ) +
-                                (HexToInt(*(token.begin + i + 2)) << 8) +
-                                (HexToInt(*(token.begin + i + 3)) << 4) +
-                                HexToInt(*(token.begin + i + 4)));
+          decoded_str.push_back((HexDigitToInt(*(token.begin + i + 1)) << 12 ) +
+                                (HexDigitToInt(*(token.begin + i + 2)) << 8) +
+                                (HexDigitToInt(*(token.begin + i + 3)) << 4) +
+                                HexDigitToInt(*(token.begin + i + 4)));
           i += 4;
           break;
 
@@ -476,7 +504,7 @@ Value* JSONReader::DecodeString(const Token& token) {
       decoded_str.push_back(c);
     }
   }
-  return Value::CreateStringValue(decoded_str);
+  return Value::CreateStringValue(WideToUTF16Hack(decoded_str));
 }
 
 JSONReader::Token JSONReader::ParseToken() {
@@ -552,16 +580,6 @@ JSONReader::Token JSONReader::ParseToken() {
   return token;
 }
 
-bool JSONReader::NextStringMatch(const std::wstring& str) {
-  for (size_t i = 0; i < str.length(); ++i) {
-    if ('\0' == *json_pos_)
-      return false;
-    if (*(json_pos_ + i) != str[i])
-      return false;
-  }
-  return true;
-}
-
 void JSONReader::EatWhitespaceAndComments() {
   while ('\0' != *json_pos_) {
     switch (*json_pos_) {
@@ -617,8 +635,18 @@ bool JSONReader::EatComment() {
   return true;
 }
 
-void JSONReader::SetErrorMessage(const char* description,
-                                 const wchar_t* error_pos) {
+bool JSONReader::NextStringMatch(const std::wstring& str) {
+  for (size_t i = 0; i < str.length(); ++i) {
+    if ('\0' == *json_pos_)
+      return false;
+    if (*(json_pos_ + i) != str[i])
+      return false;
+  }
+  return true;
+}
+
+void JSONReader::SetErrorCode(JsonParseError error,
+                              const wchar_t* error_pos) {
   int line_number = 1;
   int column_number = 1;
 
@@ -637,7 +665,9 @@ void JSONReader::SetErrorMessage(const char* description,
     }
   }
 
-  error_message_ = FormatErrorMessage(line_number, column_number, description);
+  error_line_ = line_number;
+  error_col_ = column_number;
+  error_code_ = error;
 }
 
 }  // namespace base

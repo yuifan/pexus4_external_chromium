@@ -1,32 +1,73 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "net/proxy/proxy_config.h"
 
+#include "base/logging.h"
 #include "base/string_tokenizer.h"
 #include "base/string_util.h"
+#include "base/values.h"
+#include "net/proxy/proxy_info.h"
 
 namespace net {
 
-ProxyConfig::ProxyConfig()
-    : auto_detect(false),
-      proxy_bypass_local_names(false),
-      id_(INVALID_ID) {
+namespace {
+
+// If |proxy| is valid, sets it in |dict| under the key |name|.
+void AddProxyToValue(const char* name,
+                     const ProxyServer& proxy,
+                     DictionaryValue* dict) {
+  if (proxy.is_valid())
+    dict->SetString(name, proxy.ToURI());
 }
 
-bool ProxyConfig::Equals(const ProxyConfig& other) const {
-  // The two configs can have different IDs.  We are just interested in if they
-  // have the same settings.
-  return auto_detect == other.auto_detect &&
-         pac_url == other.pac_url &&
-         proxy_rules == other.proxy_rules &&
-         proxy_bypass == other.proxy_bypass &&
-         proxy_bypass_local_names == other.proxy_bypass_local_names;
+}  // namespace
+
+ProxyConfig::ProxyRules::ProxyRules()
+    : reverse_bypass(false),
+      type(TYPE_NO_RULES) {
 }
 
-bool ProxyConfig::MayRequirePACResolver() const {
-  return auto_detect || pac_url.is_valid();
+ProxyConfig::ProxyRules::~ProxyRules() {
+}
+
+void ProxyConfig::ProxyRules::Apply(const GURL& url, ProxyInfo* result) {
+  if (empty()) {
+    result->UseDirect();
+    return;
+  }
+
+  bool bypass_proxy = bypass_rules.Matches(url);
+  if (reverse_bypass)
+    bypass_proxy = !bypass_proxy;
+  if (bypass_proxy) {
+    result->UseDirect();
+    return;
+  }
+
+  switch (type) {
+    case ProxyRules::TYPE_SINGLE_PROXY: {
+      result->UseProxyServer(single_proxy);
+      return;
+    }
+    case ProxyRules::TYPE_PROXY_PER_SCHEME: {
+      const ProxyServer* entry = MapUrlSchemeToProxy(url.scheme());
+      if (entry) {
+        result->UseProxyServer(*entry);
+      } else {
+        // We failed to find a matching proxy server for the current URL
+        // scheme. Default to direct.
+        result->UseDirect();
+      }
+      return;
+    }
+    default: {
+      result->UseDirect();
+      NOTREACHED();
+      return;
+    }
+  }
 }
 
 void ProxyConfig::ProxyRules::ParseFromString(const std::string& proxy_rules) {
@@ -36,7 +77,7 @@ void ProxyConfig::ProxyRules::ParseFromString(const std::string& proxy_rules) {
   proxy_for_http = ProxyServer();
   proxy_for_https = ProxyServer();
   proxy_for_ftp = ProxyServer();
-  socks_proxy = ProxyServer();
+  fallback_proxy = ProxyServer();
 
   StringTokenizer proxy_server_list(proxy_rules, ";");
   while (proxy_server_list.GetNext()) {
@@ -63,11 +104,21 @@ void ProxyConfig::ProxyRules::ParseFromString(const std::string& proxy_rules) {
 
       // Add it to the per-scheme mappings (if supported scheme).
       type = TYPE_PROXY_PER_SCHEME;
-      if (ProxyServer* entry = MapSchemeToProxy(url_scheme)) {
-        std::string proxy_server_token = proxy_server_for_scheme.token();
-        ProxyServer::Scheme scheme = (entry == &socks_proxy) ?
-            ProxyServer::SCHEME_SOCKS4 : ProxyServer::SCHEME_HTTP;
-        *entry = ProxyServer::FromURI(proxy_server_token, scheme);
+      ProxyServer* entry = MapUrlSchemeToProxyNoFallback(url_scheme);
+      ProxyServer::Scheme default_scheme = ProxyServer::SCHEME_HTTP;
+
+      // socks=XXX is inconsistent with the other formats, since "socks"
+      // is not a URL scheme. Rather this means "for everything else, send
+      // it to the SOCKS proxy server XXX".
+      if (url_scheme == "socks") {
+        DCHECK(!entry);
+        entry = &fallback_proxy;
+        default_scheme = ProxyServer::SCHEME_SOCKS4;
+      }
+
+      if (entry) {
+        *entry = ProxyServer::FromURI(proxy_server_for_scheme.token(),
+                                      default_scheme);
       }
     }
   }
@@ -76,189 +127,123 @@ void ProxyConfig::ProxyRules::ParseFromString(const std::string& proxy_rules) {
 const ProxyServer* ProxyConfig::ProxyRules::MapUrlSchemeToProxy(
     const std::string& url_scheme) const {
   const ProxyServer* proxy_server =
-      const_cast<ProxyRules*>(this)->MapSchemeToProxy(url_scheme);
+      const_cast<ProxyRules*>(this)->MapUrlSchemeToProxyNoFallback(url_scheme);
   if (proxy_server && proxy_server->is_valid())
     return proxy_server;
-  if (socks_proxy.is_valid())
-    return &socks_proxy;
+  if (fallback_proxy.is_valid())
+    return &fallback_proxy;
   return NULL;  // No mapping for this scheme. Use direct.
 }
 
-ProxyServer* ProxyConfig::ProxyRules::MapSchemeToProxy(
+bool ProxyConfig::ProxyRules::Equals(const ProxyRules& other) const {
+  return type == other.type &&
+         single_proxy == other.single_proxy &&
+         proxy_for_http == other.proxy_for_http &&
+         proxy_for_https == other.proxy_for_https &&
+         proxy_for_ftp == other.proxy_for_ftp &&
+         fallback_proxy == other.fallback_proxy &&
+         bypass_rules.Equals(other.bypass_rules) &&
+         reverse_bypass == other.reverse_bypass;
+}
+
+ProxyServer* ProxyConfig::ProxyRules::MapUrlSchemeToProxyNoFallback(
     const std::string& scheme) {
-  DCHECK(type == TYPE_PROXY_PER_SCHEME);
+  DCHECK_EQ(TYPE_PROXY_PER_SCHEME, type);
   if (scheme == "http")
     return &proxy_for_http;
   if (scheme == "https")
     return &proxy_for_https;
   if (scheme == "ftp")
     return &proxy_for_ftp;
-  if (scheme == "socks")
-    return &socks_proxy;
   return NULL;  // No mapping for this scheme.
 }
 
-namespace {
-
-// Returns true if the given string represents an IP address.
-bool IsIPAddress(const std::string& domain) {
-  // From GURL::HostIsIPAddress()
-  url_canon::RawCanonOutputT<char, 128> ignored_output;
-  url_canon::CanonHostInfo host_info;
-  url_parse::Component domain_comp(0, domain.size());
-  url_canon::CanonicalizeIPAddress(domain.c_str(), domain_comp,
-                                   &ignored_output, &host_info);
-  return host_info.IsIPAddress();
+ProxyConfig::ProxyConfig() : auto_detect_(false), id_(INVALID_ID) {
 }
 
-}  // namespace
+ProxyConfig::ProxyConfig(const ProxyConfig& config)
+    : auto_detect_(config.auto_detect_),
+      pac_url_(config.pac_url_),
+      proxy_rules_(config.proxy_rules_),
+      id_(config.id_) {
+}
 
-void ProxyConfig::ParseNoProxyList(const std::string& no_proxy) {
-  proxy_bypass.clear();
-  if (no_proxy.empty())
-    return;
-  // Traditional semantics:
-  // A single "*" is specifically allowed and unproxies anything.
-  // "*" wildcards other than a single "*" entry are not universally
-  // supported. We will support them, as we get * wildcards for free
-  // (see MatchPatternASCII() called from
-  // ProxyService::ShouldBypassProxyForURL()).
-  // no_proxy is a comma-separated list of <trailing_domain>[:<port>].
-  // If no port is specified then any port matches.
-  // The historical definition has trailing_domain match using a simple
-  // string "endswith" test, so that the match need not correspond to a
-  // "." boundary. For example: "google.com" matches "igoogle.com" too.
-  // Seems like that could be confusing, but we'll obey tradition.
-  // IP CIDR patterns are supposed to be supported too. We intend
-  // to do this in proxy_service.cc, but it's currently a TODO.
-  // See: http://crbug.com/9835.
-  StringTokenizer no_proxy_list(no_proxy, ",");
-  while (no_proxy_list.GetNext()) {
-    std::string bypass_entry = no_proxy_list.token();
-    TrimWhitespaceASCII(bypass_entry, TRIM_ALL, &bypass_entry);
-    if (bypass_entry.empty())
-      continue;
-    if (bypass_entry.at(0) != '*') {
-      // Insert a wildcard * to obtain an endsWith match, unless the
-      // entry looks like it might be an IP or CIDR.
-      // First look for either a :<port> or CIDR mask length suffix.
-      std::string::const_iterator begin = bypass_entry.begin();
-      std::string::const_iterator scan = bypass_entry.end() - 1;
-      while (scan > begin && IsAsciiDigit(*scan))
-        --scan;
-      std::string potential_ip;
-      if (*scan == '/' || *scan == ':')
-        potential_ip = std::string(begin, scan - 1);
-      else
-        potential_ip = bypass_entry;
-      if (!IsIPAddress(potential_ip)) {
-        // Do insert a wildcard.
-        bypass_entry.insert(0, "*");
+ProxyConfig::~ProxyConfig() {
+}
+
+ProxyConfig& ProxyConfig::operator=(const ProxyConfig& config) {
+  auto_detect_ = config.auto_detect_;
+  pac_url_ = config.pac_url_;
+  proxy_rules_ = config.proxy_rules_;
+  id_ = config.id_;
+  return *this;
+}
+
+bool ProxyConfig::Equals(const ProxyConfig& other) const {
+  // The two configs can have different IDs.  We are just interested in if they
+  // have the same settings.
+  return auto_detect_ == other.auto_detect_ &&
+         pac_url_ == other.pac_url_ &&
+         proxy_rules_.Equals(other.proxy_rules());
+}
+
+bool ProxyConfig::HasAutomaticSettings() const {
+  return auto_detect_ || has_pac_url();
+}
+
+void ProxyConfig::ClearAutomaticSettings() {
+  auto_detect_ = false;
+  pac_url_ = GURL();
+}
+
+Value* ProxyConfig::ToValue() const {
+  DictionaryValue* dict = new DictionaryValue();
+
+  // Output the automatic settings.
+  if (auto_detect_)
+    dict->SetBoolean("auto_detect", auto_detect_);
+  if (has_pac_url())
+    dict->SetString("pac_url", pac_url_.possibly_invalid_spec());
+
+  // Output the manual settings.
+  if (proxy_rules_.type != ProxyRules::TYPE_NO_RULES) {
+    switch (proxy_rules_.type) {
+      case ProxyRules::TYPE_SINGLE_PROXY:
+        AddProxyToValue("single_proxy", proxy_rules_.single_proxy, dict);
+        break;
+      case ProxyRules::TYPE_PROXY_PER_SCHEME: {
+        DictionaryValue* dict2 = new DictionaryValue();
+        AddProxyToValue("http", proxy_rules_.proxy_for_http, dict2);
+        AddProxyToValue("https", proxy_rules_.proxy_for_https, dict2);
+        AddProxyToValue("ftp", proxy_rules_.proxy_for_ftp, dict2);
+        AddProxyToValue("fallback", proxy_rules_.fallback_proxy, dict2);
+        dict->Set("proxy_per_scheme", dict2);
+        break;
       }
-      // TODO(sdoyon): When CIDR matching is implemented in
-      // proxy_service.cc, consider making proxy_bypass more
-      // sophisticated to avoid parsing out the string on every
-      // request.
+      default:
+        NOTREACHED();
     }
-    proxy_bypass.push_back(bypass_entry);
+
+    // Output the bypass rules.
+    const ProxyBypassRules& bypass = proxy_rules_.bypass_rules;
+    if (!bypass.rules().empty()) {
+      if (proxy_rules_.reverse_bypass)
+        dict->SetBoolean("reverse_bypass", true);
+
+      ListValue* list = new ListValue();
+
+      for (ProxyBypassRules::RuleList::const_iterator it =
+              bypass.rules().begin();
+           it != bypass.rules().end(); ++it) {
+        list->Append(Value::CreateStringValue((*it)->ToString()));
+      }
+
+      dict->Set("bypass_list", list);
+    }
   }
+
+  return dict;
 }
 
 }  // namespace net
 
-namespace {
-
-// Helper to stringize a ProxyServer.
-std::ostream& operator<<(std::ostream& out,
-                         const net::ProxyServer& proxy_server) {
-  if (proxy_server.is_valid())
-    out << proxy_server.ToURI();
-  return out;
-}
-
-const char* BoolToYesNoString(bool b) {
-  return b ? "Yes" : "No";
-}
-
-}  // namespace
-
-std::ostream& operator<<(std::ostream& out,
-                         const net::ProxyConfig::ProxyRules& rules) {
-  // Stringize the type enum.
-  std::string type;
-  switch (rules.type) {
-    case net::ProxyConfig::ProxyRules::TYPE_NO_RULES:
-      type = "TYPE_NO_RULES";
-      break;
-    case net::ProxyConfig::ProxyRules::TYPE_PROXY_PER_SCHEME:
-      type = "TYPE_PROXY_PER_SCHEME";
-      break;
-    case net::ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY:
-      type = "TYPE_SINGLE_PROXY";
-      break;
-    default:
-      type = IntToString(rules.type);
-      break;
-  }
-  return out << "  {\n"
-             << "    type: " << type << "\n"
-             << "    single_proxy: " << rules.single_proxy << "\n"
-             << "    proxy_for_http: " << rules.proxy_for_http << "\n"
-             << "    proxy_for_https: " << rules.proxy_for_https << "\n"
-             << "    proxy_for_ftp: " << rules.proxy_for_ftp << "\n"
-             << "    socks_proxy: " << rules.socks_proxy << "\n"
-             << "  }";
-}
-
-std::ostream& operator<<(std::ostream& out, const net::ProxyConfig& config) {
-  // "Automatic" settings.
-  out << "Automatic settings:\n";
-  out << "  Auto-detect: " << BoolToYesNoString(config.auto_detect) << "\n";
-  out << "  Custom PAC script: ";
-  if (config.pac_url.is_valid())
-    out << config.pac_url;
-  else
-    out << "[None]";
-  out << "\n";
-
-  // "Manual" settings.
-  out << "Manual settings:\n";
-  out << "  Proxy server: ";
-
-  switch (config.proxy_rules.type) {
-    case net::ProxyConfig::ProxyRules::TYPE_NO_RULES:
-      out << "[None]\n";
-      break;
-    case net::ProxyConfig::ProxyRules::TYPE_SINGLE_PROXY:
-      out << config.proxy_rules.single_proxy;
-      out << "\n";
-      break;
-    case net::ProxyConfig::ProxyRules::TYPE_PROXY_PER_SCHEME:
-      out << "\n";
-      if (config.proxy_rules.proxy_for_http.is_valid())
-        out << "    HTTP: " << config.proxy_rules.proxy_for_http << "\n";
-      if (config.proxy_rules.proxy_for_https.is_valid())
-        out << "    HTTPS: " << config.proxy_rules.proxy_for_https << "\n";
-      if (config.proxy_rules.proxy_for_ftp.is_valid())
-        out << "    FTP: " << config.proxy_rules.proxy_for_ftp << "\n";
-      if (config.proxy_rules.socks_proxy.is_valid())
-        out << "    SOCKS: " << config.proxy_rules.socks_proxy << "\n";
-      break;
-  }
-
-  out << "  Bypass list: ";
-  if (config.proxy_bypass.empty()) {
-    out << "[None]\n";
-  } else {
-    out << "\n";
-    std::vector<std::string>::const_iterator it;
-    for (it = config.proxy_bypass.begin();
-         it != config.proxy_bypass.end(); ++it) {
-      out << "    " << *it << "\n";
-    }
-  }
-
-  out << "  Bypass local names: "
-      << BoolToYesNoString(config.proxy_bypass_local_names);
-  return out;
-}

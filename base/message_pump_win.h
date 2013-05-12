@@ -1,29 +1,31 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_MESSAGE_PUMP_WIN_H_
 #define BASE_MESSAGE_PUMP_WIN_H_
+#pragma once
 
 #include <windows.h>
 
 #include <list>
 
-#include "base/lock.h"
+#include "base/base_api.h"
+#include "base/basictypes.h"
 #include "base/message_pump.h"
 #include "base/observer_list.h"
-#include "base/scoped_handle.h"
 #include "base/time.h"
+#include "base/win/scoped_handle.h"
 
 namespace base {
 
 // MessagePumpWin serves as the base for specialized versions of the MessagePump
 // for Windows. It provides basic functionality like handling of observers and
 // controlling the lifetime of the message pump.
-class MessagePumpWin : public MessagePump {
+class BASE_API MessagePumpWin : public MessagePump {
  public:
   // An Observer is an object that receives global notifications from the
-  // MessageLoop.
+  // UI MessageLoop.
   //
   // NOTE: An Observer implementation should be extremely fast!
   //
@@ -96,7 +98,7 @@ class MessagePumpWin : public MessagePump {
   ObserverList<Observer> observers_;
 
   // The time at which delayed work should run.
-  Time delayed_work_time_;
+  TimeTicks delayed_work_time_;
 
   // A boolean value used to indicate if there is a kMsgDoWork message pending
   // in the Windows Message queue.  There is at most one such message, and it
@@ -155,7 +157,7 @@ class MessagePumpWin : public MessagePump {
 // an excellent choice.  It is also helpful that the starter messages that are
 // placed in the queue when new task arrive also awakens DoRunLoop.
 //
-class MessagePumpForUI : public MessagePumpWin {
+class BASE_API MessagePumpForUI : public MessagePumpWin {
  public:
   // The application-defined code passed to the hook procedure.
   static const int kMessageFilterCode = 0x5001;
@@ -165,7 +167,7 @@ class MessagePumpForUI : public MessagePumpWin {
 
   // MessagePump methods:
   virtual void ScheduleWork();
-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
+  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
 
   // Applications can call this to encourage us to process all pending WM_PAINT
   // messages.  This method will process all paint messages the Windows Message
@@ -194,7 +196,7 @@ class MessagePumpForUI : public MessagePumpWin {
 // deal with Windows mesagges, and instead has a Run loop based on Completion
 // Ports so it is better suited for IO operations.
 //
-class MessagePumpForIO : public MessagePumpWin {
+class BASE_API MessagePumpForIO : public MessagePumpWin {
  public:
   struct IOContext;
 
@@ -283,6 +285,21 @@ class MessagePumpForIO : public MessagePumpWin {
                                DWORD error) = 0;
   };
 
+  // An IOObserver is an object that receives IO notifications from the
+  // MessagePump.
+  //
+  // NOTE: An IOObserver implementation should be extremely fast!
+  class IOObserver {
+   public:
+    IOObserver() {}
+
+    virtual void WillProcessIOEvent() = 0;
+    virtual void DidProcessIOEvent() = 0;
+
+   protected:
+    virtual ~IOObserver() {}
+  };
+
   // The extended context that should be used as the base structure on every
   // overlapped IO operation. |handler| must be set to the registered IOHandler
   // for the given file when the operation is started, and it can be set to NULL
@@ -302,7 +319,7 @@ class MessagePumpForIO : public MessagePumpWin {
 
   // MessagePump methods:
   virtual void ScheduleWork();
-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
+  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
 
   // Register the handler to be used when asynchronous IO for the given file
   // completes. The registration persists as long as |file_handle| is valid, so
@@ -320,6 +337,9 @@ class MessagePumpForIO : public MessagePumpWin {
   // caller is willing to allow pausing regular task dispatching on this thread.
   bool WaitForIOCompletion(DWORD timeout, IOHandler* filter);
 
+  void AddIOObserver(IOObserver* obs);
+  void RemoveIOObserver(IOObserver* obs);
+
  private:
   struct IOItem {
     IOHandler* handler;
@@ -333,12 +353,16 @@ class MessagePumpForIO : public MessagePumpWin {
   bool MatchCompletedIOItem(IOHandler* filter, IOItem* item);
   bool GetIOItem(DWORD timeout, IOItem* item);
   bool ProcessInternalIOItem(const IOItem& item);
+  void WillProcessIOEvent();
+  void DidProcessIOEvent();
 
   // The completion port associated with this thread.
-  ScopedHandle port_;
+  win::ScopedHandle port_;
   // This list will be empty almost always. It stores IO completions that have
   // not been delivered yet because somebody was doing cleanup.
   std::list<IOItem> completed_io_;
+
+  ObserverList<IOObserver> io_observers_;
 };
 
 }  // namespace base

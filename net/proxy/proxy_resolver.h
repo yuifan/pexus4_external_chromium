@@ -1,19 +1,21 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_PROXY_PROXY_RESOLVER_H_
 #define NET_PROXY_PROXY_RESOLVER_H_
-
-#include <string>
+#pragma once
 
 #include "base/logging.h"
+#include "base/memory/ref_counted.h"
+#include "base/string16.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/completion_callback.h"
+#include "net/proxy/proxy_resolver_script_data.h"
 
 namespace net {
 
-class LoadLog;
+class BoundNetLog;
 class ProxyInfo;
 
 // Interface for "proxy resolvers". A ProxyResolver fills in a list of proxies
@@ -41,50 +43,36 @@ class ProxyResolver {
                              ProxyInfo* results,
                              CompletionCallback* callback,
                              RequestHandle* request,
-                             LoadLog* load_log) = 0;
+                             const BoundNetLog& net_log) = 0;
 
   // Cancels |request|.
   virtual void CancelRequest(RequestHandle request) = 0;
 
   // The PAC script backend can be specified to the ProxyResolver either via
   // URL, or via the javascript text itself.  If |expects_pac_bytes| is true,
-  // then PAC scripts should be specified using SetPacScriptByData(). Otherwise
-  // they should be specified using SetPacScriptByUrl().
+  // then the ProxyResolverScriptData passed to SetPacScript() should
+  // contain the actual script bytes rather than just the URL.
   bool expects_pac_bytes() const { return expects_pac_bytes_; }
 
-  // Sets the PAC script backend to use for this proxy resolver (by URL).
-  int SetPacScriptByUrl(const GURL& url, CompletionCallback* callback) {
-    DCHECK(!expects_pac_bytes());
-    return SetPacScript(url, std::string(), callback);
-  }
-
-  // Sets the PAC script backend to use for this proxy resolver (by contents).
-  int SetPacScriptByData(const std::string& bytes_utf8,
-                         CompletionCallback* callback) {
-    DCHECK(expects_pac_bytes());
-    return SetPacScript(GURL(), bytes_utf8, callback);
-  }
-
-  // TODO(eroman): Make this =0.
-  virtual void CancelSetPacScript() {
-    NOTREACHED();
-  }
+  virtual void CancelSetPacScript() = 0;
 
   // Frees any unneeded memory held by the resolver, e.g. garbage in the JS
   // engine.  Most subclasses don't need to do anything, so we provide a default
   // no-op implementation.
   virtual void PurgeMemory() {}
 
- private:
-  // Called to set the PAC script backend to use. If |pac_url| is invalid,
-  // this is a request to use WPAD (auto detect). |bytes_utf8| may be empty if
-  // the fetch failed, or if the fetch returned no content.
+  // Called to set the PAC script backend to use.
   // Returns ERR_IO_PENDING in the case of asynchronous completion, and notifies
   // the result through |callback|.
-  virtual int SetPacScript(const GURL& pac_url,
-                           const std::string& bytes_utf8,
-                           CompletionCallback* callback) = 0;
+  virtual int SetPacScript(
+      const scoped_refptr<ProxyResolverScriptData>& pac_script,
+      CompletionCallback* callback) = 0;
 
+  // Optional shutdown code to be run before destruction. This is only used
+  // by the multithreaded runner to signal cleanup from origin thread
+  virtual void Shutdown() {}
+
+ private:
   const bool expects_pac_bytes_;
 
   DISALLOW_COPY_AND_ASSIGN(ProxyResolver);

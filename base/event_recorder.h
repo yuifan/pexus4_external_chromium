@@ -1,15 +1,20 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_EVENT_RECORDER_H_
 #define BASE_EVENT_RECORDER_H_
+#pragma once
 
-#include <string>
+#include "base/base_api.h"
+#include "base/basictypes.h"
+#include "build/build_config.h"
+
 #if defined(OS_WIN)
+#include <stdio.h>
+#include <string.h>
 #include <windows.h>
 #endif
-#include "base/basictypes.h"
 
 class FilePath;
 
@@ -28,7 +33,7 @@ namespace base {
 //        Why?  Imagine if the product had a "record a macro" feature.
 //        You might be recording globally, while recording or playing back
 //        a macro.  I don't think two playbacks make sense.
-class EventRecorder {
+class BASE_API EventRecorder {
  public:
   // Get the singleton EventRecorder.
   // We can only handle one recorder/player at a time.
@@ -79,6 +84,9 @@ class EventRecorder {
 #endif
         playback_first_msg_time_(0),
         playback_start_time_(0) {
+#if defined(OS_WIN)
+    memset(&playback_msg_, 0, sizeof(playback_msg_));
+#endif
   }
   ~EventRecorder();
 
@@ -94,7 +102,7 @@ class EventRecorder {
   int playback_first_msg_time_;
   int playback_start_time_;
 
-  DISALLOW_EVIL_CONSTRUCTORS(EventRecorder);
+  DISALLOW_COPY_AND_ASSIGN(EventRecorder);
 };
 
 }  // namespace base

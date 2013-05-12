@@ -1,18 +1,19 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_TRACKED_OBJECTS_H_
 #define BASE_TRACKED_OBJECTS_H_
+#pragma once
 
 #include <map>
 #include <string>
 #include <vector>
 
-#include "base/lock.h"
-#include "base/task.h"
-#include "base/thread_local_storage.h"
+#include "base/base_api.h"
+#include "base/synchronization/lock.h"
 #include "base/tracked.h"
+#include "base/threading/thread_local_storage.h"
 
 // TrackedObjects provides a database of stats about objects (generally Tasks)
 // that are tracked.  Tracking means their birth, death, duration, birth thread,
@@ -20,18 +21,18 @@
 // across a series of objects so that the counts and times can be rapidly
 // updated without (usually) having to lock the data, and hence there is usually
 // very little contention caused by the tracking.  The data can be viewed via
-// the about:objects URL, with a variety of sorting and filtering choices.
+// the about:tasks URL, with a variety of sorting and filtering choices.
 //
-// Theese classes serve as the basis of a profiler of sorts for the Tasks
-// system.  As a result, design decisions were made to maximize speed, by
-// minimizing recurring allocation/deallocation, lock contention and data
-// copying.  In the "stable" state, which is reached relatively quickly, there
-// is no separate marginal allocation cost associated with construction or
-// destruction of tracked objects, no locks are generally employed, and probably
-// the largest computational cost is associated with obtaining start and stop
-// times for instances as they are created and destroyed.  The introduction of
-// worker threads had a slight impact on this approach, and required use of some
-// locks when accessing data from the worker threads.
+// These classes serve as the basis of a profiler of sorts for the Tasks system.
+// As a result, design decisions were made to maximize speed, by minimizing
+// recurring allocation/deallocation, lock contention and data copying.  In the
+// "stable" state, which is reached relatively quickly, there is no separate
+// marginal allocation cost associated with construction or destruction of
+// tracked objects, no locks are generally employed, and probably the largest
+// computational cost is associated with obtaining start and stop times for
+// instances as they are created and destroyed.  The introduction of worker
+// threads had a slight impact on this approach, and required use of some locks
+// when accessing data from the worker threads.
 //
 // The following describes the lifecycle of tracking an instance.
 //
@@ -110,7 +111,7 @@
 //
 // The above description tries to define the high performance (run time)
 // portions of these classes.  After gathering statistics, calls instigated
-// by visiting about:objects will assemble and aggregate data for display. The
+// by visiting about:tasks will assemble and aggregate data for display. The
 // following data structures are used for producing such displays.  They are
 // not performance critical, and their only major constraint is that they should
 // be able to run concurrently with ongoing augmentation of the birth and death
@@ -136,8 +137,7 @@
 // need to be sorted, and possibly aggregated (example: how many threads are in
 // a specific consecutive set of Snapshots?  What was the total birth count for
 // that set? etc.).  Aggregation instances collect running sums of any set of
-// snapshot instances, and are used to print sub-totals in an about:objects
-// page.
+// snapshot instances, and are used to print sub-totals in an about:tasks page.
 //
 // TODO(jar): I need to store DataCollections, and provide facilities for taking
 // the difference between two gathered DataCollections.  For now, I'm just
@@ -157,7 +157,7 @@ namespace tracked_objects {
 // For a specific thread, and a specific birth place, the collection of all
 // death info (with tallies for each death thread, to prevent access conflicts).
 class ThreadData;
-class BirthOnThread {
+class BASE_API BirthOnThread {
  public:
   explicit BirthOnThread(const Location& location);
 
@@ -180,7 +180,7 @@ class BirthOnThread {
 //------------------------------------------------------------------------------
 // A class for accumulating counts of births (without bothering with a map<>).
 
-class Births: public BirthOnThread {
+class BASE_API Births: public BirthOnThread {
  public:
   explicit Births(const Location& location);
 
@@ -208,7 +208,7 @@ class Births: public BirthOnThread {
 // birthplace (fixed Location).  Used both on specific threads, and also used
 // in snapshots when integrating assembled data.
 
-class DeathData {
+class BASE_API DeathData {
  public:
   // Default initializer.
   DeathData() : count_(0), square_duration_(0) {}
@@ -249,7 +249,7 @@ class DeathData {
 // The source of this data was collected on many threads, and is asynchronously
 // changing.  The data in this instance is not asynchronously changing.
 
-class Snapshot {
+class BASE_API Snapshot {
  public:
   // When snapshotting a full life cycle set (birth-to-death), use this:
   Snapshot(const BirthOnThread& birth_on_thread, const ThreadData& death_thread,
@@ -285,13 +285,14 @@ class Snapshot {
 // items.  It protects the gathering under locks, so that it could be called via
 // Posttask on any threads, or passed to all the target threads in parallel.
 
-class DataCollector {
+class BASE_API DataCollector {
  public:
   typedef std::vector<Snapshot> Collection;
 
   // Construct with a list of how many threads should contribute.  This helps us
   // determine (in the async case) when we are done with all contributions.
   DataCollector();
+  ~DataCollector();
 
   // Add all stats from the indicated thread into our arrays.  This function is
   // mutex protected, and *could* be called from any threads (although current
@@ -307,6 +308,8 @@ class DataCollector {
   void AddListOfLivingObjects();
 
  private:
+  typedef std::map<const BirthOnThread*, int> BirthCount;
+
   // This instance may be provided to several threads to contribute data.  The
   // following counter tracks how many more threads will contribute.  When it is
   // zero, then all asynchronous contributions are complete, and locked access
@@ -318,10 +321,9 @@ class DataCollector {
 
   // The total number of births recorded at each location for which we have not
   // seen a death count.
-  typedef std::map<const BirthOnThread*, int> BirthCount;
   BirthCount global_birth_count_;
 
-  Lock accumulation_lock_;  // Protects access during accumulation phase.
+  base::Lock accumulation_lock_;  // Protects access during accumulation phase.
 
   DISALLOW_COPY_AND_ASSIGN(DataCollector);
 };
@@ -330,9 +332,10 @@ class DataCollector {
 // Aggregation contains summaries (totals and subtotals) of groups of Snapshot
 // instances to provide printing of these collections on a single line.
 
-class Aggregation: public DeathData {
+class BASE_API Aggregation: public DeathData {
  public:
-  Aggregation() : birth_count_(0) {}
+  Aggregation();
+  ~Aggregation();
 
   void AddDeathSnapshot(const Snapshot& snapshot);
   void AddBirths(const Births& births);
@@ -355,13 +358,13 @@ class Aggregation: public DeathData {
 //------------------------------------------------------------------------------
 // Comparator is a class that supports the comparison of Snapshot instances.
 // An instance is actually a list of chained Comparitors, that can provide for
-// arbitrary ordering.  The path portion of an about:objects URL is translated
+// arbitrary ordering.  The path portion of an about:tasks URL is translated
 // into such a chain, which is then used to order Snapshot instances in a
 // vector.  It orders them into groups (for aggregation), and can also order
 // instances within the groups (for detailed rendering of the instances in an
 // aggregation).
 
-class Comparator {
+class BASE_API Comparator {
  public:
   // Selector enum is the token identifier for each parsed keyword, most of
   // which specify a sort order.
@@ -421,7 +424,7 @@ class Comparator {
   // Translate a keyword and restriction in URL path to a selector for sorting.
   void ParseKeyphrase(const std::string& key_phrase);
 
-  // Parse a query in an about:objects URL to decide on sort ordering.
+  // Parse a query in an about:tasks URL to decide on sort ordering.
   bool ParseQuery(const std::string& query);
 
   // Output a header line that can be used to indicated what items will be
@@ -462,12 +465,13 @@ class Comparator {
 // For each thread, we have a ThreadData that stores all tracking info generated
 // on this thread.  This prevents the need for locking as data accumulates.
 
-class ThreadData {
+class BASE_API ThreadData {
  public:
   typedef std::map<Location, Births*> BirthMap;
   typedef std::map<const Births*, DeathData> DeathMap;
 
   ThreadData();
+  ~ThreadData();
 
   // Using Thread Local Store, find the current instance for collecting data.
   // If an instance does not exist, construct one (and remember it for use on
@@ -476,8 +480,7 @@ class ThreadData {
   // return null.
   static ThreadData* current();
 
-  // For a given about:objects URL, develop resulting HTML, and append to
-  // output.
+  // For a given about:tasks URL, develop resulting HTML, and append to output.
   static void WriteHTML(const std::string& query, std::string* output);
 
   // For a given accumulated array of results, use the comparator to sort and
@@ -502,7 +505,7 @@ class ThreadData {
 
   // Using our lock, make a copy of the specified maps.  These calls may arrive
   // from non-local threads, and are used to quickly scan data from all threads
-  // in order to build an HTML page for about:objects.
+  // in order to build an HTML page for about:tasks.
   void SnapshotBirthMap(BirthMap *output) const;
   void SnapshotDeathMap(DeathMap *output) const;
 
@@ -557,44 +560,9 @@ class ThreadData {
     SHUTDOWN,
   };
 
-  // A class used to count down which is accessed by several threads.  This is
-  // used to make sure RunOnAllThreads() actually runs a task on the expected
-  // count of threads.
-  class ThreadSafeDownCounter {
-   public:
-    // Constructor sets the count, once and for all.
-    explicit ThreadSafeDownCounter(size_t count);
-
-    // Decrement the count, and return true if we hit zero.  Also delete this
-    // instance automatically when we hit zero.
-    bool LastCaller();
-
-   private:
-    size_t remaining_count_;
-    Lock lock_;  // protect access to remaining_count_.
-  };
-
-#ifdef OS_WIN
-  // A Task class that runs a static method supplied, and checks to see if this
-  // is the last tasks instance (on last thread) that will run the method.
-  // IF this is the last run, then the supplied event is signalled.
-  class RunTheStatic : public Task {
-   public:
-    typedef void (*FunctionPointer)();
-    RunTheStatic(FunctionPointer function,
-                 HANDLE completion_handle,
-                 ThreadSafeDownCounter* counter);
-    // Run the supplied static method, and optionally set the event.
-    void Run();
-
-   private:
-    FunctionPointer function_;
-    HANDLE completion_handle_;
-    // Make sure enough tasks are called before completion is signaled.
-    ThreadSafeDownCounter* counter_;
-
-    DISALLOW_COPY_AND_ASSIGN(RunTheStatic);
-  };
+#if defined(OS_WIN)
+  class ThreadSafeDownCounter;
+  class RunTheStatic;
 #endif
 
   // Each registered thread is called to set status_ to SHUTDOWN.
@@ -604,12 +572,12 @@ class ThreadData {
   static void ShutdownDisablingFurtherTracking();
 
   // We use thread local store to identify which ThreadData to interact with.
-  static TLSSlot tls_index_;
+  static base::ThreadLocalStorage::Slot tls_index_;
 
   // Link to the most recently created instance (starts a null terminated list).
   static ThreadData* first_;
   // Protection for access to first_.
-  static Lock list_lock_;
+  static base::Lock list_lock_;
 
   // We set status_ to SHUTDOWN when we shut down the tracking service. This
   // setting is redundantly established by all participating threads so that we
@@ -645,7 +613,7 @@ class ThreadData {
   // thread, or reading from another thread.  For reading from this thread we
   // don't need a lock, as there is no potential for a conflict since the
   // writing is only done from this thread.
-  mutable Lock lock_;
+  mutable base::Lock lock_;
 
   DISALLOW_COPY_AND_ASSIGN(ThreadData);
 };
@@ -675,13 +643,10 @@ class AutoTracking {
 #ifndef NDEBUG
     if (state_ != kRunning)
       return;
-    // Don't call these in a Release build: they just waste time.
-    // The following should ONLY be called when in single threaded mode. It is
-    // unsafe to do this cleanup if other threads are still active.
-    // It is also very unnecessary, so I'm only doing this in debug to satisfy
-    // purify (if we need to!).
-    ThreadData::ShutdownSingleThreadedCleanup();
-    state_ = kTornDownAndStopped;
+    // We don't do cleanup of any sort in Release build because it is a
+    // complete waste of time.  Since Chromium doesn't join all its thread and
+    // guarantee we're in a single threaded mode, we don't even do cleanup in
+    // debug mode, as it will generate race-checker warnings.
 #endif
   }
 

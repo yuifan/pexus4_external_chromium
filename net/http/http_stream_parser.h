@@ -1,26 +1,32 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_HTTP_HTTP_STREAM_PARSER_H_
 #define NET_HTTP_HTTP_STREAM_PARSER_H_
+#pragma once
 
 #include <string>
 
 #include "base/basictypes.h"
-#include "net/base/io_buffer.h"
-#include "net/base/load_log.h"
+#include "net/base/completion_callback.h"
+#include "net/base/net_log.h"
 #include "net/base/upload_data_stream.h"
 #include "net/http/http_chunked_decoder.h"
-#include "net/http/http_response_info.h"
-#include "net/socket/client_socket_handle.h"
 
 namespace net {
 
 class ClientSocketHandle;
-class HttpRequestInfo;
+class DrainableIOBuffer;
+class GrowableIOBuffer;
+struct HttpRequestInfo;
+class HttpRequestHeaders;
+class HttpResponseInfo;
+class IOBuffer;
+class SSLCertRequestInfo;
+class SSLInfo;
 
-class HttpStreamParser {
+class HttpStreamParser  : public ChunkCallback {
  public:
   // Any data in |read_buffer| will be used before reading from the socket
   // and any data left over after parsing the stream will be put into
@@ -28,20 +34,24 @@ class HttpStreamParser {
   // buffer's offset will be set to the first free byte. |read_buffer| may
   // have its capacity changed.
   HttpStreamParser(ClientSocketHandle* connection,
+                   const HttpRequestInfo* request,
                    GrowableIOBuffer* read_buffer,
-                   LoadLog* load_log);
-  ~HttpStreamParser() {}
+                   const BoundNetLog& net_log);
+  ~HttpStreamParser();
 
   // These functions implement the interface described in HttpStream with
   // some additional functionality
-  int SendRequest(const HttpRequestInfo* request, const std::string& headers,
-                  UploadDataStream* request_body, HttpResponseInfo* response,
-                  CompletionCallback* callback);
+  int SendRequest(const std::string& request_line,
+                  const HttpRequestHeaders& headers,
+                  UploadDataStream* request_body,
+                  HttpResponseInfo* response, CompletionCallback* callback);
 
   int ReadResponseHeaders(CompletionCallback* callback);
 
   int ReadResponseBody(IOBuffer* buf, int buf_len,
                        CompletionCallback* callback);
+
+  void Close(bool not_reusable);
 
   uint64 GetUploadProgress() const;
 
@@ -52,6 +62,19 @@ class HttpStreamParser {
   bool CanFindEndOfResponse() const;
 
   bool IsMoreDataBuffered() const;
+
+  bool IsConnectionReused() const;
+
+  void SetConnectionReused();
+
+  bool IsConnectionReusable() const;
+
+  void GetSSLInfo(SSLInfo* ssl_info);
+
+  void GetSSLCertRequestInfo(SSLCertRequestInfo* cert_request_info);
+
+  // ChunkCallback methods.
+  virtual void OnChunkAvailable();
 
  private:
   // FOO_COMPLETE states implement the second half of potentially asynchronous
@@ -96,14 +119,15 @@ class HttpStreamParser {
   int DoReadBody();
   int DoReadBodyComplete(int result);
 
-  // Examines |read_buf_| to find the start and end of the headers. Return
-  // the offset for the end of the headers, or -1 if the complete headers
-  // were not found. If they are are found, parse them with
-  // DoParseResponseHeaders().
+  // Examines |read_buf_| to find the start and end of the headers. If they are
+  // found, parse them with DoParseResponseHeaders().  Return the offset for
+  // the end of the headers, or -1 if the complete headers were not found, or
+  // with a net::Error if we encountered an error during parsing.
   int ParseResponseHeaders();
 
-  // Parse the headers into response_.
-  void DoParseResponseHeaders(int end_of_header_offset);
+  // Parse the headers into response_.  Returns OK on success or a net::Error on
+  // failure.
+  int DoParseResponseHeaders(int end_of_header_offset);
 
   // Examine the parsed headers to try to determine the response body size.
   void CalculateResponseBodySize();
@@ -162,10 +186,17 @@ class HttpStreamParser {
   // The underlying socket.
   ClientSocketHandle* const connection_;
 
-  scoped_refptr<LoadLog> load_log_;
+  BoundNetLog net_log_;
 
   // Callback to be used when doing IO.
   CompletionCallbackImpl<HttpStreamParser> io_callback_;
+
+  // Stores an encoded chunk for chunked uploads.
+  // Note: This should perhaps be improved to not create copies of the data.
+  scoped_refptr<IOBuffer> chunk_buf_;
+  size_t chunk_length_;
+  size_t chunk_length_without_encoding_;
+  bool sent_last_chunk_;
 
   DISALLOW_COPY_AND_ASSIGN(HttpStreamParser);
 };

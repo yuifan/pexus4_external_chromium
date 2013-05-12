@@ -31,6 +31,7 @@ struct TraceBuffer {
   char buffer[kNumberOfEntries][kEntrySize];
 };
 
+#if ENABLE_TRACING
 void DebugOutput(const char* msg) {
 #if defined(OS_WIN)
   OutputDebugStringA(msg);
@@ -38,6 +39,7 @@ void DebugOutput(const char* msg) {
   NOTIMPLEMENTED();
 #endif
 }
+#endif  // ENABLE_TRACING
 
 }  // namespace
 
@@ -57,6 +59,14 @@ TraceObject* TraceObject::GetTraceObject() {
   return s_trace_object;
 }
 
+TraceObject::TraceObject() {
+  InitTrace();
+}
+
+TraceObject::~TraceObject() {
+  DestroyTrace();
+}
+
 #if ENABLE_TRACING
 
 static TraceBuffer* s_trace_buffer = NULL;
@@ -70,14 +80,15 @@ void InitTrace(void) {
 }
 
 void DestroyTrace(void) {
-  DCHECK(s_trace_buffer);
   delete s_trace_buffer;
   s_trace_buffer = NULL;
   s_trace_object = NULL;
 }
 
 void Trace(const char* format, ...) {
-  DCHECK(s_trace_buffer);
+  if (!s_trace_buffer)
+    return;
+
   va_list ap;
   va_start(ap, format);
 

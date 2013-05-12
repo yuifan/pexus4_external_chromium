@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,6 +7,7 @@
 
 #ifndef NET_DISK_CACHE_ADDR_H_
 #define NET_DISK_CACHE_ADDR_H_
+#pragma once
 
 #include "net/disk_cache/disk_format.h"
 
@@ -23,7 +24,7 @@ enum FileType {
 const int kMaxBlockSize = 4096 * 4;
 const int kMaxBlockFile = 255;
 const int kMaxNumBlocks = 4;
-const int kFirstAdditionlBlockFile = 4;
+const int kFirstAdditionalBlockFile = 4;
 
 // Defines a storage address for a cache record
 //
@@ -117,6 +118,9 @@ class Addr {
     else
       return EXTERNAL;
   }
+
+  // Returns true if this address looks like a valid one.
+  bool SanityCheck() const;
 
  private:
   static const uint32 kInitializedMask    = 0x80000000;

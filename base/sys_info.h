@@ -1,10 +1,12 @@
-// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_SYS_INFO_H_
 #define BASE_SYS_INFO_H_
+#pragma once
 
+#include "base/base_api.h"
 #include "base/basictypes.h"
 
 #include <string>
@@ -13,7 +15,7 @@ class FilePath;
 
 namespace base {
 
-class SysInfo {
+class BASE_API SysInfo {
  public:
   // Return the number of logical processors/cores on the current machine.
   static int NumberOfProcessors();
@@ -30,15 +32,6 @@ class SysInfo {
   // or -1 on failure.
   static int64 AmountOfFreeDiskSpace(const FilePath& path);
 
-  // Return true if the given environment variable is defined.
-  // TODO: find a better place for HasEnvVar.
-  static bool HasEnvVar(const wchar_t* var);
-
-  // Return the value of the given environment variable
-  // or an empty string if not defined.
-  // TODO: find a better place for GetEnvVar.
-  static std::wstring GetEnvVar(const wchar_t* var);
-
   // Returns the name of the host operating system.
   static std::string OperatingSystemName();
 
@@ -48,9 +41,9 @@ class SysInfo {
   // Retrieves detailed numeric values for the OS version.
   // TODO(port): Implement a Linux version of this method and enable the
   // corresponding unit test.
-  static void OperatingSystemVersionNumbers(int32 *major_version,
-                                            int32 *minor_version,
-                                            int32 *bugfix_version);
+  static void OperatingSystemVersionNumbers(int32* major_version,
+                                            int32* minor_version,
+                                            int32* bugfix_version);
 
   // Returns the CPU architecture of the system. Exact return value may differ
   // across platforms.
@@ -80,9 +73,9 @@ class SysInfo {
   // Parses /etc/lsb-release to get version information for Google Chrome OS.
   // Declared here so it can be exposed for unit testing.
   static void ParseLsbRelease(const std::string& lsb_release,
-                              int32 *major_version,
-                              int32 *minor_version,
-                              int32 *bugfix_version);
+                              int32* major_version,
+                              int32* minor_version,
+                              int32* bugfix_version);
 #endif
 };
 

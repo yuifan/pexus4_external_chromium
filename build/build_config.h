@@ -17,6 +17,8 @@
 // A set of macros to use for platform detection.
 #if defined(__APPLE__)
 #define OS_MACOSX 1
+#elif defined(__native_client__)
+#define OS_NACL 1
 #elif defined(__linux__)
 #define OS_LINUX 1
 // Use TOOLKIT_GTK on linux if TOOLKIT_VIEWS isn't defined.
@@ -32,6 +34,9 @@
 #elif defined(__OpenBSD__)
 #define OS_OPENBSD 1
 #define TOOLKIT_GTK
+#elif defined(__sun)
+#define OS_SOLARIS 1
+#define TOOLKIT_GTK
 #else
 #error Please add support for your platform in build/build_config.h
 #endif
@@ -42,23 +47,48 @@
 #define TOOLKIT_USES_GTK 1
 #endif
 
-#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_OPENBSD)
-#define USE_NSS 1  // Use NSS for crypto.
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_OPENBSD) || \
+    defined(OS_SOLARIS)
+
+#if defined(ANDROID)
+#define USE_OPENSSL 1
+#define USE_SYSTEM_ZLIB 1
+#define USE_SYSTEM_SQLITE 1
+#define OS_ANDROID 1
+#endif
+
+#if !defined(USE_OPENSSL)
+#define USE_NSS 1  // Default to use NSS for crypto, unless OpenSSL is chosen.
+#endif
+#if !defined(ANDROID)
 #define USE_X11 1  // Use X for graphics.
+#else
+#undef USE_X11
+#endif
+#endif
+
+#if defined(USE_OPENSSL) && defined(USE_NSS)
+#error Cannot use both OpenSSL and NSS
 #endif
 
 // For access to standard POSIXish features, use OS_POSIX instead of a
 // more specific macro.
 #if defined(OS_MACOSX) || defined(OS_LINUX) || defined(OS_FREEBSD) || \
-    defined(OS_OPENBSD)
+    defined(OS_OPENBSD) || defined(OS_SOLARIS) || defined(OS_NACL) || \
+    defined(ANDROID)
 #define OS_POSIX 1
 // Use base::DataPack for name/value pairs.
 #define USE_BASE_DATA_PACK 1
 #endif
 
 // Use tcmalloc
-#if defined(OS_WIN) && !defined(NO_TCMALLOC)
+#if (defined(OS_WIN) || defined(OS_LINUX)) && !defined(NO_TCMALLOC)
 #define USE_TCMALLOC 1
+#endif
+
+// Use heapchecker.
+#if defined(OS_LINUX) && !defined(NO_HEAPCHECKER)
+#define USE_HEAPCHECKER 1
 #endif
 
 // Compiler detection.
@@ -87,6 +117,11 @@
 #define ARCH_CPU_ARMEL 1
 #define ARCH_CPU_32_BITS 1
 #define WCHAR_T_IS_UNSIGNED 1
+#elif defined(__MIPSEL__)
+#define ARCH_CPU_MIPS_FAMILY 1
+#define ARCH_CPU_MIPSEL 1
+#define ARCH_CPU_32_BITS 1
+#define WCHAR_T_IS_UNSIGNED 0
 #else
 #error Please add support for your architecture in build/build_config.h
 #endif
@@ -108,6 +143,21 @@
 #define WCHAR_T_IS_UTF16
 #else
 #error Please add support for your compiler in build/build_config.h
+#endif
+
+#if defined(OS_CHROMEOS)
+// Single define to trigger whether CrOS fonts have BCI on.
+// In that case font sizes/deltas should be adjusted.
+//define CROS_FONTS_USING_BCI
+#endif
+
+#if defined(OS_ANDROID)
+// The compiler thinks std::string::const_iterator and "const char*" are
+// equivalent types.
+#define STD_STRING_ITERATOR_IS_CHAR_POINTER
+// The compiler thinks base::string16::const_iterator and "char16*" are
+// equivalent types.
+#define BASE_STRING16_ITERATOR_IS_CHAR16_POINTER
 #endif
 
 #endif  // BUILD_BUILD_CONFIG_H_

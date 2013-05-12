@@ -1,4 +1,4 @@
-// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -66,7 +66,7 @@
 //
 // WARNING: FilePaths should ALWAYS be displayed with LTR directionality, even
 // when the UI language is RTL. This means you always need to pass filepaths
-// through l10n_util::WrapPathWithLTRFormatting() before displaying it in the
+// through base::i18n::WrapPathWithLTRFormatting() before displaying it in the
 // RTL UI.
 //
 // This is a very common source of bugs, please try to keep this in mind.
@@ -98,14 +98,18 @@
 
 #ifndef BASE_FILE_PATH_H_
 #define BASE_FILE_PATH_H_
+#pragma once
 
+#include <stddef.h>
 #include <string>
 #include <vector>
 
-#include "base/basictypes.h"
+#include "base/base_api.h"
 #include "base/compiler_specific.h"
 #include "base/hash_tables.h"
+#include "base/string16.h"
 #include "base/string_piece.h"  // For implicit conversions.
+#include "build/build_config.h"
 
 // Windows-style drive letter support and pathname separator characters can be
 // enabled and disabled independently, to aid testing.  These #defines are
@@ -120,7 +124,7 @@ class Pickle;
 
 // An abstraction to isolate users from the differences between native
 // pathnames on different platforms.
-class FilePath {
+class BASE_API FilePath {
  public:
 #if defined(OS_POSIX)
   // On most platforms, native pathnames are char arrays, and the encoding
@@ -150,14 +154,11 @@ class FilePath {
   // The character used to identify a file extension.
   static const CharType kExtensionSeparator;
 
-  FilePath() {}
-  FilePath(const FilePath& that) : path_(that.path_) {}
-  explicit FilePath(const StringType& path) : path_(path) {}
-
-  FilePath& operator=(const FilePath& that) {
-    path_ = that.path_;
-    return *this;
-  }
+  FilePath();
+  FilePath(const FilePath& that);
+  explicit FilePath(const StringType& path);
+  ~FilePath();
+  FilePath& operator=(const FilePath& that);
 
   bool operator==(const FilePath& that) const;
 
@@ -171,6 +172,8 @@ class FilePath {
   const StringType& value() const { return path_; }
 
   bool empty() const { return path_.empty(); }
+
+  void clear() { path_.clear(); }
 
   // Returns true if |character| is in kSeparators.
   static bool IsSeparator(CharType character);
@@ -277,11 +280,33 @@ class FilePath {
   // directory (i.e. has a path component that is ".."
   bool ReferencesParent() const;
 
+  // Return a Unicode human-readable version of this path.
+  // Warning: you can *not*, in general, go from a display name back to a real
+  // path.  Only use this when displaying paths to users, not just when you
+  // want to stuff a string16 into some other API.
+  string16 LossyDisplayName() const;
+
+  // Return the path as ASCII, or the empty string if the path is not ASCII.
+  // This should only be used for cases where the FilePath is representing a
+  // known-ASCII filename.
+  std::string MaybeAsASCII() const;
+
   // Older Chromium code assumes that paths are always wstrings.
-  // This function converts a wstring to a FilePath, and is useful to smooth
-  // porting that old code to the FilePath API.
-  // It has "Hack" in its name so people feel bad about using it.
-  // TODO(port): remove these functions.
+  // This function converts wstrings to FilePaths, and is
+  // useful to smooth porting that old code to the FilePath API.
+  // It has "Hack" its name so people feel bad about using it.
+  // http://code.google.com/p/chromium/issues/detail?id=24672
+  //
+  // If you are trying to be a good citizen and remove these, ask yourself:
+  // - Am I interacting with other Chrome code that deals with files?  Then
+  //   try to convert the API into using FilePath.
+  // - Am I interacting with OS-native calls?  Then use value() to get at an
+  //   OS-native string format.
+  // - Am I using well-known file names, like "config.ini"?  Then use the
+  //   ASCII functions (we require paths to always be supersets of ASCII).
+  // - Am I displaying a string to the user in some UI?  Then use the
+  //   LossyDisplayName() function, but keep in mind that you can't
+  //   ever use the result of that again as a path.
   static FilePath FromWStringHack(const std::wstring& wstring);
 
   // Static helper method to write a StringType to a pickle.
@@ -292,6 +317,11 @@ class FilePath {
 
   void WriteToPickle(Pickle* pickle);
   bool ReadFromPickle(Pickle* pickle, void** iter);
+
+#if defined(FILE_PATH_USES_WIN_SEPARATORS)
+  // Normalize all path separators to backslash.
+  FilePath NormalizeWindowsPathSeparators() const;
+#endif
 
   // Compare two strings in the same way the file system does.
   // Note that these always ignore case, even on file systems that are case-
@@ -328,13 +358,6 @@ class FilePath {
                                    const StringType& string2);
 #endif
 
-  // Older Chromium code assumes that paths are always wstrings.
-  // This function produces a wstring from a FilePath, and is useful to smooth
-  // porting that old code to the FilePath API.
-  // It has "Hack" in its name so people feel bad about using it.
-  // TODO(port): remove these functions.
-  std::wstring ToWStringHack() const;
-
  private:
   // Remove trailing separators from this object.  If the path is absolute, it
   // will never be stripped any more than to refer to the absolute root
@@ -346,11 +369,16 @@ class FilePath {
   StringType path_;
 };
 
-// Macros for string literal initialization of FilePath::CharType[].
+// Macros for string literal initialization of FilePath::CharType[], and for
+// using a FilePath::CharType[] in a printf-style format string.
 #if defined(OS_POSIX)
 #define FILE_PATH_LITERAL(x) x
+#define PRFilePath "s"
+#define PRFilePathLiteral "%s"
 #elif defined(OS_WIN)
 #define FILE_PATH_LITERAL(x) L ## x
+#define PRFilePath "ls"
+#define PRFilePathLiteral L"%ls"
 #endif  // OS_WIN
 
 // Provide a hash function so that hash_sets and maps can contain FilePath
@@ -360,7 +388,7 @@ namespace __gnu_cxx {
 
 template<>
 struct hash<FilePath> {
-  std::size_t operator()(const FilePath& f) const {
+  size_t operator()(const FilePath& f) const {
     return hash<FilePath::StringType>()(f.value());
   }
 };

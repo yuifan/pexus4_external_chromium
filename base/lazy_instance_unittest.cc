@@ -5,7 +5,7 @@
 #include "base/at_exit.h"
 #include "base/atomic_sequence_num.h"
 #include "base/lazy_instance.h"
-#include "base/simple_thread.h"
+#include "base/threading/simple_thread.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
 namespace {
@@ -26,7 +26,8 @@ class ConstructAndDestructLogger {
 class SlowConstructor {
  public:
   SlowConstructor() : some_int_(0) {
-    PlatformThread::Sleep(1000);  // Sleep for 1 second to try to cause a race.
+    // Sleep for 1 second to try to cause a race.
+    base::PlatformThread::Sleep(1000);
     ++constructed;
     some_int_ = 12;
   }
@@ -94,4 +95,47 @@ TEST(LazyInstanceTest, ConstructorThreadSafety) {
     pool.JoinAll();
     EXPECT_EQ(1, SlowConstructor::constructed);
   }
+}
+
+namespace {
+
+// DeleteLogger is an object which sets a flag when it's destroyed.
+// It accepts a bool* and sets the bool to true when the dtor runs.
+class DeleteLogger {
+ public:
+  DeleteLogger() : deleted_(NULL) {}
+  ~DeleteLogger() { *deleted_ = true; }
+
+  void SetDeletedPtr(bool* deleted) {
+    deleted_ = deleted;
+  }
+
+ private:
+  bool* deleted_;
+};
+
+}  // anonymous namespace
+
+TEST(LazyInstanceTest, LeakyLazyInstance) {
+  // Check that using a plain LazyInstance causes the dtor to run
+  // when the AtExitManager finishes.
+  bool deleted1 = false;
+  {
+    base::ShadowingAtExitManager shadow;
+    static base::LazyInstance<DeleteLogger> test(base::LINKER_INITIALIZED);
+    test.Get().SetDeletedPtr(&deleted1);
+  }
+  EXPECT_TRUE(deleted1);
+
+  // Check that using a *leaky* LazyInstance makes the dtor not run
+  // when the AtExitManager finishes.
+  bool deleted2 = false;
+  {
+    base::ShadowingAtExitManager shadow;
+    static base::LazyInstance<DeleteLogger,
+                              base::LeakyLazyInstanceTraits<DeleteLogger> >
+        test(base::LINKER_INITIALIZED);
+    test.Get().SetDeletedPtr(&deleted2);
+  }
+  EXPECT_FALSE(deleted2);
 }

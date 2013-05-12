@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -9,17 +9,23 @@
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <libgen.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/errno.h>
 #include <sys/mman.h>
+#include <sys/param.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #if defined(OS_MACOSX)
 #include <AvailabilityMacros.h>
+#elif !defined(ANDROID)
+#include <glib.h>
 #endif
 
 #include <fstream>
@@ -27,51 +33,57 @@
 #include "base/basictypes.h"
 #include "base/eintr_wrapper.h"
 #include "base/file_path.h"
-#include "base/lock.h"
 #include "base/logging.h"
-#include "base/scoped_ptr.h"
-#include "base/singleton.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/memory/singleton.h"
 #include "base/string_util.h"
 #include "base/sys_string_conversions.h"
+#include "base/threading/thread_restrictions.h"
 #include "base/time.h"
 #include "base/utf_string_conversions.h"
 
 namespace file_util {
 
-#if defined(OS_FREEBSD) || \
+namespace {
+
+// Helper for NormalizeFilePath(), defined below.
+bool RealPath(const FilePath& path, FilePath* real_path) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For realpath().
+  FilePath::CharType buf[PATH_MAX];
+  if (!realpath(path.value().c_str(), buf))
+    return false;
+
+  *real_path = FilePath(buf);
+  return true;
+}
+
+}  // namespace
+
+#if defined(OS_OPENBSD) || defined(OS_FREEBSD) || \
     (defined(OS_MACOSX) && \
      MAC_OS_X_VERSION_MIN_REQUIRED < MAC_OS_X_VERSION_10_5)
 typedef struct stat stat_wrapper_t;
 static int CallStat(const char *path, stat_wrapper_t *sb) {
+  base::ThreadRestrictions::AssertIOAllowed();
   return stat(path, sb);
 }
 #else
 typedef struct stat64 stat_wrapper_t;
 static int CallStat(const char *path, stat_wrapper_t *sb) {
+  base::ThreadRestrictions::AssertIOAllowed();
   return stat64(path, sb);
 }
 #endif
 
 
 #if defined(GOOGLE_CHROME_BUILD)
-static const char* kTempFileName = "com.google.chrome.XXXXXX";
+static const char* kTempFileName = ".com.google.chrome.XXXXXX";
 #else
-static const char* kTempFileName = "org.chromium.XXXXXX";
+static const char* kTempFileName = ".org.chromium.XXXXXX";
 #endif
 
-std::wstring GetDirectoryFromPath(const std::wstring& path) {
-  if (EndsWithSeparator(path)) {
-    return FilePath::FromWStringHack(path)
-        .StripTrailingSeparators()
-        .ToWStringHack();
-  } else {
-    char full_path[PATH_MAX];
-    base::strlcpy(full_path, WideToUTF8(path).c_str(), arraysize(full_path));
-    return UTF8ToWide(dirname(full_path));
-  }
-}
-
 bool AbsolutePath(FilePath* path) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For realpath().
   char full_path[PATH_MAX];
   if (realpath(path->value().c_str(), full_path) == NULL)
     return false;
@@ -81,12 +93,13 @@ bool AbsolutePath(FilePath* path) {
 
 int CountFilesCreatedAfter(const FilePath& path,
                            const base::Time& comparison_time) {
+  base::ThreadRestrictions::AssertIOAllowed();
   int file_count = 0;
 
   DIR* dir = opendir(path.value().c_str());
   if (dir) {
 #if !defined(OS_LINUX) && !defined(OS_MACOSX) && !defined(OS_FREEBSD) && \
-    !defined(OS_OPENBSD)
+    !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
   #error Port warning: depending on the definition of struct dirent, \
          additional space for pathname may be needed
 #endif
@@ -118,7 +131,7 @@ int CountFilesCreatedAfter(const FilePath& path,
       // which are older than |comparison_time| are considered newer
       // (current implementation) 2. files newer than
       // |comparison_time| are considered older.
-      if (st.st_ctime >= comparison_time.ToTimeT())
+      if (static_cast<time_t>(st.st_ctime) >= comparison_time.ToTimeT())
         ++file_count;
     }
     closedir(dir);
@@ -131,6 +144,7 @@ int CountFilesCreatedAfter(const FilePath& path,
 // that functionality. If not, remove from file_util_win.cc, otherwise add it
 // here.
 bool Delete(const FilePath& path, bool recursive) {
+  base::ThreadRestrictions::AssertIOAllowed();
   const char* path_str = path.value().c_str();
   stat_wrapper_t file_info;
   int test = CallStat(path_str, &file_info);
@@ -166,11 +180,11 @@ bool Delete(const FilePath& path, bool recursive) {
     directories.pop();
     success = (rmdir(dir.value().c_str()) == 0);
   }
-
   return success;
 }
 
 bool Move(const FilePath& from_path, const FilePath& to_path) {
+  base::ThreadRestrictions::AssertIOAllowed();
   // Windows compatibility: if to_path exists, from_path and to_path
   // must be the same type, either both files, or both directories.
   stat_wrapper_t to_file_info;
@@ -195,12 +209,14 @@ bool Move(const FilePath& from_path, const FilePath& to_path) {
 }
 
 bool ReplaceFile(const FilePath& from_path, const FilePath& to_path) {
+  base::ThreadRestrictions::AssertIOAllowed();
   return (rename(from_path.value().c_str(), to_path.value().c_str()) == 0);
 }
 
 bool CopyDirectory(const FilePath& from_path,
                    const FilePath& to_path,
                    bool recursive) {
+  base::ThreadRestrictions::AssertIOAllowed();
   // Some old callers of CopyDirectory want it to support wildcards.
   // After some discussion, we decided to fix those callers.
   // Break loudly here if anyone tries to do this.
@@ -300,25 +316,17 @@ bool CopyDirectory(const FilePath& from_path,
 }
 
 bool PathExists(const FilePath& path) {
-  stat_wrapper_t file_info;
-  return CallStat(path.value().c_str(), &file_info) == 0;
+  base::ThreadRestrictions::AssertIOAllowed();
+  return access(path.value().c_str(), F_OK) == 0;
 }
 
 bool PathIsWritable(const FilePath& path) {
-  FilePath test_path(path);
-  stat_wrapper_t file_info;
-  if (CallStat(test_path.value().c_str(), &file_info) != 0)
-    return false;
-  if (S_IWOTH & file_info.st_mode)
-    return true;
-  if (getegid() == file_info.st_gid && (S_IWGRP & file_info.st_mode))
-    return true;
-  if (geteuid() == file_info.st_uid && (S_IWUSR & file_info.st_mode))
-    return true;
-  return false;
+  base::ThreadRestrictions::AssertIOAllowed();
+  return access(path.value().c_str(), W_OK) == 0;
 }
 
 bool DirectoryExists(const FilePath& path) {
+  base::ThreadRestrictions::AssertIOAllowed();
   stat_wrapper_t file_info;
   if (CallStat(path.value().c_str(), &file_info) == 0)
     return S_ISDIR(file_info.st_mode);
@@ -365,33 +373,59 @@ bool ReadFromFD(int fd, char* buffer, size_t bytes) {
   return total_read == bytes;
 }
 
+bool CreateSymbolicLink(const FilePath& target_path,
+                        const FilePath& symlink_path) {
+  DCHECK(!symlink_path.empty());
+  DCHECK(!target_path.empty());
+  return ::symlink(target_path.value().c_str(),
+                   symlink_path.value().c_str()) != -1;
+}
+
+bool ReadSymbolicLink(const FilePath& symlink_path,
+                      FilePath* target_path) {
+  DCHECK(!symlink_path.empty());
+  DCHECK(target_path);
+  char buf[PATH_MAX];
+  ssize_t count = ::readlink(symlink_path.value().c_str(), buf, arraysize(buf));
+
+  if (count <= 0) {
+    target_path->clear();
+    return false;
+  }
+
+  *target_path = FilePath(FilePath::StringType(buf, count));
+  return true;
+}
+
 // Creates and opens a temporary file in |directory|, returning the
 // file descriptor. |path| is set to the temporary file path.
 // This function does NOT unlink() the file.
 int CreateAndOpenFdForTemporaryFile(FilePath directory, FilePath* path) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For call to mkstemp().
   *path = directory.Append(kTempFileName);
   const std::string& tmpdir_string = path->value();
   // this should be OK since mkstemp just replaces characters in place
   char* buffer = const_cast<char*>(tmpdir_string.c_str());
 
-  return mkstemp(buffer);
+  return HANDLE_EINTR(mkstemp(buffer));
 }
 
 bool CreateTemporaryFile(FilePath* path) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For call to close().
   FilePath directory;
   if (!GetTempDir(&directory))
     return false;
   int fd = CreateAndOpenFdForTemporaryFile(directory, path);
   if (fd < 0)
     return false;
-  close(fd);
+  ignore_result(HANDLE_EINTR(close(fd)));
   return true;
 }
 
 FILE* CreateAndOpenTemporaryShmemFile(FilePath* path) {
   FilePath directory;
   if (!GetShmemTempDir(&directory))
-    return false;
+    return NULL;
 
   return CreateAndOpenTemporaryFileInDir(directory, path);
 }
@@ -401,12 +435,45 @@ FILE* CreateAndOpenTemporaryFileInDir(const FilePath& dir, FilePath* path) {
   if (fd < 0)
     return NULL;
 
-  return fdopen(fd, "a+");
+  FILE* file = fdopen(fd, "a+");
+  if (!file)
+    ignore_result(HANDLE_EINTR(close(fd)));
+  return file;
 }
 
 bool CreateTemporaryFileInDir(const FilePath& dir, FilePath* temp_file) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For call to close().
   int fd = CreateAndOpenFdForTemporaryFile(dir, temp_file);
-  return ((fd >= 0) && !close(fd));
+  return ((fd >= 0) && !HANDLE_EINTR(close(fd)));
+}
+
+static bool CreateTemporaryDirInDirImpl(const FilePath& base_dir,
+                                        const FilePath::StringType& name_tmpl,
+                                        FilePath* new_dir) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For call to mkdtemp().
+  CHECK(name_tmpl.find("XXXXXX") != FilePath::StringType::npos)
+    << "Directory name template must contain \"XXXXXX\".";
+
+  FilePath sub_dir = base_dir.Append(name_tmpl);
+  std::string sub_dir_string = sub_dir.value();
+
+  // this should be OK since mkdtemp just replaces characters in place
+  char* buffer = const_cast<char*>(sub_dir_string.c_str());
+  char* dtemp = mkdtemp(buffer);
+  if (!dtemp) {
+    DPLOG(ERROR) << "mkdtemp";
+    return false;
+  }
+  *new_dir = FilePath(dtemp);
+  return true;
+}
+
+bool CreateTemporaryDirInDir(const FilePath& base_dir,
+                             const FilePath::StringType& prefix,
+                             FilePath* new_dir) {
+  FilePath::StringType mkdtemp_template = prefix;
+  mkdtemp_template.append(FILE_PATH_LITERAL("XXXXXX"));
+  return CreateTemporaryDirInDirImpl(base_dir, mkdtemp_template, new_dir);
 }
 
 bool CreateNewTempDirectory(const FilePath::StringType& prefix,
@@ -414,18 +481,12 @@ bool CreateNewTempDirectory(const FilePath::StringType& prefix,
   FilePath tmpdir;
   if (!GetTempDir(&tmpdir))
     return false;
-  tmpdir = tmpdir.Append(kTempFileName);
-  std::string tmpdir_string = tmpdir.value();
-  // this should be OK since mkdtemp just replaces characters in place
-  char* buffer = const_cast<char*>(tmpdir_string.c_str());
-  char* dtemp = mkdtemp(buffer);
-  if (!dtemp)
-    return false;
-  *new_temp_path = FilePath(dtemp);
-  return true;
+
+  return CreateTemporaryDirInDirImpl(tmpdir, kTempFileName, new_temp_path);
 }
 
 bool CreateDirectory(const FilePath& full_path) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For call to mkdir().
   std::vector<FilePath> subpaths;
 
   // Collect a list of all parent directories.
@@ -440,25 +501,34 @@ bool CreateDirectory(const FilePath& full_path) {
   // Iterate through the parents and create the missing ones.
   for (std::vector<FilePath>::reverse_iterator i = subpaths.rbegin();
        i != subpaths.rend(); ++i) {
-    if (!DirectoryExists(*i)) {
-      if (mkdir(i->value().c_str(), 0700) != 0)
-        return false;
-    }
+    if (DirectoryExists(*i))
+      continue;
+    if (mkdir(i->value().c_str(), 0700) == 0)
+      continue;
+    // Mkdir failed, but it might have failed with EEXIST, or some other error
+    // due to the the directory appearing out of thin air. This can occur if
+    // two processes are trying to create the same file system tree at the same
+    // time. Check to see if it exists and make sure it is a directory.
+    if (!DirectoryExists(*i))
+      return false;
   }
   return true;
 }
 
-bool GetFileInfo(const FilePath& file_path, FileInfo* results) {
+bool GetFileInfo(const FilePath& file_path, base::PlatformFileInfo* results) {
   stat_wrapper_t file_info;
   if (CallStat(file_path.value().c_str(), &file_info) != 0)
     return false;
   results->is_directory = S_ISDIR(file_info.st_mode);
   results->size = file_info.st_size;
   results->last_modified = base::Time::FromTimeT(file_info.st_mtime);
+  results->last_accessed = base::Time::FromTimeT(file_info.st_atime);
+  results->creation_time = base::Time::FromTimeT(file_info.st_ctime);
   return true;
 }
 
 bool GetInode(const FilePath& path, ino_t* inode) {
+  base::ThreadRestrictions::AssertIOAllowed();  // For call to stat().
   struct stat buffer;
   int result = stat(path.value().c_str(), &buffer);
   if (result < 0)
@@ -473,11 +543,17 @@ FILE* OpenFile(const std::string& filename, const char* mode) {
 }
 
 FILE* OpenFile(const FilePath& filename, const char* mode) {
-  return fopen(filename.value().c_str(), mode);
+  base::ThreadRestrictions::AssertIOAllowed();
+  FILE* result = NULL;
+  do {
+    result = fopen(filename.value().c_str(), mode);
+  } while (!result && errno == EINTR);
+  return result;
 }
 
 int ReadFile(const FilePath& filename, char* data, int size) {
-  int fd = open(filename.value().c_str(), O_RDONLY);
+  base::ThreadRestrictions::AssertIOAllowed();
+  int fd = HANDLE_EINTR(open(filename.value().c_str(), O_RDONLY));
   if (fd < 0)
     return -1;
 
@@ -488,7 +564,8 @@ int ReadFile(const FilePath& filename, char* data, int size) {
 }
 
 int WriteFile(const FilePath& filename, const char* data, int size) {
-  int fd = creat(filename.value().c_str(), 0666);
+  base::ThreadRestrictions::AssertIOAllowed();
+  int fd = HANDLE_EINTR(creat(filename.value().c_str(), 0666));
   if (fd < 0)
     return -1;
 
@@ -515,6 +592,9 @@ int WriteFileDescriptor(const int fd, const char* data, int size) {
 
 // Gets the current working directory for the process.
 bool GetCurrentDirectory(FilePath* dir) {
+  // getcwd can return ENOENT, which implies it checks against the disk.
+  base::ThreadRestrictions::AssertIOAllowed();
+
   char system_buffer[PATH_MAX] = "";
   if (!getcwd(system_buffer, sizeof(system_buffer))) {
     NOTREACHED();
@@ -526,6 +606,7 @@ bool GetCurrentDirectory(FilePath* dir) {
 
 // Sets the current working directory for the process.
 bool SetCurrentDirectory(const FilePath& path) {
+  base::ThreadRestrictions::AssertIOAllowed();
   int ret = chdir(path.value().c_str());
   return !ret;
 }
@@ -539,8 +620,7 @@ FileEnumerator::FileEnumerator(const FilePath& root_path,
     : current_directory_entry_(0),
       root_path_(root_path),
       recursive_(recursive),
-      file_type_(file_type),
-      is_in_find_op_(false) {
+      file_type_(file_type) {
   // INCLUDE_DOT_DOT must not be specified if recursive.
   DCHECK(!(recursive && (INCLUDE_DOT_DOT & file_type_)));
   pending_paths_.push(root_path);
@@ -554,34 +634,18 @@ FileEnumerator::FileEnumerator(const FilePath& root_path,
       root_path_(root_path),
       recursive_(recursive),
       file_type_(file_type),
-      pattern_(root_path.Append(pattern).value()),
-      is_in_find_op_(false) {
+      pattern_(root_path.Append(pattern).value()) {
   // INCLUDE_DOT_DOT must not be specified if recursive.
   DCHECK(!(recursive && (INCLUDE_DOT_DOT & file_type_)));
   // The Windows version of this code appends the pattern to the root_path,
   // potentially only matching against items in the top-most directory.
   // Do the same here.
-  if (pattern.size() == 0)
+  if (pattern.empty())
     pattern_ = FilePath::StringType();
   pending_paths_.push(root_path);
 }
 
 FileEnumerator::~FileEnumerator() {
-}
-
-void FileEnumerator::GetFindInfo(FindInfo* info) {
-  DCHECK(info);
-
-  if (current_directory_entry_ >= directory_entries_.size())
-    return;
-
-  DirectoryEntryInfo* cur_entry = &directory_entries_[current_directory_entry_];
-  memcpy(&(info->stat), &(cur_entry->stat), sizeof(info->stat));
-  info->filename.assign(cur_entry->filename.value());
-}
-
-bool FileEnumerator::IsDirectory(const FindInfo& info) {
-  return S_ISDIR(info.stat.st_mode);
 }
 
 FilePath FileEnumerator::Next() {
@@ -625,14 +689,35 @@ FilePath FileEnumerator::Next() {
       ].filename);
 }
 
+void FileEnumerator::GetFindInfo(FindInfo* info) {
+  DCHECK(info);
+
+  if (current_directory_entry_ >= directory_entries_.size())
+    return;
+
+  DirectoryEntryInfo* cur_entry = &directory_entries_[current_directory_entry_];
+  memcpy(&(info->stat), &(cur_entry->stat), sizeof(info->stat));
+  info->filename.assign(cur_entry->filename.value());
+}
+
+bool FileEnumerator::IsDirectory(const FindInfo& info) {
+  return S_ISDIR(info.stat.st_mode);
+}
+
+// static
+FilePath FileEnumerator::GetFilename(const FindInfo& find_info) {
+  return FilePath(find_info.filename);
+}
+
 bool FileEnumerator::ReadDirectory(std::vector<DirectoryEntryInfo>* entries,
                                    const FilePath& source, bool show_links) {
+  base::ThreadRestrictions::AssertIOAllowed();
   DIR* dir = opendir(source.value().c_str());
   if (!dir)
     return false;
 
 #if !defined(OS_LINUX) && !defined(OS_MACOSX) && !defined(OS_FREEBSD) && \
-    !defined(OS_OPENBSD)
+    !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
   #error Port warning: depending on the definition of struct dirent, \
          additional space for pathname may be needed
 #endif
@@ -652,7 +737,7 @@ bool FileEnumerator::ReadDirectory(std::vector<DirectoryEntryInfo>* entries,
     if (ret < 0) {
       // Print the stat() error message unless it was ENOENT and we're
       // following symlinks.
-      if (!(ret == ENOENT && !show_links)) {
+      if (!(errno == ENOENT && !show_links)) {
         PLOG(ERROR) << "Couldn't stat "
                     << source.Append(dent->d_name).value();
       }
@@ -675,6 +760,8 @@ MemoryMappedFile::MemoryMappedFile()
 }
 
 bool MemoryMappedFile::MapFileToMemoryInternal() {
+  base::ThreadRestrictions::AssertIOAllowed();
+
   struct stat file_stat;
   if (fstat(file_, &file_stat) == base::kInvalidPlatformFileValue) {
     LOG(ERROR) << "Couldn't fstat " << file_ << ", errno " << errno;
@@ -691,10 +778,12 @@ bool MemoryMappedFile::MapFileToMemoryInternal() {
 }
 
 void MemoryMappedFile::CloseHandles() {
+  base::ThreadRestrictions::AssertIOAllowed();
+
   if (data_ != NULL)
     munmap(data_, length_);
   if (file_ != base::kInvalidPlatformFileValue)
-    close(file_);
+    ignore_result(HANDLE_EINTR(close(file_)));
 
   data_ = NULL;
   length_ = 0;
@@ -703,7 +792,107 @@ void MemoryMappedFile::CloseHandles() {
 
 bool HasFileBeenModifiedSince(const FileEnumerator::FindInfo& find_info,
                               const base::Time& cutoff_time) {
-  return find_info.stat.st_mtime >= cutoff_time.ToTimeT();
+  return static_cast<time_t>(find_info.stat.st_mtime) >= cutoff_time.ToTimeT();
 }
 
-} // namespace file_util
+bool NormalizeFilePath(const FilePath& path, FilePath* normalized_path) {
+  FilePath real_path_result;
+  if (!RealPath(path, &real_path_result))
+    return false;
+
+  // To be consistant with windows, fail if |real_path_result| is a
+  // directory.
+  stat_wrapper_t file_info;
+  if (CallStat(real_path_result.value().c_str(), &file_info) != 0 ||
+      S_ISDIR(file_info.st_mode))
+    return false;
+
+  *normalized_path = real_path_result;
+  return true;
+}
+
+#if !defined(OS_MACOSX)
+bool GetTempDir(FilePath* path) {
+  const char* tmp = getenv("TMPDIR");
+  if (tmp)
+    *path = FilePath(tmp);
+  else
+    *path = FilePath("/tmp");
+  return true;
+}
+
+bool GetShmemTempDir(FilePath* path) {
+  *path = FilePath("/dev/shm");
+  return true;
+}
+
+FilePath GetHomeDir() {
+#ifndef ANDROID
+  const char* home_dir = getenv("HOME");
+  if (home_dir && home_dir[0])
+    return FilePath(home_dir);
+
+  // g_get_home_dir calls getpwent, which can fall through to LDAP calls.
+  base::ThreadRestrictions::AssertIOAllowed();
+
+  home_dir = g_get_home_dir();
+  if (home_dir && home_dir[0])
+    return FilePath(home_dir);
+
+  FilePath rv;
+  if (file_util::GetTempDir(&rv))
+    return rv;
+#endif
+  // Last resort.
+  return FilePath("/tmp");
+}
+
+bool CopyFile(const FilePath& from_path, const FilePath& to_path) {
+  base::ThreadRestrictions::AssertIOAllowed();
+  int infile = HANDLE_EINTR(open(from_path.value().c_str(), O_RDONLY));
+  if (infile < 0)
+    return false;
+
+  int outfile = HANDLE_EINTR(creat(to_path.value().c_str(), 0666));
+  if (outfile < 0) {
+    ignore_result(HANDLE_EINTR(close(infile)));
+    return false;
+  }
+
+  const size_t kBufferSize = 32768;
+  std::vector<char> buffer(kBufferSize);
+  bool result = true;
+
+  while (result) {
+    ssize_t bytes_read = HANDLE_EINTR(read(infile, &buffer[0], buffer.size()));
+    if (bytes_read < 0) {
+      result = false;
+      break;
+    }
+    if (bytes_read == 0)
+      break;
+    // Allow for partial writes
+    ssize_t bytes_written_per_read = 0;
+    do {
+      ssize_t bytes_written_partial = HANDLE_EINTR(write(
+          outfile,
+          &buffer[bytes_written_per_read],
+          bytes_read - bytes_written_per_read));
+      if (bytes_written_partial < 0) {
+        result = false;
+        break;
+      }
+      bytes_written_per_read += bytes_written_partial;
+    } while (bytes_written_per_read < bytes_read);
+  }
+
+  if (HANDLE_EINTR(close(infile)) < 0)
+    result = false;
+  if (HANDLE_EINTR(close(outfile)) < 0)
+    result = false;
+
+  return result;
+}
+#endif  // defined(OS_MACOSX)
+
+}  // namespace file_util

@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -19,16 +19,19 @@
 
 #ifndef NET_BASE_SDCH_MANAGER_H_
 #define NET_BASE_SDCH_MANAGER_H_
+#pragma once
 
 #include <map>
 #include <set>
 #include <string>
 
-#include "base/ref_counted.h"
-#include "base/scoped_ptr.h"
+#include "base/gtest_prod_util.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/scoped_ptr.h"
 #include "base/time.h"
 #include "googleurl/src/gurl.h"
-#include "testing/gtest/include/gtest/gtest_prod.h"
+
+namespace net {
 
 //------------------------------------------------------------------------------
 // Create a public interface to help us load SDCH dictionaries.
@@ -48,6 +51,7 @@ class SdchFetcher {
  private:
   DISALLOW_COPY_AND_ASSIGN(SdchFetcher);
 };
+
 //------------------------------------------------------------------------------
 
 class SdchManager {
@@ -165,16 +169,20 @@ class SdchManager {
    private:
     friend class base::RefCounted<Dictionary>;
     friend class SdchManager;  // Only manager can construct an instance.
-    FRIEND_TEST(SdchFilterTest, PathMatch);
+    FRIEND_TEST_ALL_PREFIXES(SdchFilterTest, PathMatch);
 
     // Construct a vc-diff usable dictionary from the dictionary_text starting
     // at the given offset.  The supplied client_hash should be used to
     // advertise the dictionary's availability relative to the suppplied URL.
-    Dictionary(const std::string& dictionary_text, size_t offset,
-               const std::string& client_hash, const GURL& url,
-               const std::string& domain, const std::string& path,
-               const base::Time& expiration, const std::set<int> ports);
-    ~Dictionary() {}
+    Dictionary(const std::string& dictionary_text,
+               size_t offset,
+               const std::string& client_hash,
+               const GURL& url,
+               const std::string& domain,
+               const std::string& path,
+               const base::Time& expiration,
+               const std::set<int>& ports);
+    ~Dictionary();
 
     const GURL& url() const { return url_; }
     const std::string& client_hash() const { return client_hash_; }
@@ -186,7 +194,7 @@ class SdchManager {
     // Security methods to check if we can establish a new dictionary with the
     // given data, that arrived in response to get of dictionary_url.
     static bool CanSet(const std::string& domain, const std::string& path,
-                       const std::set<int> ports, const GURL& dictionary_url);
+                       const std::set<int>& ports, const GURL& dictionary_url);
 
     // Security method to check if we can use a dictionary to decompress a
     // target that arrived with a reference to this dictionary.
@@ -274,7 +282,7 @@ class SdchManager {
   // supported domain (i.e., not blacklisted, and either the specific supported
   // domain, or all domains were assumed supported).  If it is blacklist, reduce
   // by 1 the number of times it will be reported as blacklisted.
-  const bool IsInSupportedDomain(const GURL& url);
+  bool IsInSupportedDomain(const GURL& url);
 
   // Schedule the URL fetching to load a dictionary. This will always return
   // before the dictionary is actually loaded and added.
@@ -363,5 +371,7 @@ class SdchManager {
 
   DISALLOW_COPY_AND_ASSIGN(SdchManager);
 };
+
+}  // namespace net
 
 #endif  // NET_BASE_SDCH_MANAGER_H_

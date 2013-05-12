@@ -6,18 +6,18 @@
 
 #include "net/base/winsock_init.h"
 
+#include "base/lazy_instance.h"
 #include "base/logging.h"
-#include "base/singleton.h"
 
 namespace {
 
 class WinsockInitSingleton {
  public:
-  WinsockInitSingleton() : did_init_(false) {
+  WinsockInitSingleton() {
     WORD winsock_ver = MAKEWORD(2, 2);
     WSAData wsa_data;
-    did_init_ = (WSAStartup(winsock_ver, &wsa_data) == 0);
-    if (did_init_) {
+    bool did_init = (WSAStartup(winsock_ver, &wsa_data) == 0);
+    if (did_init) {
       DCHECK(wsa_data.wVersion == winsock_ver);
 
       // The first time WSAGetLastError is called, the delay load helper will
@@ -32,20 +32,20 @@ class WinsockInitSingleton {
   }
 
   ~WinsockInitSingleton() {
-    if (did_init_)
-      WSACleanup();
+    // Don't call WSACleanup() since the worker pool threads can continue to
+    // call getaddrinfo() after Winsock has shutdown, which can lead to crashes.
   }
-
- private:
-  bool did_init_;
 };
+
+static base::LazyInstance<WinsockInitSingleton> g_winsock_init_singleton(
+    base::LINKER_INITIALIZED);
 
 }  // namespace
 
 namespace net {
 
 void EnsureWinsockInit() {
-  Singleton<WinsockInitSingleton>::get();
+  g_winsock_init_singleton.Get();
 }
 
 }  // namespace net

@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,21 +6,24 @@
 
 #include "base/at_exit.h"
 #include "base/command_line.h"
+#include "base/lazy_instance.h"
 #include "base/message_loop.h"
-#include "base/singleton.h"
-#include "base/stats_counters.h"
+#include "base/metrics/stats_counters.h"
+#include "base/string_number_conversions.h"
 #include "base/string_util.h"
+#include "net/base/cert_verifier.h"
 #include "net/base/completion_callback.h"
 #include "net/base/host_resolver.h"
 #include "net/base/io_buffer.h"
 #include "net/base/net_errors.h"
 #include "net/base/ssl_config_service.h"
+#include "net/http/http_auth_handler_factory.h"
 #include "net/http/http_cache.h"
 #include "net/http/http_network_layer.h"
+#include "net/http/http_network_session.h"
 #include "net/http/http_request_info.h"
 #include "net/http/http_transaction.h"
 #include "net/proxy/proxy_service.h"
-#include "net/socket/client_socket_factory.h"
 
 void usage(const char* program_name) {
   printf("usage: %s --url=<url>  [--n=<clients>] [--stats] [--use_cache]\n",
@@ -45,6 +48,8 @@ class Driver {
   int clients_;
 };
 
+static base::LazyInstance<Driver> g_driver(base::LINKER_INITIALIZED);
+
 // A network client
 class Client {
  public:
@@ -58,11 +63,11 @@ class Client {
     int rv = factory->CreateTransaction(&transaction_);
     DCHECK_EQ(net::OK, rv);
     buffer_->AddRef();
-    driver_->ClientStarted();
+    g_driver.Get().ClientStarted();
     request_info_.url = url_;
     request_info_.method = "GET";
     int state = transaction_->Start(
-        &request_info_, &connect_callback_, NULL);
+        &request_info_, &connect_callback_, net::BoundNetLog());
     DCHECK(state == net::ERR_IO_PENDING);
   };
 
@@ -84,7 +89,7 @@ class Client {
     }
 
     // Deal with received data here.
-    static StatsCounter bytes_read("FetchClient.bytes_read");
+    base::StatsCounter bytes_read("FetchClient.bytes_read");
     bytes_read.Add(result);
 
     // Issue a read for more data.
@@ -97,9 +102,9 @@ class Client {
   }
 
   void OnRequestComplete(int result) {
-    static StatsCounter requests("FetchClient.requests");
+    base::StatsCounter requests("FetchClient.requests");
     requests.Increment();
-    driver_->ClientStopped();
+    g_driver.Get().ClientStopped();
     printf(".");
   }
 
@@ -110,12 +115,11 @@ class Client {
   scoped_refptr<net::IOBuffer> buffer_;
   net::CompletionCallbackImpl<Client> connect_callback_;
   net::CompletionCallbackImpl<Client> read_callback_;
-  Singleton<Driver> driver_;
 };
 
 int main(int argc, char**argv) {
   base::AtExitManager exit;
-  StatsTable table("fetchclient", 50, 1000);
+  base::StatsTable table("fetchclient", 50, 1000);
   table.set_current(&table);
 
   CommandLine::Init(argc, argv);
@@ -124,33 +128,47 @@ int main(int argc, char**argv) {
   if (!url.length())
     usage(argv[0]);
   int client_limit = 1;
-  if (parsed_command_line.HasSwitch("n"))
-    StringToInt(parsed_command_line.GetSwitchValueASCII("n"), &client_limit);
+  if (parsed_command_line.HasSwitch("n")) {
+    base::StringToInt(parsed_command_line.GetSwitchValueASCII("n"),
+                      &client_limit);
+  }
   bool use_cache = parsed_command_line.HasSwitch("use-cache");
 
   // Do work here.
   MessageLoop loop(MessageLoop::TYPE_IO);
 
-  scoped_refptr<net::HostResolver> host_resolver(
-      net::CreateSystemHostResolver(NULL));
+  scoped_ptr<net::HostResolver> host_resolver(
+      net::CreateSystemHostResolver(net::HostResolver::kDefaultParallelism,
+                                    NULL, NULL));
 
+  scoped_ptr<net::CertVerifier> cert_verifier(new net::CertVerifier);
   scoped_refptr<net::ProxyService> proxy_service(
-      net::ProxyService::CreateNull());
+      net::ProxyService::CreateDirect());
   scoped_refptr<net::SSLConfigService> ssl_config_service(
       net::SSLConfigService::CreateSystemSSLConfigService());
   net::HttpTransactionFactory* factory = NULL;
+  scoped_ptr<net::HttpAuthHandlerFactory> http_auth_handler_factory(
+      net::HttpAuthHandlerFactory::CreateDefault(host_resolver.get()));
+
+  net::HttpNetworkSession::Params session_params;
+  session_params.host_resolver = host_resolver.get();
+  session_params.cert_verifier = cert_verifier.get();
+  session_params.proxy_service = proxy_service;
+  session_params.http_auth_handler_factory = http_auth_handler_factory.get();
+  session_params.ssl_config_service = ssl_config_service;
+
+  scoped_refptr<net::HttpNetworkSession> network_session(
+      new net::HttpNetworkSession(session_params));
   if (use_cache) {
-    factory = new net::HttpCache(NULL, host_resolver, proxy_service,
-                                 ssl_config_service, 0);
+    factory = new net::HttpCache(network_session,
+                                 net::HttpCache::DefaultBackend::InMemory(0));
   } else {
-    factory = new net::HttpNetworkLayer(
-        net::ClientSocketFactory::GetDefaultFactory(), NULL, host_resolver,
-        proxy_service, ssl_config_service);
+    factory = new net::HttpNetworkLayer(network_session);
   }
 
   {
-    StatsCounterTimer driver_time("FetchClient.total_time");
-    StatsScope<StatsCounterTimer> scope(driver_time);
+    base::StatsCounterTimer driver_time("FetchClient.total_time");
+    base::StatsScope<base::StatsCounterTimer> scope(driver_time);
 
     Client** clients = new Client*[client_limit];
     for (int i = 0; i < client_limit; i++)
@@ -187,7 +205,7 @@ int main(int argc, char**argv) {
     // Dump the stats table.
     printf("<stats>\n");
     int counter_max = table.GetMaxCounters();
-    for (int index=0; index < counter_max; index++) {
+    for (int index = 0; index < counter_max; index++) {
       std::string name(table.GetRowName(index));
       if (name.length() > 0) {
         int value = table.GetRowValue(index);

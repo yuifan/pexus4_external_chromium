@@ -1,15 +1,16 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_DISK_CACHE_STATS_H_
 #define NET_DISK_CACHE_STATS_H_
+#pragma once
 
 #include <string>
 #include <vector>
 
 #include "base/basictypes.h"
-#include "base/scoped_ptr.h"
+#include "base/memory/scoped_ptr.h"
 #include "net/disk_cache/stats_histogram.h"
 
 namespace disk_cache {
@@ -44,10 +45,11 @@ class Stats {
     FATAL_ERROR,
     LAST_REPORT,  // Time of the last time we sent a report.
     LAST_REPORT_TIMER,  // Timer count of the last time we sent a report.
+    DOOM_RECENT,  // The cache was partially cleared.
     MAX_COUNTER
   };
 
-  Stats() : backend_(NULL) {}
+  Stats();
   ~Stats();
 
   bool Init(BackendImpl* backend, uint32* storage_addr);
@@ -84,7 +86,7 @@ class Stats {
   uint32 storage_addr_;
   int data_sizes_[kDataSizesLength];
   int64 counters_[MAX_COUNTER];
-  scoped_refptr<StatsHistogram> size_histogram_;
+  StatsHistogram* size_histogram_;
 
   DISALLOW_COPY_AND_ASSIGN(Stats);
 };

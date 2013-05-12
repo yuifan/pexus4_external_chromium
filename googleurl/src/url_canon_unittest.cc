@@ -144,6 +144,44 @@ void SetupReplComp(
 
 }  // namespace
 
+TEST(URLCanonTest, DoAppendUTF8) {
+  struct UTF8Case {
+    unsigned input;
+    const char* output;
+  } utf_cases[] = {
+    // Valid code points.
+    {0x24, "\x24"},
+    {0xA2, "\xC2\xA2"},
+    {0x20AC, "\xE2\x82\xAC"},
+    {0x24B62, "\xF0\xA4\xAD\xA2"},
+    {0x10FFFF, "\xF4\x8F\xBF\xBF"},
+  };
+  std::string out_str;
+  for (size_t i = 0; i < ARRAYSIZE(utf_cases); i++) {
+    out_str.clear();
+    url_canon::StdStringCanonOutput output(&out_str);
+    url_canon::AppendUTF8Value(utf_cases[i].input, &output);
+    output.Complete();
+    EXPECT_EQ(utf_cases[i].output, out_str);
+  }
+}
+
+// TODO(mattm): Can't run this in debug mode for now, since the DCHECK will
+// cause the Chromium stacktrace dialog to appear and hang the test.
+// See http://crbug.com/49580.
+#if defined(GTEST_HAS_DEATH_TEST) && defined(NDEBUG)
+TEST(URLCanonTest, DoAppendUTF8Invalid) {
+  std::string out_str;
+  url_canon::StdStringCanonOutput output(&out_str);
+  // Invalid code point (too large).
+  ASSERT_DEBUG_DEATH({
+    url_canon::AppendUTF8Value(0x110000, &output);
+    output.Complete();
+    EXPECT_EQ("", out_str);
+  }, "");
+}
+#endif
+
 TEST(URLCanonTest, UTF) {
   // Low-level test that we handle reading, canonicalization, and writing
   // UTF-8/UTF-16 strings properly.
@@ -766,6 +804,22 @@ TEST(URLCanonTest, IPv6) {
   }
 }
 
+TEST(URLCanonTest, IPEmpty) {
+  std::string out_str1;
+  url_canon::StdStringCanonOutput output1(&out_str1);
+  url_canon::CanonHostInfo host_info;
+
+  // This tests tests.
+  const char spec[] = "192.168.0.1";
+  url_canon::CanonicalizeIPAddress(spec, url_parse::Component(),
+                                   &output1, &host_info);
+  EXPECT_FALSE(host_info.IsIPAddress());
+
+  url_canon::CanonicalizeIPAddress(spec, url_parse::Component(0, 0),
+                                   &output1, &host_info);
+  EXPECT_FALSE(host_info.IsIPAddress());
+}
+
 TEST(URLCanonTest, UserInfo) {
   // Note that the canonicalizer should escape and treat empty components as
   // not being there.
@@ -950,8 +1004,8 @@ TEST(URLCanonTest, Path) {
       // %7f should be allowed and %3D should not be unescaped (these were wrong
       // in a previous version).
     {"/%7Ffp3%3Eju%3Dduvgw%3Dd", L"/%7Ffp3%3Eju%3Dduvgw%3Dd", "/%7Ffp3%3Eju%3Dduvgw%3Dd", url_parse::Component(0, 24), true},
-      // @ should be unescaped.
-    {"/@asdf%40", L"/@asdf%40", "/@asdf@", url_parse::Component(0, 7), true},
+      // @ should be passed through unchanged (escaped or unescaped).
+    {"/@asdf%40", L"/@asdf%40", "/@asdf%40", url_parse::Component(0, 9), true},
 
     // ----- encoding tests -----
       // Basic conversions
@@ -1736,8 +1790,11 @@ TEST(URLCanonTest, ResolveRelativeURL) {
       // Basic absolute input.
     {"http://host/a", true, false, "http://another/", true, false, false, NULL},
     {"http://host/a", true, false, "http:////another/", true, false, false, NULL},
-      // Empty relative URLs shouldn't change the input.
+      // Empty relative URLs should only remove the ref part of the URL,
+      // leaving the rest unchanged.
     {"http://foo/bar", true, false, "", true, true, true, "http://foo/bar"},
+    {"http://foo/bar#ref", true, false, "", true, true, true, "http://foo/bar"},
+    {"http://foo/bar#", true, false, "", true, true, true, "http://foo/bar"},
       // Spaces at the ends of the relative path should be ignored.
     {"http://foo/bar", true, false, "  another  ", true, true, true, "http://foo/another"},
     {"http://foo/bar", true, false, "  .  ", true, true, true, "http://foo/"},

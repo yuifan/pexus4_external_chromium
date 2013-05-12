@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -12,11 +12,14 @@
 
 #include <ios>
 
-#include "base/debug_util.h"
-#include "base/histogram.h"
+#include "base/command_line.h"
+#include "base/debug/stack_trace.h"
 #include "base/logging.h"
-#include "base/scoped_handle_win.h"
-#include "base/scoped_ptr.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/metrics/histogram.h"
+#include "base/sys_info.h"
+#include "base/win/scoped_handle.h"
+#include "base/win/windows_version.h"
 
 // userenv.dll is required for CreateEnvironmentBlock().
 #pragma comment(lib, "userenv.lib")
@@ -28,6 +31,20 @@ namespace {
 // System pagesize. This value remains constant on x86/64 architectures.
 const int PAGESIZE_KB = 4;
 
+// Exit codes with special meanings on Windows.
+const DWORD kNormalTerminationExitCode = 0;
+const DWORD kDebuggerInactiveExitCode = 0xC0000354;
+const DWORD kKeyboardInterruptExitCode = 0xC000013A;
+const DWORD kDebuggerTerminatedExitCode = 0x40010004;
+
+// This exit code is used by the Windows task manager when it kills a
+// process.  It's value is obviously not that unique, and it's
+// surprising to me that the task manager uses this value, but it
+// seems to be common practice on Windows to test for it as an
+// indication that the task manager has killed something if the
+// process goes away.
+const DWORD kProcessKilledExitCode = 1;
+
 // HeapSetInformation function pointer.
 typedef BOOL (WINAPI* HeapSetFn)(HANDLE, HEAP_INFORMATION_CLASS, PVOID, SIZE_T);
 
@@ -38,14 +55,13 @@ LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = NULL;
 // Prints the exception call stack.
 // This is the unit tests exception filter.
 long WINAPI StackDumpExceptionFilter(EXCEPTION_POINTERS* info) {
-  StackTrace(info).PrintBacktrace();
+  debug::StackTrace(info).PrintBacktrace();
   if (g_previous_filter)
     return g_previous_filter(info);
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // Connects back to a console if available.
-// Only necessary on Windows, no-op on other platforms.
 void AttachToConsole() {
   if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
     unsigned int result = GetLastError();
@@ -104,11 +120,23 @@ bool OpenProcessHandle(ProcessId pid, ProcessHandle* handle) {
 
 bool OpenPrivilegedProcessHandle(ProcessId pid, ProcessHandle* handle) {
   ProcessHandle result = OpenProcess(PROCESS_DUP_HANDLE |
-                                         PROCESS_TERMINATE |
-                                         PROCESS_QUERY_INFORMATION |
-                                         PROCESS_VM_READ |
-                                         SYNCHRONIZE,
+                                     PROCESS_TERMINATE |
+                                     PROCESS_QUERY_INFORMATION |
+                                     PROCESS_VM_READ |
+                                     SYNCHRONIZE,
                                      FALSE, pid);
+
+  if (result == INVALID_HANDLE_VALUE)
+    return false;
+
+  *handle = result;
+  return true;
+}
+
+bool OpenProcessHandleWithAccess(ProcessId pid,
+                                 uint32 access_flags,
+                                 ProcessHandle* handle) {
+  ProcessHandle result = OpenProcess(access_flags, FALSE, pid);
 
   if (result == INVALID_HANDLE_VALUE)
     return false;
@@ -138,8 +166,60 @@ ProcessId GetProcId(ProcessHandle process) {
   return 0;
 }
 
-bool LaunchApp(const std::wstring& cmdline,
-               bool wait, bool start_hidden, ProcessHandle* process_handle) {
+bool GetProcessIntegrityLevel(ProcessHandle process, IntegrityLevel *level) {
+  if (!level)
+    return false;
+
+  if (win::GetVersion() < base::win::VERSION_VISTA)
+    return false;
+
+  HANDLE process_token;
+  if (!OpenProcessToken(process, TOKEN_QUERY | TOKEN_QUERY_SOURCE,
+      &process_token))
+    return false;
+
+  win::ScopedHandle scoped_process_token(process_token);
+
+  DWORD token_info_length = 0;
+  if (GetTokenInformation(process_token, TokenIntegrityLevel, NULL, 0,
+                          &token_info_length) ||
+      GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+    return false;
+
+  scoped_array<char> token_label_bytes(new char[token_info_length]);
+  if (!token_label_bytes.get())
+    return false;
+
+  TOKEN_MANDATORY_LABEL* token_label =
+      reinterpret_cast<TOKEN_MANDATORY_LABEL*>(token_label_bytes.get());
+  if (!token_label)
+    return false;
+
+  if (!GetTokenInformation(process_token, TokenIntegrityLevel, token_label,
+                           token_info_length, &token_info_length))
+    return false;
+
+  DWORD integrity_level = *GetSidSubAuthority(token_label->Label.Sid,
+      (DWORD)(UCHAR)(*GetSidSubAuthorityCount(token_label->Label.Sid)-1));
+
+  if (integrity_level < SECURITY_MANDATORY_MEDIUM_RID) {
+    *level = LOW_INTEGRITY;
+  } else if (integrity_level >= SECURITY_MANDATORY_MEDIUM_RID &&
+      integrity_level < SECURITY_MANDATORY_HIGH_RID) {
+    *level = MEDIUM_INTEGRITY;
+  } else if (integrity_level >= SECURITY_MANDATORY_HIGH_RID) {
+    *level = HIGH_INTEGRITY;
+  } else {
+    NOTREACHED();
+    return false;
+  }
+
+  return true;
+}
+
+bool LaunchAppImpl(const std::wstring& cmdline,
+                   bool wait, bool start_hidden, bool inherit_handles,
+                   ProcessHandle* process_handle) {
   STARTUPINFO startup_info = {0};
   startup_info.cb = sizeof(startup_info);
   startup_info.dwFlags = STARTF_USESHOWWINDOW;
@@ -147,7 +227,7 @@ bool LaunchApp(const std::wstring& cmdline,
   PROCESS_INFORMATION process_info;
   if (!CreateProcess(NULL,
                      const_cast<wchar_t*>(cmdline.c_str()), NULL, NULL,
-                     FALSE, 0, NULL, NULL,
+                     inherit_handles, 0, NULL, NULL,
                      &startup_info, &process_info))
     return false;
 
@@ -166,11 +246,30 @@ bool LaunchApp(const std::wstring& cmdline,
   return true;
 }
 
+bool LaunchApp(const std::wstring& cmdline,
+               bool wait, bool start_hidden, ProcessHandle* process_handle) {
+  return LaunchAppImpl(cmdline, wait, start_hidden, false, process_handle);
+}
+
+bool LaunchAppWithHandleInheritance(
+    const std::wstring& cmdline, bool wait, bool start_hidden,
+    ProcessHandle* process_handle) {
+  return LaunchAppImpl(cmdline, wait, start_hidden, true, process_handle);
+}
 
 bool LaunchAppAsUser(UserTokenHandle token, const std::wstring& cmdline,
                      bool start_hidden, ProcessHandle* process_handle) {
+  return LaunchAppAsUser(token, cmdline, start_hidden, process_handle,
+                         false, false);
+}
+
+bool LaunchAppAsUser(UserTokenHandle token, const std::wstring& cmdline,
+                     bool start_hidden, ProcessHandle* process_handle,
+                     bool empty_desktop_name, bool inherit_handles) {
   STARTUPINFO startup_info = {0};
   startup_info.cb = sizeof(startup_info);
+  if (empty_desktop_name)
+    startup_info.lpDesktop = L"";
   PROCESS_INFORMATION process_info;
   if (start_hidden) {
     startup_info.dwFlags = STARTF_USESHOWWINDOW;
@@ -179,12 +278,12 @@ bool LaunchAppAsUser(UserTokenHandle token, const std::wstring& cmdline,
   DWORD flags = CREATE_UNICODE_ENVIRONMENT;
   void* enviroment_block = NULL;
 
-  if(!CreateEnvironmentBlock(&enviroment_block, token, FALSE))
+  if (!CreateEnvironmentBlock(&enviroment_block, token, FALSE))
     return false;
 
   BOOL launched =
       CreateProcessAsUser(token, NULL, const_cast<wchar_t*>(cmdline.c_str()),
-                          NULL, NULL, FALSE, flags, enviroment_block,
+                          NULL, NULL, inherit_handles, flags, enviroment_block,
                           NULL, &startup_info, &process_info);
 
   DestroyEnvironmentBlock(enviroment_block);
@@ -204,8 +303,8 @@ bool LaunchAppAsUser(UserTokenHandle token, const std::wstring& cmdline,
 
 bool LaunchApp(const CommandLine& cl,
                bool wait, bool start_hidden, ProcessHandle* process_handle) {
-  return LaunchApp(cl.command_line_string(), wait,
-                   start_hidden, process_handle);
+  return LaunchAppImpl(cl.command_line_string(), wait,
+                       start_hidden, false, process_handle);
 }
 
 // Attempts to kill the process identified by the given process
@@ -215,9 +314,11 @@ bool KillProcessById(ProcessId process_id, int exit_code, bool wait) {
   HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE,
                                FALSE,  // Don't inherit handle
                                process_id);
-  if (!process)
+  if (!process) {
+    DLOG(ERROR) << "Unable to open process " << process_id << " : "
+                << GetLastError();
     return false;
-
+  }
   bool ret = KillProcess(process, exit_code, wait);
   CloseHandle(process);
   return ret;
@@ -240,8 +341,8 @@ bool GetAppOutput(const CommandLine& cl, std::string* output) {
   }
 
   // Ensure we don't leak the handles.
-  ScopedHandle scoped_out_read(out_read);
-  ScopedHandle scoped_out_write(out_write);
+  win::ScopedHandle scoped_out_read(out_read);
+  win::ScopedHandle scoped_out_write(out_write);
 
   // Ensure the read handle to the pipe for STDOUT is not inherited.
   if (!SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0)) {
@@ -308,78 +409,89 @@ bool KillProcess(ProcessHandle process, int exit_code, bool wait) {
   return result;
 }
 
-bool DidProcessCrash(bool* child_exited, ProcessHandle handle) {
-  DWORD exitcode = 0;
+TerminationStatus GetTerminationStatus(ProcessHandle handle, int* exit_code) {
+  DWORD tmp_exit_code = 0;
 
-  if (child_exited)
-    *child_exited = true;  // On Windows it an error to call this function if
-                           // the child hasn't already exited.
-  if (!::GetExitCodeProcess(handle, &exitcode)) {
+  if (!::GetExitCodeProcess(handle, &tmp_exit_code)) {
     NOTREACHED();
-    return false;
+    if (exit_code) {
+      // This really is a random number.  We haven't received any
+      // information about the exit code, presumably because this
+      // process doesn't have permission to get the exit code, or
+      // because of some other cause for GetExitCodeProcess to fail
+      // (MSDN docs don't give the possible failure error codes for
+      // this function, so it could be anything).  But we don't want
+      // to leave exit_code uninitialized, since that could cause
+      // random interpretations of the exit code.  So we assume it
+      // terminated "normally" in this case.
+      *exit_code = kNormalTerminationExitCode;
+    }
+    // Assume the child has exited normally if we can't get the exit
+    // code.
+    return TERMINATION_STATUS_NORMAL_TERMINATION;
   }
-  if (exitcode == STILL_ACTIVE) {
-    // The process is likely not dead or it used 0x103 as exit code.
+  if (tmp_exit_code == STILL_ACTIVE) {
+    DWORD wait_result = WaitForSingleObject(handle, 0);
+    if (wait_result == WAIT_TIMEOUT) {
+      if (exit_code)
+        *exit_code = wait_result;
+      return TERMINATION_STATUS_STILL_RUNNING;
+    }
+
+    DCHECK_EQ(WAIT_OBJECT_0, wait_result);
+
+    // Strange, the process used 0x103 (STILL_ACTIVE) as exit code.
     NOTREACHED();
-    return false;
+
+    return TERMINATION_STATUS_ABNORMAL_TERMINATION;
   }
 
-  // Warning, this is not generic code; it heavily depends on the way
-  // the rest of the code kills a process.
+  if (exit_code)
+    *exit_code = tmp_exit_code;
 
-  if (exitcode == PROCESS_END_NORMAL_TERMINATON ||
-      exitcode == PROCESS_END_KILLED_BY_USER ||
-      exitcode == PROCESS_END_PROCESS_WAS_HUNG ||
-      exitcode == 0xC0000354 ||     // STATUS_DEBUGGER_INACTIVE.
-      exitcode == 0xC000013A ||     // Control-C/end session.
-      exitcode == 0x40010004) {     // Debugger terminated process/end session.
-    return false;
+  switch (tmp_exit_code) {
+    case kNormalTerminationExitCode:
+      return TERMINATION_STATUS_NORMAL_TERMINATION;
+    case kDebuggerInactiveExitCode:  // STATUS_DEBUGGER_INACTIVE.
+    case kKeyboardInterruptExitCode:  // Control-C/end session.
+    case kDebuggerTerminatedExitCode:  // Debugger terminated process.
+    case kProcessKilledExitCode:  // Task manager kill.
+      return TERMINATION_STATUS_PROCESS_WAS_KILLED;
+    default:
+      // All other exit codes indicate crashes.
+      return TERMINATION_STATUS_PROCESS_CRASHED;
   }
-
-  // All other exit codes indicate crashes.
-  return true;
 }
 
 bool WaitForExitCode(ProcessHandle handle, int* exit_code) {
-  ScopedHandle closer(handle);  // Ensure that we always close the handle.
-  if (::WaitForSingleObject(handle, INFINITE) != WAIT_OBJECT_0) {
-    NOTREACHED();
+  bool success = WaitForExitCodeWithTimeout(handle, exit_code, INFINITE);
+  CloseProcessHandle(handle);
+  return success;
+}
+
+bool WaitForExitCodeWithTimeout(ProcessHandle handle, int* exit_code,
+                                int64 timeout_milliseconds) {
+  if (::WaitForSingleObject(handle, timeout_milliseconds) != WAIT_OBJECT_0)
     return false;
-  }
   DWORD temp_code;  // Don't clobber out-parameters in case of failure.
   if (!::GetExitCodeProcess(handle, &temp_code))
     return false;
+
   *exit_code = temp_code;
   return true;
 }
 
-NamedProcessIterator::NamedProcessIterator(const std::wstring& executable_name,
-                                           const ProcessFilter* filter)
+ProcessIterator::ProcessIterator(const ProcessFilter* filter)
     : started_iteration_(false),
-      executable_name_(executable_name),
       filter_(filter) {
   snapshot_ = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 }
 
-NamedProcessIterator::~NamedProcessIterator() {
+ProcessIterator::~ProcessIterator() {
   CloseHandle(snapshot_);
 }
 
-
-const ProcessEntry* NamedProcessIterator::NextProcessEntry() {
-  bool result = false;
-  do {
-    result = CheckForNextProcess();
-  } while (result && !IncludeEntry());
-
-  if (result) {
-    return &entry_;
-  }
-
-  return NULL;
-}
-
-bool NamedProcessIterator::CheckForNextProcess() {
+bool ProcessIterator::CheckForNextProcess() {
   InitProcessEntry(&entry_);
 
   if (!started_iteration_) {
@@ -390,39 +502,15 @@ bool NamedProcessIterator::CheckForNextProcess() {
   return !!Process32Next(snapshot_, &entry_);
 }
 
-bool NamedProcessIterator::IncludeEntry() {
-  return _wcsicmp(executable_name_.c_str(), entry_.szExeFile) == 0 &&
-                  (!filter_ || filter_->Includes(entry_.th32ProcessID,
-                                                 entry_.th32ParentProcessID));
-}
-
-void NamedProcessIterator::InitProcessEntry(ProcessEntry* entry) {
+void ProcessIterator::InitProcessEntry(ProcessEntry* entry) {
   memset(entry, 0, sizeof(*entry));
   entry->dwSize = sizeof(*entry);
 }
 
-int GetProcessCount(const std::wstring& executable_name,
-                    const ProcessFilter* filter) {
-  int count = 0;
-
-  NamedProcessIterator iter(executable_name, filter);
-  while (iter.NextProcessEntry())
-    ++count;
-  return count;
-}
-
-bool KillProcesses(const std::wstring& executable_name, int exit_code,
-                   const ProcessFilter* filter) {
-  bool result = true;
-  const ProcessEntry* entry;
-
-  NamedProcessIterator iter(executable_name, filter);
-  while (entry = iter.NextProcessEntry()) {
-    if (!KillProcessById((*entry).th32ProcessID, exit_code, true))
-      result = false;
-  }
-
-  return result;
+bool NamedProcessIterator::IncludeEntry() {
+  // Case insensitive.
+  return _wcsicmp(executable_name_.c_str(), entry().exe_file()) == 0 &&
+         ProcessIterator::IncludeEntry();
 }
 
 bool WaitForProcessesToExit(const std::wstring& executable_name,
@@ -452,11 +540,6 @@ bool WaitForSingleProcess(ProcessHandle handle, int64 wait_milliseconds) {
   return retval;
 }
 
-bool CrashAwareSleep(ProcessHandle handle, int64 wait_milliseconds) {
-  bool retval = WaitForSingleObject(handle, wait_milliseconds) == WAIT_TIMEOUT;
-  return retval;
-}
-
 bool CleanupProcesses(const std::wstring& executable_name,
                       int64 wait_milliseconds,
                       int exit_code,
@@ -472,12 +555,11 @@ bool CleanupProcesses(const std::wstring& executable_name,
 ///////////////////////////////////////////////////////////////////////////////
 // ProcesMetrics
 
-ProcessMetrics::ProcessMetrics(ProcessHandle process) : process_(process),
-                                                        last_time_(0),
-                                                        last_system_time_(0) {
-  SYSTEM_INFO system_info;
-  GetSystemInfo(&system_info);
-  processor_count_ = system_info.dwNumberOfProcessors;
+ProcessMetrics::ProcessMetrics(ProcessHandle process)
+    : process_(process),
+      processor_count_(base::SysInfo::NumberOfProcessors()),
+      last_time_(0),
+      last_system_time_(0) {
 }
 
 // static
@@ -522,18 +604,29 @@ size_t ProcessMetrics::GetPeakWorkingSetSize() const {
   return 0;
 }
 
-size_t ProcessMetrics::GetPrivateBytes() const {
+bool ProcessMetrics::GetMemoryBytes(size_t* private_bytes,
+                                    size_t* shared_bytes) {
   // PROCESS_MEMORY_COUNTERS_EX is not supported until XP SP2.
   // GetProcessMemoryInfo() will simply fail on prior OS. So the requested
   // information is simply not available. Hence, we will return 0 on unsupported
   // OSes. Unlike most Win32 API, we don't need to initialize the "cb" member.
   PROCESS_MEMORY_COUNTERS_EX pmcx;
-  if (GetProcessMemoryInfo(process_,
-                          reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmcx),
-                          sizeof(pmcx))) {
-      return pmcx.PrivateUsage;
+  if (private_bytes &&
+      GetProcessMemoryInfo(process_,
+                           reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmcx),
+                           sizeof(pmcx))) {
+    *private_bytes = pmcx.PrivateUsage;
   }
-  return 0;
+
+  if (shared_bytes) {
+    WorkingSetKBytes ws_usage;
+    if (!GetWorkingSetKBytes(&ws_usage))
+      return false;
+
+    *shared_bytes = ws_usage.shared * 1024;
+  }
+
+  return true;
 }
 
 void ProcessMetrics::GetCommittedKBytes(CommittedKBytes* usage) const {
@@ -691,18 +784,18 @@ double ProcessMetrics::GetCPUUsage() {
   return cpu;
 }
 
-bool ProcessMetrics::GetIOCounters(IO_COUNTERS* io_counters) const {
+bool ProcessMetrics::GetIOCounters(IoCounters* io_counters) const {
   return GetProcessIoCounters(process_, io_counters) != FALSE;
 }
 
 bool ProcessMetrics::CalculateFreeMemory(FreeMBytes* free) const {
-  const SIZE_T kTopAdress = 0x7F000000;
+  const SIZE_T kTopAddress = 0x7F000000;
   const SIZE_T kMegabyte = 1024 * 1024;
   SIZE_T accumulated = 0;
 
   MEMORY_BASIC_INFORMATION largest = {0};
   UINT_PTR scan = 0;
-  while (scan < kTopAdress) {
+  while (scan < kTopAddress) {
     MEMORY_BASIC_INFORMATION info;
     if (!::VirtualQueryEx(process_, reinterpret_cast<void*>(scan),
                           &info, sizeof(info)))
@@ -710,7 +803,7 @@ bool ProcessMetrics::CalculateFreeMemory(FreeMBytes* free) const {
     if (info.State == MEM_FREE) {
       accumulated += info.RegionSize;
       UINT_PTR end = scan + info.RegionSize;
-      if (info.RegionSize > (largest.RegionSize))
+      if (info.RegionSize > largest.RegionSize)
         largest = info;
     }
     scan += info.RegionSize;

@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 //
@@ -6,15 +6,17 @@
 // It is intended to be used for live experiment of WebSocket connectivity
 // metrics.
 // Note that it is not used for WebKit's WebSocket communication.
-// See third_party/WebKit/WebCore/websockets/ instead.
+// See third_party/WebKit/Source/WebCore/websockets/ instead.
 
 #ifndef NET_WEBSOCKETS_WEBSOCKET_H_
 #define NET_WEBSOCKETS_WEBSOCKET_H_
+#pragma once
 
 #include <deque>
 #include <string>
 
-#include "base/ref_counted.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/scoped_ptr.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/io_buffer.h"
 #include "net/socket_stream/socket_stream.h"
@@ -26,9 +28,9 @@ namespace net {
 
 class ClientSocketFactory;
 class HostResolver;
-class HttpResponseHeaders;
 
 class WebSocket;
+class WebSocketHandshake;
 
 // Delegate methods will be called on the same message loop as
 // WebSocket is constructed.
@@ -43,11 +45,14 @@ class WebSocketDelegate {
   // |msg| should be in UTF-8.
   virtual void OnMessage(WebSocket* socket, const std::string& msg) = 0;
 
+  // Called when WebSocket error has been detected.
+  virtual void OnError(WebSocket* socket) {}
+
   // Called when |socket| is closed.
-  virtual void OnClose(WebSocket* socket) = 0;
+  virtual void OnClose(WebSocket* socket, bool was_clean) = 0;
 
   // Called when an error occured on |socket|.
-  virtual void OnError(const WebSocket* socket, int error) {}
+  virtual void OnSocketError(const WebSocket* socket, int error) {}
 };
 
 class WebSocket : public base::RefCountedThreadSafe<WebSocket>,
@@ -57,28 +62,35 @@ class WebSocket : public base::RefCountedThreadSafe<WebSocket>,
     INITIALIZED = -1,
     CONNECTING = 0,
     OPEN = 1,
-    CLOSED = 2,
+    CLOSING = 2,
+    CLOSED = 3,
+  };
+  enum ProtocolVersion {
+    DEFAULT_VERSION = 0,
+    DRAFT75 = 1,
   };
   class Request {
    public:
     Request(const GURL& url, const std::string protocol,
             const std::string origin, const std::string location,
-            URLRequestContext* context)
+            ProtocolVersion version,
+            net::URLRequestContext* context)
         : url_(url),
           protocol_(protocol),
           origin_(origin),
           location_(location),
+          version_(version),
           context_(context),
           host_resolver_(NULL),
           client_socket_factory_(NULL) {}
     ~Request() {}
 
     const GURL& url() const { return url_; }
-    bool is_secure() const;
     const std::string& protocol() const { return protocol_; }
     const std::string& origin() const { return origin_; }
     const std::string& location() const { return location_; }
-    URLRequestContext* context() const { return context_; }
+    ProtocolVersion version() const { return version_; }
+    net::URLRequestContext* context() const { return context_; }
 
     // Sets an alternative HostResolver. For testing purposes only.
     void SetHostResolver(HostResolver* host_resolver) {
@@ -95,17 +107,15 @@ class WebSocket : public base::RefCountedThreadSafe<WebSocket>,
       return client_socket_factory_;
     }
 
-    // Creates the client handshake message from |this|.
-    std::string CreateClientHandshakeMessage() const;
-
    private:
     GURL url_;
     std::string protocol_;
     std::string origin_;
     std::string location_;
-    scoped_refptr<URLRequestContext> context_;
+    ProtocolVersion version_;
+    scoped_refptr<net::URLRequestContext> context_;
 
-    scoped_refptr<HostResolver> host_resolver_;
+    HostResolver* host_resolver_;
     ClientSocketFactory* client_socket_factory_;
 
     DISALLOW_COPY_AND_ASSIGN(Request);
@@ -147,33 +157,12 @@ class WebSocket : public base::RefCountedThreadSafe<WebSocket>,
   virtual void OnError(const SocketStream* socket, int error);
 
  private:
-  enum Mode {
-    MODE_INCOMPLETE, MODE_NORMAL, MODE_AUTHENTICATE,
-  };
   typedef std::deque< scoped_refptr<IOBufferWithSize> > PendingDataQueue;
 
   friend class WebSocketTest;
 
   friend class base::RefCountedThreadSafe<WebSocket>;
   virtual ~WebSocket();
-
-  // Checks handshake.
-  // Prerequisite: Server handshake message is received in |current_read_buf_|.
-  // Returns number of bytes for server handshake message,
-  // or negative if server handshake message is not received fully yet.
-  int CheckHandshake();
-
-  // Processes server handshake message, parsed as |headers|, and updates
-  // |ws_origin_|, |ws_location_| and |ws_protocol_|.
-  // Returns true if it's ok.
-  // Returns false otherwise (e.g. duplicate WebSocket-Origin: header, etc.)
-  bool ProcessHeaders(const HttpResponseHeaders& headers);
-
-  // Checks |ws_origin_|, |ws_location_| and |ws_protocol_| are valid
-  // against |request_|.
-  // Returns true if it's ok.
-  // Returns false otherwise (e.g. origin mismatch, etc.)
-  bool CheckResponseHeaders() const;
 
   // Sends pending data in |current_write_buf_| and/or |pending_write_bufs_|.
   void SendPending();
@@ -190,22 +179,20 @@ class WebSocket : public base::RefCountedThreadSafe<WebSocket>,
   // Skips |len| bytes in |current_read_buf_|.
   void SkipReadBuffer(int len);
 
+  void StartClosingHandshake();
+  void DoForceCloseConnection();
+  void FailConnection();
   // Handles closed connection.
   void DoClose();
 
-  // Handles error report.
-  void DoError(int error);
+  // Handles socket error report.
+  void DoSocketError(int error);
 
   State ready_state_;
-  Mode mode_;
   scoped_ptr<Request> request_;
+  scoped_ptr<WebSocketHandshake> handshake_;
   WebSocketDelegate* delegate_;
   MessageLoop* origin_loop_;
-
-  // Handshake messages that server sent.
-  std::string ws_origin_;
-  std::string ws_location_;
-  std::string ws_protocol_;
 
   scoped_refptr<SocketStream> socket_stream_;
   int max_pending_send_allowed_;
@@ -225,6 +212,17 @@ class WebSocket : public base::RefCountedThreadSafe<WebSocket>,
   // Deque of IOBuffers in pending.
   // Front IOBuffer is being sent via |current_write_buf_|.
   PendingDataQueue pending_write_bufs_;
+
+  // True when the 0xFF frame with length 0x00 is received.
+  bool server_closing_handshake_;
+  // True when trying to send 0xFF and 0x00 bytes.
+  bool client_closing_handshake_;
+  // True when send 0xFF and 0x00 bytes.
+  bool closing_handshake_started_;
+  // Task to close the connection after closing handshake has started and
+  // |closing_handshake_timeout_|.
+  CancelableTask* force_close_task_;
+  int64 closing_handshake_timeout_;
 
   DISALLOW_COPY_AND_ASSIGN(WebSocket);
 };

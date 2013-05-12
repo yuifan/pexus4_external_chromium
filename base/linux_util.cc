@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,52 +6,25 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <glib.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <vector>
 
 #include "base/command_line.h"
-#include "base/lock.h"
+#include "base/file_util.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/memory/singleton.h"
 #include "base/path_service.h"
 #include "base/process_util.h"
-#include "base/singleton.h"
 #include "base/string_util.h"
-#include "base/third_party/xdg_user_dirs/xdg_user_dir_lookup.h"
+#include "base/synchronization/lock.h"
 
 namespace {
-
-class EnvironmentVariableGetterImpl
-    : public base::EnvironmentVariableGetter {
- public:
-  virtual bool Getenv(const char* variable_name, std::string* result) {
-    const char* env_value = ::getenv(variable_name);
-    if (env_value) {
-      // Note that the variable may be defined but empty.
-      *result = env_value;
-      return true;
-    }
-    // Some commonly used variable names are uppercase while others
-    // are lowercase, which is inconsistent. Let's try to be helpful
-    // and look for a variable name with the reverse case.
-    char first_char = variable_name[0];
-    std::string alternate_case_var;
-    if (first_char >= 'a' && first_char <= 'z')
-      alternate_case_var = StringToUpperASCII(std::string(variable_name));
-    else if (first_char >= 'A' && first_char <= 'Z')
-      alternate_case_var = StringToLowerASCII(std::string(variable_name));
-    else
-      return false;
-    env_value = ::getenv(alternate_case_var.c_str());
-    if (env_value) {
-      *result = env_value;
-      return true;
-    }
-    return false;
-  }
-};
 
 // Not needed for OS_CHROMEOS.
 #if defined(OS_LINUX)
@@ -65,7 +38,7 @@ enum LinuxDistroState {
 class LinuxDistroHelper {
  public:
   // Retrieves the Singleton.
-  static LinuxDistroHelper* Get() {
+  static LinuxDistroHelper* GetInstance() {
     return Singleton<LinuxDistroHelper>::get();
   }
 
@@ -78,7 +51,7 @@ class LinuxDistroHelper {
   // we automatically move to STATE_CHECK_STARTED so nobody else will
   // do the check.
   LinuxDistroState State() {
-    AutoLock scoped_lock(lock_);
+    base::AutoLock scoped_lock(lock_);
     if (STATE_DID_NOT_CHECK == state_) {
       state_ = STATE_CHECK_STARTED;
       return STATE_DID_NOT_CHECK;
@@ -88,13 +61,13 @@ class LinuxDistroHelper {
 
   // Indicate the check finished, move to STATE_CHECK_FINISHED.
   void CheckFinished() {
-    AutoLock scoped_lock(lock_);
-    DCHECK(state_ == STATE_CHECK_STARTED);
+    base::AutoLock scoped_lock(lock_);
+    DCHECK_EQ(STATE_CHECK_STARTED, state_);
     state_ = STATE_CHECK_FINISHED;
   }
 
  private:
-  Lock lock_;
+  base::Lock lock_;
   LinuxDistroState state_;
 };
 #endif  // if defined(OS_LINUX)
@@ -148,61 +121,27 @@ bool ProcPathGetInode(ino_t* inode_out, const char* path, bool log = false) {
   return true;
 }
 
-}  // anonymous namespace
+}  // namespace
 
 namespace base {
 
-uint8_t* BGRAToRGBA(const uint8_t* pixels, int width, int height, int stride) {
-  if (stride == 0)
-    stride = width * 4;
-
-  uint8_t* new_pixels = static_cast<uint8_t*>(malloc(height * stride));
-
-  // We have to copy the pixels and swap from BGRA to RGBA.
-  for (int i = 0; i < height; ++i) {
-    for (int j = 0; j < width; ++j) {
-      int idx = i * stride + j * 4;
-      new_pixels[idx] = pixels[idx + 2];
-      new_pixels[idx + 1] = pixels[idx + 1];
-      new_pixels[idx + 2] = pixels[idx];
-      new_pixels[idx + 3] = pixels[idx + 3];
-    }
-  }
-
-  return new_pixels;
-}
+// Account for the terminating null character.
+static const int kDistroSize = 128 + 1;
 
 // We use this static string to hold the Linux distro info. If we
 // crash, the crash handler code will send this in the crash dump.
-std::string linux_distro =
+char g_linux_distro[kDistroSize] =
 #if defined(OS_CHROMEOS)
     "CrOS";
 #else  // if defined(OS_LINUX)
     "Unknown";
 #endif
 
-FilePath GetHomeDir(EnvironmentVariableGetter* env) {
-  std::string home_dir;
-  if (env->Getenv("HOME", &home_dir) && !home_dir.empty())
-    return FilePath(home_dir);
-
-  home_dir = g_get_home_dir();
-  if (!home_dir.empty())
-    return FilePath(home_dir);
-
-  FilePath rv;
-  if (PathService::Get(base::DIR_TEMP, &rv))
-    return rv;
-
-  // Last resort.
-  return FilePath("/tmp");
-}
-
 std::string GetLinuxDistro() {
 #if defined(OS_CHROMEOS)
-  return linux_distro;
-#else  // if defined(OS_LINUX)
-  LinuxDistroHelper* distro_state_singleton = LinuxDistroHelper::Get();
+  return g_linux_distro;
+#elif defined(OS_LINUX)
+  LinuxDistroHelper* distro_state_singleton = LinuxDistroHelper::GetInstance();
   LinuxDistroState state = distro_state_singleton->State();
   if (STATE_DID_NOT_CHECK == state) {
     // We do this check only once per process. If it fails, there's
@@ -217,93 +156,28 @@ std::string GetLinuxDistro() {
       // lsb_release -d should return: Description:<tab>Distro Info
       static const std::string field = "Description:\t";
       if (output.compare(0, field.length(), field) == 0) {
-        linux_distro = output.substr(field.length());
-        TrimWhitespaceASCII(linux_distro, TRIM_ALL, &linux_distro);
+        SetLinuxDistro(output.substr(field.length()));
       }
     }
     distro_state_singleton->CheckFinished();
-    return linux_distro;
+    return g_linux_distro;
   } else if (STATE_CHECK_STARTED == state) {
     // If the distro check above is in progress in some other thread, we're
     // not going to wait for the results.
     return "Unknown";
   } else {
     // In STATE_CHECK_FINISHED, no more writing to |linux_distro|.
-    return linux_distro;
+    return g_linux_distro;
   }
+#else
+  NOTIMPLEMENTED();
 #endif
 }
 
-FilePath GetXDGDirectory(EnvironmentVariableGetter* env,
-                         const char* env_name, const char* fallback_dir) {
-  std::string env_value;
-  if (env->Getenv(env_name, &env_value) && !env_value.empty())
-    return FilePath(env_value);
-  return GetHomeDir(env).Append(fallback_dir);
-}
-
-FilePath GetXDGUserDirectory(EnvironmentVariableGetter* env,
-                             const char* dir_name, const char* fallback_dir) {
-  char* xdg_dir = xdg_user_dir_lookup(dir_name);
-  if (xdg_dir) {
-    FilePath rv(xdg_dir);
-    free(xdg_dir);
-    return rv;
-  }
-  return GetHomeDir(env).Append(fallback_dir);
-}
-
-// static
-EnvironmentVariableGetter* EnvironmentVariableGetter::Create() {
-  return new EnvironmentVariableGetterImpl();
-}
-
-DesktopEnvironment GetDesktopEnvironment(EnvironmentVariableGetter* env) {
-  std::string desktop_session;
-  if (env->Getenv("DESKTOP_SESSION", &desktop_session)) {
-    if (desktop_session == "gnome")
-      return DESKTOP_ENVIRONMENT_GNOME;
-    else if (desktop_session == "kde4")
-      return DESKTOP_ENVIRONMENT_KDE4;
-    else if (desktop_session == "kde") {
-      // This may mean KDE4 on newer systems, so we have to check.
-      std::string dummy;
-      if (env->Getenv("KDE_SESSION_VERSION", &dummy))
-        return DESKTOP_ENVIRONMENT_KDE4;
-      return DESKTOP_ENVIRONMENT_KDE3;
-    }
-  }
-
-  // Fall back on some older environment variables.
-  // Useful particularly in the DESKTOP_SESSION=default case.
-  std::string dummy;
-  if (env->Getenv("GNOME_DESKTOP_SESSION_ID", &dummy)) {
-    return DESKTOP_ENVIRONMENT_GNOME;
-  } else if (env->Getenv("KDE_FULL_SESSION", &dummy)) {
-    if (env->Getenv("KDE_SESSION_VERSION", &dummy))
-      return DESKTOP_ENVIRONMENT_KDE4;
-    return DESKTOP_ENVIRONMENT_KDE3;
-  }
-
-  return DESKTOP_ENVIRONMENT_OTHER;
-}
-
-const char* GetDesktopEnvironmentName(DesktopEnvironment env) {
-  switch (env) {
-    case DESKTOP_ENVIRONMENT_OTHER:
-      return NULL;
-    case DESKTOP_ENVIRONMENT_GNOME:
-      return "GNOME";
-    case DESKTOP_ENVIRONMENT_KDE3:
-      return "KDE3";
-    case DESKTOP_ENVIRONMENT_KDE4:
-      return "KDE4";
-  }
-  return NULL;
-}
-
-const char* GetDesktopEnvironmentName(EnvironmentVariableGetter* env) {
-  return GetDesktopEnvironmentName(GetDesktopEnvironment(env));
+void SetLinuxDistro(const std::string& distro) {
+  std::string trimmed_distro;
+  TrimWhitespaceASCII(distro, TRIM_ALL, &trimmed_distro);
+  base::strlcpy(g_linux_distro, trimmed_distro.c_str(), kDistroSize);
 }
 
 bool FileDescriptorGetInode(ino_t* inode_out, int fd) {
@@ -376,6 +250,48 @@ bool FindProcessHoldingSocket(pid_t* pid_out, ino_t socket_inode) {
   }
 
   return already_found;
+}
+
+pid_t FindThreadIDWithSyscall(pid_t pid, const std::string& expected_data) {
+  char buf[256];
+  snprintf(buf, sizeof(buf), "/proc/%d/task", pid);
+  DIR* task = opendir(buf);
+  if (!task) {
+    LOG(WARNING) << "Cannot open " << buf;
+    return -1;
+  }
+
+  std::vector<pid_t> tids;
+  struct dirent* dent;
+  while ((dent = readdir(task))) {
+    char *endptr;
+    const unsigned long int tid_ul = strtoul(dent->d_name, &endptr, 10);
+    if (tid_ul == ULONG_MAX || *endptr)
+      continue;
+    tids.push_back(tid_ul);
+  }
+  closedir(task);
+
+  scoped_array<char> syscall_data(new char[expected_data.length()]);
+  for (std::vector<pid_t>::const_iterator
+       i = tids.begin(); i != tids.end(); ++i) {
+    const pid_t current_tid = *i;
+    snprintf(buf, sizeof(buf), "/proc/%d/task/%d/syscall", pid, current_tid);
+    int fd = open(buf, O_RDONLY);
+    if (fd < 0)
+      continue;
+    bool read_ret =
+        file_util::ReadFromFD(fd, syscall_data.get(), expected_data.length());
+    close(fd);
+    if (!read_ret)
+      continue;
+
+    if (0 == strncmp(expected_data.c_str(), syscall_data.get(),
+                     expected_data.length())) {
+      return current_tid;
+    }
+  }
+  return -1;
 }
 
 }  // namespace base

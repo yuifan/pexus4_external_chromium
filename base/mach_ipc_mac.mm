@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -10,6 +10,10 @@
 #include "base/logging.h"
 
 namespace base {
+
+// static
+const size_t MachMessage::kEmptyMessageSize = sizeof(mach_msg_header_t) +
+    sizeof(mach_msg_body_t) + sizeof(MessageDataPacket);
 
 //==============================================================================
 MachSendMessage::MachSendMessage(int32_t message_id) : MachMessage() {
@@ -50,7 +54,7 @@ MachMessage::MachMessage(void *storage, size_t storage_length)
       storage_length_bytes_(storage_length),
       own_storage_(false) {
   DCHECK(storage);
-  DCHECK(storage_length >= kEmptyMessageSize);
+  DCHECK_GE(storage_length, kEmptyMessageSize);
 }
 
 //==============================================================================
@@ -198,7 +202,12 @@ ReceivePort::ReceivePort(const char *receive_port_name) {
   if (init_result_ != KERN_SUCCESS)
     return;
 
-  NSPort *ns_port = [NSMachPort portWithMachPort:port_];
+  // Without |NSMachPortDeallocateNone|, the NSMachPort seems to deallocate
+  // receive rights on port when it is eventually released.  It is not necessary
+  // to deallocate any rights here as |port_| is fully deallocated in the
+  // ReceivePort destructor.
+  NSPort *ns_port = [NSMachPort portWithMachPort:port_
+                                         options:NSMachPortDeallocateNone];
   NSString *port_name = [NSString stringWithUTF8String:receive_port_name];
   [[NSMachBootstrapServer sharedInstance] registerPort:ns_port name:port_name];
 }
@@ -252,8 +261,12 @@ kern_return_t ReceivePort::WaitForMessage(MachReceiveMessage *out_message,
   out_message->Head()->msgh_reserved = 0;
   out_message->Head()->msgh_id = 0;
 
+  mach_msg_option_t rcv_options = MACH_RCV_MSG;
+  if (timeout != MACH_MSG_TIMEOUT_NONE)
+    rcv_options |= MACH_RCV_TIMEOUT;
+
   kern_return_t result = mach_msg(out_message->Head(),
-                                  MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                  rcv_options,
                                   0,
                                   out_message->MaxSize(),
                                   port_,

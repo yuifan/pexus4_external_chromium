@@ -1,9 +1,10 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_BASICTYPES_H_
 #define BASE_BASICTYPES_H_
+#pragma once
 
 #include <limits.h>         // So we can set the bounds of our types
 #include <stddef.h>         // For size_t
@@ -19,16 +20,19 @@
 typedef signed char         schar;
 typedef signed char         int8;
 typedef short               int16;
-// TODO(mbelshe) Remove these type guards.  These are
-//               temporary to avoid conflicts with npapi.h.
+// TODO: Remove these type guards.  These are to avoid conflicts with
+// obsolete/protypes.h in the Gecko SDK.
 #ifndef _INT32
 #define _INT32
 typedef int                 int32;
 #endif
 
-// The NSPR system headers define 64-bit as |long| when possible.  In order to
-// not have typedef mismatches, we do the same on LP64.
-#if __LP64__
+// The NSPR system headers define 64-bit as |long| when possible, except on
+// Mac OS X.  In order to not have typedef mismatches, we do the same on LP64.
+//
+// On Mac OS X, |long long| is used for 64-bit types for compatibility with
+// <inttypes.h> format macros even in the LP64 model.
+#if defined(__LP64__) && !defined(OS_MACOSX)
 typedef long                int64;
 #else
 typedef long long           int64;
@@ -42,15 +46,15 @@ typedef long long           int64;
 
 typedef unsigned char      uint8;
 typedef unsigned short     uint16;
-// TODO(mbelshe) Remove these type guards.  These are
-//               temporary to avoid conflicts with npapi.h.
+// TODO: Remove these type guards.  These are to avoid conflicts with
+// obsolete/protypes.h in the Gecko SDK.
 #ifndef _UINT32
 #define _UINT32
 typedef unsigned int       uint32;
 #endif
 
 // See the comment above about NSPR and 64-bit.
-#if __LP64__
+#if defined(__LP64__) && !defined(OS_MACOSX)
 typedef unsigned long uint64;
 #else
 typedef unsigned long long uint64;
@@ -82,6 +86,10 @@ const  int64 kint64max  = (( int64) GG_LONGLONG(0x7FFFFFFFFFFFFFFF));
   void operator=(const TypeName&)
 
 // An older, deprecated, politically incorrect name for the above.
+// NOTE: The usage of this macro was baned from our code base, but some
+// third_party libraries are yet using it.
+// TODO(tfarina): Figure out how to fix the usage of this macro in the
+// third_party libraries and get rid of it.
 #define DISALLOW_EVIL_CONSTRUCTORS(TypeName) DISALLOW_COPY_AND_ASSIGN(TypeName)
 
 // A macro to disallow all the implicit constructors, namely the
@@ -327,6 +335,18 @@ inline Dest bit_cast(const Source& source) {
   return dest;
 }
 
+// Used to explicitly mark the return value of a function as unused. If you are
+// really sure you don't want to do anything with the return value of a function
+// that has been marked WARN_UNUSED_RESULT, wrap it with this. Example:
+//
+//   scoped_ptr<MyType> my_var = ...;
+//   if (TakeOwnership(my_var.get()) == SUCCESS)
+//     ignore_result(my_var.release());
+//
+template<typename T>
+inline void ignore_result(const T& ignored) {
+}
+
 // The following enum should be used only as a constructor argument to indicate
 // that the variable has static storage class, and that the constructor should
 // do nothing to its state.  It indicates to the reader that it is legal to
@@ -343,6 +363,5 @@ inline Dest bit_cast(const Source& source) {
 namespace base {
 enum LinkerInitialized { LINKER_INITIALIZED };
 }  // base
-
 
 #endif  // BASE_BASICTYPES_H_

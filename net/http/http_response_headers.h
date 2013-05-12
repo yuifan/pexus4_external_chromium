@@ -1,16 +1,18 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_HTTP_HTTP_RESPONSE_HEADERS_H_
 #define NET_HTTP_HTTP_RESPONSE_HEADERS_H_
+#pragma once
 
 #include <string>
 #include <vector>
 
 #include "base/basictypes.h"
 #include "base/hash_tables.h"
-#include "base/ref_counted.h"
+#include "base/memory/ref_counted.h"
+#include "net/base/net_export.h"
 #include "net/http/http_version.h"
 
 class Pickle;
@@ -23,9 +25,19 @@ class TimeDelta;
 namespace net {
 
 // HttpResponseHeaders: parses and holds HTTP response headers.
-class HttpResponseHeaders
+class NET_EXPORT HttpResponseHeaders
     : public base::RefCountedThreadSafe<HttpResponseHeaders> {
  public:
+  // Persist options.
+  typedef int PersistOptions;
+  static const PersistOptions PERSIST_RAW = -1;  // Raw, unparsed headers.
+  static const PersistOptions PERSIST_ALL = 0;  // Parsed headers.
+  static const PersistOptions PERSIST_SANS_COOKIES = 1 << 0;
+  static const PersistOptions PERSIST_SANS_CHALLENGES = 1 << 1;
+  static const PersistOptions PERSIST_SANS_HOP_BY_HOP = 1 << 2;
+  static const PersistOptions PERSIST_SANS_NON_CACHEABLE = 1 << 3;
+  static const PersistOptions PERSIST_SANS_RANGES = 1 << 4;
+
   // Parses the given raw_headers.  raw_headers should be formatted thus:
   // includes the http status response line, each line is \0-terminated, and
   // it's terminated by an empty line (ie, 2 \0s in a row).
@@ -43,16 +55,6 @@ class HttpResponseHeaders
   // for this object is found relative to the given pickle_iter, which should
   // be passed to the pickle's various Read* methods.
   HttpResponseHeaders(const Pickle& pickle, void** pickle_iter);
-
-  // Persist options.
-  typedef int PersistOptions;
-  static const PersistOptions PERSIST_RAW = -1;  // Raw, unparsed headers.
-  static const PersistOptions PERSIST_ALL = 0;  // Parsed headers.
-  static const PersistOptions PERSIST_SANS_COOKIES = 1 << 0;
-  static const PersistOptions PERSIST_SANS_CHALLENGES = 1 << 1;
-  static const PersistOptions PERSIST_SANS_HOP_BY_HOP = 1 << 2;
-  static const PersistOptions PERSIST_SANS_NON_CACHEABLE = 1 << 3;
-  static const PersistOptions PERSIST_SANS_RANGES = 1 << 4;
 
   // Appends a representation of this object to the given pickle.
   // The options argument can be a combination of PersistOptions.
@@ -134,9 +136,10 @@ class HttpResponseHeaders
   // method returns the un-coalesced response header lines, so if a response
   // header appears on multiple lines, then it will appear multiple times in
   // this enumeration (in the order the header lines were received from the
-  // server).  Initialize a 'void*' variable to NULL and pass it by address to
-  // EnumerateHeaderLines.  Call EnumerateHeaderLines repeatedly until it
-  // returns false.  The out-params 'name' and 'value' are set upon success.
+  // server).  Also, a given header might have an empty value.  Initialize a
+  // 'void*' variable to NULL and pass it by address to EnumerateHeaderLines.
+  // Call EnumerateHeaderLines repeatedly until it returns false.  The
+  // out-params 'name' and 'value' are set upon success.
   bool EnumerateHeaderLines(void** iter,
                             std::string* name,
                             std::string* value) const;
@@ -145,7 +148,8 @@ class HttpResponseHeaders
   // in the first header, then you can pass NULL for the 'iter' parameter.
   // Otherwise, to iterate across all values for the specified header,
   // initialize a 'void*' variable to NULL and pass it by address to
-  // EnumerateHeader.  Call EnumerateHeader repeatedly until it returns false.
+  // EnumerateHeader. Note that a header might have an empty value. Call
+  // EnumerateHeader repeatedly until it returns false.
   bool EnumerateHeader(void** iter,
                        const std::string& name,
                        std::string* value) const;
@@ -153,6 +157,10 @@ class HttpResponseHeaders
   // Returns true if the response contains the specified header-value pair.
   // Both name and value are compared case insensitively.
   bool HasHeaderValue(const std::string& name, const std::string& value) const;
+
+  // Returns true if the response contains the specified header.
+  // The name is compared case insensitively.
+  bool HasHeader(const std::string& name) const;
 
   // Get the mime type and charset values in lower case form from the headers.
   // Empty strings are returned if the values are not present.
@@ -243,8 +251,12 @@ class HttpResponseHeaders
 
   typedef base::hash_set<std::string> HeaderSet;
 
-  HttpResponseHeaders() {}
-  ~HttpResponseHeaders() {}
+  // The members of this structure point into raw_headers_.
+  struct ParsedHeader;
+  typedef std::vector<ParsedHeader> HeaderList;
+
+  HttpResponseHeaders();
+  ~HttpResponseHeaders();
 
   // Initializes from the given raw headers.
   void Parse(const std::string& raw_input);
@@ -308,19 +320,6 @@ class HttpResponseHeaders
 
   // Adds the set of content range response headers.
   static void AddHopContentRangeHeaders(HeaderSet* header_names);
-
-  // The members of this structure point into raw_headers_.
-  struct ParsedHeader {
-    std::string::const_iterator name_begin;
-    std::string::const_iterator name_end;
-    std::string::const_iterator value_begin;
-    std::string::const_iterator value_end;
-
-    // A header "continuation" contains only a subsequent value for the
-    // preceding header.  (Header values are comma separated.)
-    bool is_continuation() const { return name_begin == name_end; }
-  };
-  typedef std::vector<ParsedHeader> HeaderList;
 
   // We keep a list of ParsedHeader objects.  These tell us where to locate the
   // header-value pairs within raw_headers_.

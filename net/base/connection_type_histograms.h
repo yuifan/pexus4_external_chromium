@@ -4,6 +4,7 @@
 
 #ifndef NET_BASE_CONNECTION_TYPE_HISTOGRAMS_H_
 #define NET_BASE_CONNECTION_TYPE_HISTOGRAMS_H_
+#pragma once
 
 // The UpdateConnectionTypeHistograms function collects statistics related
 // to the number of MD5 certificates that our users are encountering.  The
@@ -29,12 +30,16 @@ enum ConnectionType {
                               // in the certificate chain (excluding root)
   CONNECTION_HTTP = 7,     // An HTTP connection
   CONNECTION_SPDY = 8,     // A SPDY connection
+  CONNECTION_SSL_SSL2 = 9,     // An SSL connection that uses SSL 2.0
+  CONNECTION_SSL_SSL3 = 10,    // An SSL connection that uses SSL 3.0
+  CONNECTION_SSL_TLS1 = 11,    // An SSL connection that uses TLS 1.0
+  CONNECTION_SSL_TLS1_1 = 12,  // An SSL connection that uses TLS 1.1
+  CONNECTION_SSL_TLS1_2 = 13,  // An SSL connection that uses TLS 1.2
   NUM_OF_CONNECTION_TYPES
 };
 
 // Update the connection type histograms.  |type| is the connection type.
-// |success| is whether or not the connection was successful or not.
-void UpdateConnectionTypeHistograms(ConnectionType type, bool success);
+void UpdateConnectionTypeHistograms(ConnectionType type);
 
 }  // namespace net
 

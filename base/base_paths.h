@@ -1,14 +1,16 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_BASE_PATHS_H_
 #define BASE_BASE_PATHS_H_
+#pragma once
 
 // This file declares path keys for the base module.  These can be used with
 // the PathService to access various special directories and files.
 
-#include "base/basictypes.h"
+#include "build/build_config.h"
+
 #if defined(OS_WIN)
 #include "base/base_paths_win.h"
 #elif defined(OS_MACOSX)
@@ -32,10 +34,11 @@ enum {
                     // for tests that need to locate various resources.  It
                     // should not be used outside of test code.
 #if defined(OS_POSIX)
-  DIR_USER_CACHE,   // Directory where user cache data resides. The Chromium
-                    // browser cache can be a subdirectory of DIR_USER_CACHE.
-                    // This is $XDG_CACHE_HOME on Linux and ~/Library/Caches
-                    // on Mac.
+  DIR_CACHE,    // Directory where to put cache data.  Note this is
+                // *not* where the browser cache lives, but the
+                // browser cache can be a subdirectory.
+                // This is $XDG_CACHE_HOME on Linux and
+                // ~/Library/Caches on Mac.
 #endif
 
   PATH_END

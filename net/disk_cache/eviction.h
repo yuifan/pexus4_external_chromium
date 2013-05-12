@@ -1,12 +1,12 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_DISK_CACHE_EVICTION_H_
 #define NET_DISK_CACHE_EVICTION_H_
+#pragma once
 
 #include "base/basictypes.h"
-#include "base/compiler_specific.h"
 #include "base/task.h"
 #include "net/disk_cache/disk_format.h"
 #include "net/disk_cache/rankings.h"
@@ -20,10 +20,11 @@ class EntryImpl;
 // integrated with BackendImpl.
 class Eviction {
  public:
-  Eviction() : backend_(NULL), ALLOW_THIS_IN_INITIALIZER_LIST(factory_(this)) {}
-  ~Eviction() {}
+  Eviction();
+  ~Eviction();
 
   void Init(BackendImpl* backend);
+  void Stop();
 
   // Deletes entries from the cache until the current size is below the limit.
   // If empty is true, the whole cache will be trimmed, regardless of being in
@@ -39,12 +40,17 @@ class Eviction {
   void OnDoomEntry(EntryImpl* entry);
   void OnDestroyEntry(EntryImpl* entry);
 
+  // Testing interface.
+  void SetTestMode();
+  void TrimDeletedList(bool empty);
+
  private:
   void PostDelayedTrim();
   void DelayedTrim();
+  bool ShouldTrim();
   void ReportTrimTimes(EntryImpl* entry);
   Rankings::List GetListForEntry(EntryImpl* entry);
-  bool EvictEntry(CacheRankingsBlock* node, bool empty);
+  bool EvictEntry(CacheRankingsBlock* node, bool empty, Rankings::List list);
 
   // We'll just keep for a while a separate set of methods that implement the
   // new eviction algorithm. This code will replace the original methods when
@@ -60,17 +66,21 @@ class Eviction {
   bool RemoveDeletedNode(CacheRankingsBlock* node);
 
   bool NodeIsOldEnough(CacheRankingsBlock* node, int list);
-  int SelectListByLenght();
+  int SelectListByLength(Rankings::ScopedRankingsBlock* next);
   void ReportListStats();
 
   BackendImpl* backend_;
   Rankings* rankings_;
   IndexHeader* header_;
   int max_size_;
+  int trim_delays_;
   bool new_eviction_;
   bool first_trim_;
   bool trimming_;
   bool delay_trim_;
+  bool init_;
+  bool test_mode_;
+  bool in_experiment_;
   ScopedRunnableMethodFactory<Eviction> factory_;
 
   DISALLOW_COPY_AND_ASSIGN(Eviction);

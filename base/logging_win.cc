@@ -1,51 +1,15 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "base/logging_win.h"
-#include "base/atomicops.h"
-#include "base/singleton.h"
+#include "base/memory/singleton.h"
 #include <initguid.h>  // NOLINT
 
-namespace {
-
-struct LogEventProviderTraits {
-  // WARNING: User has to deal with get() returning NULL.
-  static logging::LogEventProvider* New() {
-    if (base::subtle::NoBarrier_AtomicExchange(&dead_, 1))
-      return NULL;
-    logging::LogEventProvider* ptr =
-        reinterpret_cast<logging::LogEventProvider*>(buffer_);
-    // We are protected by a memory barrier.
-    new(ptr) logging::LogEventProvider();
-    return ptr;
-  }
-
-  static void Delete(logging::LogEventProvider* p) {
-    base::subtle::NoBarrier_Store(&dead_, 1);
-    MemoryBarrier();
-    p->logging::LogEventProvider::~LogEventProvider();
-  }
-
-  static const bool kRegisterAtExit = true;
-
- private:
-  static const size_t kBufferSize = (sizeof(logging::LogEventProvider) +
-                                     sizeof(intptr_t) - 1) / sizeof(intptr_t);
-  static intptr_t buffer_[kBufferSize];
-
-  // Signal the object was already deleted, so it is not revived.
-  static base::subtle::Atomic32 dead_;
-};
-
-intptr_t LogEventProviderTraits::buffer_[kBufferSize];
-base::subtle::Atomic32 LogEventProviderTraits::dead_ = 0;
-
-Singleton<logging::LogEventProvider, LogEventProviderTraits> log_provider;
-
-}  // namespace
-
 namespace logging {
+
+using base::win::EtwEventLevel;
+using base::win::EtwMofEvent;
 
 DEFINE_GUID(kLogEventId,
     0x7fe69228, 0x633e, 0x4f06, 0x80, 0xc1, 0x52, 0x7f, 0xea, 0x23, 0xe3, 0xa7);
@@ -53,60 +17,87 @@ DEFINE_GUID(kLogEventId,
 LogEventProvider::LogEventProvider() : old_log_level_(LOG_NONE) {
 }
 
-bool LogEventProvider::LogMessage(int severity, const std::string& message) {
+LogEventProvider* LogEventProvider::GetInstance() {
+  return Singleton<LogEventProvider,
+                   StaticMemorySingletonTraits<LogEventProvider> >::get();
+}
+
+bool LogEventProvider::LogMessage(logging::LogSeverity severity,
+    const char* file, int line, size_t message_start,
+    const std::string& message) {
   EtwEventLevel level = TRACE_LEVEL_NONE;
 
   // Convert the log severity to the most appropriate ETW trace level.
-  switch (severity) {
-    case LOG_INFO:
-      level = TRACE_LEVEL_INFORMATION;
-      break;
-    case LOG_WARNING:
-      level = TRACE_LEVEL_WARNING;
-      break;
-    case LOG_ERROR:
-    case LOG_ERROR_REPORT:
-      level = TRACE_LEVEL_ERROR;
-      break;
-    case LOG_FATAL:
-      level = TRACE_LEVEL_FATAL;
-      break;
-  };
+  if (severity >= 0) {
+    switch (severity) {
+      case LOG_INFO:
+        level = TRACE_LEVEL_INFORMATION;
+        break;
+      case LOG_WARNING:
+        level = TRACE_LEVEL_WARNING;
+        break;
+      case LOG_ERROR:
+      case LOG_ERROR_REPORT:
+        level = TRACE_LEVEL_ERROR;
+        break;
+      case LOG_FATAL:
+        level = TRACE_LEVEL_FATAL;
+        break;
+    }
+  } else {  // severity < 0 is VLOG verbosity levels.
+    level = TRACE_LEVEL_INFORMATION - severity;
+  }
 
   // Bail if we're not logging, not at that level,
   // or if we're post-atexit handling.
-  LogEventProvider* provider = log_provider.get();
+  LogEventProvider* provider = LogEventProvider::GetInstance();
   if (provider == NULL || level > provider->enable_level())
     return false;
 
-  // And now log the event, with stack trace if one is
-  // requested per our enable flags.
-  if (provider->enable_flags() & ENABLE_STACK_TRACE_CAPTURE) {
-    const size_t kMaxBacktraceDepth = 32;
-    void* backtrace[kMaxBacktraceDepth];
-    DWORD depth = CaptureStackBackTrace(2, kMaxBacktraceDepth, backtrace, NULL);
-    EtwMofEvent<3> event(kLogEventId, LOG_MESSAGE_WITH_STACKTRACE, level);
-
-    event.SetField(0, sizeof(depth), &depth);
-    event.SetField(1, sizeof(backtrace[0]) * depth, &backtrace);
-    event.SetField(2, message.length() + 1, message.c_str());
+  // And now log the event.
+  if (provider->enable_flags() & ENABLE_LOG_MESSAGE_ONLY) {
+    EtwMofEvent<1> event(kLogEventId, LOG_MESSAGE, level);
+    event.SetField(0, message.length() + 1 - message_start,
+        message.c_str() + message_start);
 
     provider->Log(event.get());
   } else {
-    EtwMofEvent<1> event(kLogEventId, LOG_MESSAGE, level);
-    event.SetField(0, message.length() + 1, message.c_str());
+    const size_t kMaxBacktraceDepth = 32;
+    void* backtrace[kMaxBacktraceDepth];
+    DWORD depth = 0;
+
+    // Capture a stack trace if one is requested.
+    // requested per our enable flags.
+    if (provider->enable_flags() & ENABLE_STACK_TRACE_CAPTURE)
+      depth = CaptureStackBackTrace(2, kMaxBacktraceDepth, backtrace, NULL);
+
+    EtwMofEvent<5> event(kLogEventId, LOG_MESSAGE_FULL, level);
+    if (file == NULL)
+      file = "";
+
+    // Add the stack trace.
+    event.SetField(0, sizeof(depth), &depth);
+    event.SetField(1, sizeof(backtrace[0]) * depth, &backtrace);
+    // The line.
+    event.SetField(2, sizeof(line), &line);
+    // The file.
+    event.SetField(3, strlen(file) + 1, file);
+    // And finally the message.
+    event.SetField(4, message.length() + 1 - message_start,
+        message.c_str() + message_start);
+
     provider->Log(event.get());
   }
 
   // Don't increase verbosity in other log destinations.
-  if (severity >= provider->old_log_level_)
+  if (severity < provider->old_log_level_)
     return true;
 
   return false;
 }
 
 void LogEventProvider::Initialize(const GUID& provider_name) {
-  LogEventProvider* provider = log_provider.get();
+  LogEventProvider* provider = LogEventProvider::GetInstance();
 
   provider->set_provider_name(provider_name);
   provider->Register();
@@ -116,7 +107,7 @@ void LogEventProvider::Initialize(const GUID& provider_name) {
 }
 
 void LogEventProvider::Uninitialize() {
-  log_provider.get()->Unregister();
+  LogEventProvider::GetInstance()->Unregister();
 }
 
 void LogEventProvider::OnEventsEnabled() {
@@ -126,21 +117,17 @@ void LogEventProvider::OnEventsEnabled() {
   // Convert the new trace level to a logging severity
   // and enable logging at that level.
   EtwEventLevel level = enable_level();
-  switch (level) {
-    case TRACE_LEVEL_NONE:
-    case TRACE_LEVEL_FATAL:
-      SetMinLogLevel(LOG_FATAL);
-      break;
-    case TRACE_LEVEL_ERROR:
-      SetMinLogLevel(LOG_ERROR);
-      break;
-    case TRACE_LEVEL_WARNING:
-      SetMinLogLevel(LOG_WARNING);
-      break;
-    case TRACE_LEVEL_INFORMATION:
-    case TRACE_LEVEL_VERBOSE:
-      SetMinLogLevel(LOG_INFO);
-      break;
+  if (level == TRACE_LEVEL_NONE || level == TRACE_LEVEL_FATAL) {
+    SetMinLogLevel(LOG_FATAL);
+  } else if (level == TRACE_LEVEL_ERROR) {
+    SetMinLogLevel(LOG_ERROR);
+  } else if (level == TRACE_LEVEL_WARNING) {
+    SetMinLogLevel(LOG_WARNING);
+  } else if (level == TRACE_LEVEL_INFORMATION) {
+    SetMinLogLevel(LOG_INFO);
+  } else if (level >= TRACE_LEVEL_VERBOSE) {
+    // Above INFO, we enable verbose levels with negative severities.
+    SetMinLogLevel(TRACE_LEVEL_INFORMATION - level);
   }
 }
 

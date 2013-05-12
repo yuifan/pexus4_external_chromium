@@ -1,14 +1,17 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_BASE_ESCAPE_H_
 #define NET_BASE_ESCAPE_H_
+#pragma once
 
 #include <string>
+#include <vector>
 
 #include "base/basictypes.h"
 #include "base/string16.h"
+#include "net/base/net_export.h"
 
 // Escaping --------------------------------------------------------------------
 
@@ -98,15 +101,20 @@ string16 UnescapeURLComponent(const string16& escaped_text,
 // Unescapes the given substring as a URL, and then tries to interpret the
 // result as being encoded as UTF-8. If the result is convertable into UTF-8, it
 // will be returned as converted. If it is not, the original escaped string will
-// be converted into a string16 and returned.
-//
-// |offset_for_adjustment| may be NULL; if not, it is an offset into |text| that
-// will be adjusted to point at the same logical place in the result string.  If
-// this isn't possible because it points into the middle of an escape sequence
-// or past the end of the string, it will be set to string16::npos.
+// be converted into a string16 and returned. (|offset[s]_for_adjustment|)
+// specifies one or more offsets into the source strings; each offset will be
+// adjusted to point at the same logical place in the result strings during
+// decoding.  If this isn't possible because an offset points past the end of
+// the source strings or into the middle of a multibyte sequence, the offending
+// offset will be set to std::wstring::npos. |offset[s]_for_adjustment| may be
+// NULL.
 string16 UnescapeAndDecodeUTF8URLComponent(const std::string& text,
                                            UnescapeRule::Type rules,
                                            size_t* offset_for_adjustment);
+string16 UnescapeAndDecodeUTF8URLComponentWithOffsets(
+    const std::string& text,
+    UnescapeRule::Type rules,
+    std::vector<size_t>* offsets_for_adjustment);
 
 // Unescape the following ampersand character codes from |text|:
 // &lt; &gt; &amp; &quot; &#39;
@@ -120,18 +128,25 @@ string16 UnescapeForHTML(const string16& text);
 // This is basically the same as encodeURIComponent in javascript.
 // For the string16 version, we do a conversion to charset before encoding the
 // string.  If the charset doesn't exist, we return false.
-//
-// TODO(brettw) bug 1201094: This function should be removed. See the bug for
-// why and what callers should do instead.
-std::string EscapeQueryParamValue(const std::string& text, bool use_plus);
+NET_EXPORT std::string EscapeQueryParamValue(const std::string& text, bool use_plus);
 bool EscapeQueryParamValue(const string16& text, const char* codepage,
                            bool use_plus, string16* escaped);
 
-// A specialized version of EscapeQueryParamValue for wide strings that
+// A specialized version of EscapeQueryParamValue for string16s that
 // assumes the codepage is UTF8.  This is provided as a convenience.
-//
-// TODO(brettw) bug 1201094: This function should be removed. See the bug for
-// why and what callers should do instead.
-std::wstring EscapeQueryParamValueUTF8(const std::wstring& text, bool use_plus);
+string16 EscapeQueryParamValueUTF8(const string16& text, bool use_plus);
+
+// Private Functions (Exposed for Unit Testing) --------------------------------
+
+// A function called by std::for_each that will adjust any offset which occurs
+// after one or more encoded characters.
+struct AdjustEncodingOffset {
+  typedef std::vector<size_t> Adjustments;
+
+  explicit AdjustEncodingOffset(const Adjustments& adjustments);
+  void operator()(size_t& offset);
+
+  const Adjustments& adjustments;
+};
 
 #endif  // NET_BASE_ESCAPE_H_

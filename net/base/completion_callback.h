@@ -4,8 +4,9 @@
 
 #ifndef NET_BASE_COMPLETION_CALLBACK_H__
 #define NET_BASE_COMPLETION_CALLBACK_H__
+#pragma once
 
-#include "base/task.h"
+#include "base/callback.h"
 
 namespace net {
 

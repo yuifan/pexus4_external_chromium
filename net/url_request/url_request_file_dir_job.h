@@ -1,42 +1,48 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef NET_URL_REQUEST_URL_REQUEST_FILE_DIR_JOB_H__
-#define NET_URL_REQUEST_URL_REQUEST_FILE_DIR_JOB_H__
+#ifndef NET_URL_REQUEST_URL_REQUEST_FILE_DIR_JOB_H_
+#define NET_URL_REQUEST_URL_REQUEST_FILE_DIR_JOB_H_
+#pragma once
 
 #include <string>
 
 #include "base/file_path.h"
 #include "base/file_util.h"
+#include "base/task.h"
 #include "net/base/directory_lister.h"
 #include "net/url_request/url_request_job.h"
 
+namespace net {
+
 class URLRequestFileDirJob
   : public URLRequestJob,
-    public net::DirectoryLister::DirectoryListerDelegate {
+    public DirectoryLister::DirectoryListerDelegate {
  public:
   URLRequestFileDirJob(URLRequest* request, const FilePath& dir_path);
 
-  // URLRequestJob methods:
-  virtual void Start();
+  bool list_complete() const { return list_complete_; }
+
   virtual void StartAsync();
+
+  // Overridden from URLRequestJob:
+  virtual void Start();
   virtual void Kill();
-  virtual bool ReadRawData(net::IOBuffer* buf, int buf_size, int *bytes_read);
+  virtual bool ReadRawData(IOBuffer* buf, int buf_size, int *bytes_read);
   virtual bool GetMimeType(std::string* mime_type) const;
   virtual bool GetCharset(std::string* charset);
-  virtual bool IsRedirectResponse(GURL* location, int* http_status_code);
 
-  // DirectoryLister::DirectoryListerDelegate methods:
-  virtual void OnListFile(const file_util::FileEnumerator::FindInfo& data);
+  // Overridden from DirectoryLister::DirectoryListerDelegate:
+  virtual void OnListFile(
+      const DirectoryLister::DirectoryListerData& data);
   virtual void OnListDone(int error);
-
-  bool list_complete() const { return list_complete_; }
 
  private:
   virtual ~URLRequestFileDirJob();
 
   void CloseLister();
+
   // When we have data and a read has been pending, this function
   // will fill the response buffer and notify the request
   // appropriately.
@@ -45,7 +51,7 @@ class URLRequestFileDirJob
   // Fills a buffer with the output.
   bool FillReadBuffer(char *buf, int buf_size, int *bytes_read);
 
-  scoped_refptr<net::DirectoryLister> lister_;
+  scoped_refptr<DirectoryLister> lister_;
   FilePath dir_path_;
   std::string data_;
   bool canceled_;
@@ -60,10 +66,13 @@ class URLRequestFileDirJob
   // we wait for IO to complete.  When done, we fill the buffer
   // manually.
   bool read_pending_;
-  scoped_refptr<net::IOBuffer> read_buffer_;
+  scoped_refptr<IOBuffer> read_buffer_;
   int read_buffer_length_;
+  ScopedRunnableMethodFactory<URLRequestFileDirJob> method_factory_;
 
-  DISALLOW_EVIL_CONSTRUCTORS(URLRequestFileDirJob);
+  DISALLOW_COPY_AND_ASSIGN(URLRequestFileDirJob);
 };
 
-#endif  // NET_URL_REQUEST_URL_REQUEST_FILE_DIR_JOB_H__
+}  // namespace net
+
+#endif  // NET_URL_REQUEST_URL_REQUEST_FILE_DIR_JOB_H_

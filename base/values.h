@@ -1,77 +1,78 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// This file specifies a recursive data storage class called Value
-// intended for storing setting and other persistable data.
-// It includes the ability to specify (recursive) lists and dictionaries, so
-// it's fairly expressive.  However, the API is optimized for the common case,
-// namely storing a hierarchical tree of simple values.  Given a
-// DictionaryValue root, you can easily do things like:
+// This file specifies a recursive data storage class called Value intended for
+// storing setting and other persistable data.  It includes the ability to
+// specify (recursive) lists and dictionaries, so it's fairly expressive.
+// However, the API is optimized for the common case, namely storing a
+// hierarchical tree of simple values.  Given a DictionaryValue root, you can
+// easily do things like:
 //
-// root->SetString(L"global.pages.homepage", L"http://goateleporter.com");
-// std::wstring homepage = L"http://google.com";  // default/fallback value
-// root->GetString(L"global.pages.homepage", &homepage);
+// root->SetString("global.pages.homepage", "http://goateleporter.com");
+// std::string homepage = "http://google.com";  // default/fallback value
+// root->GetString("global.pages.homepage", &homepage);
 //
-// where "global" and "pages" are also DictionaryValues, and "homepage"
-// is a string setting.  If some elements of the path didn't exist yet,
-// the SetString() method would create the missing elements and attach them
-// to root before attaching the homepage value.
+// where "global" and "pages" are also DictionaryValues, and "homepage" is a
+// string setting.  If some elements of the path didn't exist yet, the
+// SetString() method would create the missing elements and attach them to root
+// before attaching the homepage value.
 
 #ifndef BASE_VALUES_H_
 #define BASE_VALUES_H_
+#pragma once
 
 #include <iterator>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "base/base_api.h"
 #include "base/basictypes.h"
 #include "base/string16.h"
 #include "build/build_config.h"
 
-class Value;
-class FundamentalValue;
-class StringValue;
 class BinaryValue;
 class DictionaryValue;
+class FundamentalValue;
 class ListValue;
+class StringValue;
+class Value;
 
 typedef std::vector<Value*> ValueVector;
-typedef std::map<std::wstring, Value*> ValueMap;
+typedef std::map<std::string, Value*> ValueMap;
 
 // The Value class is the base class for Values.  A Value can be
 // instantiated via the Create*Value() factory methods, or by directly
 // creating instances of the subclasses.
-class Value {
+class BASE_API Value {
  public:
+  enum ValueType {
+    TYPE_NULL = 0,
+    TYPE_BOOLEAN,
+    TYPE_INTEGER,
+    TYPE_DOUBLE,
+    TYPE_STRING,
+    TYPE_BINARY,
+    TYPE_DICTIONARY,
+    TYPE_LIST
+  };
+
   virtual ~Value();
 
   // Convenience methods for creating Value objects for various
   // kinds of values without thinking about which class implements them.
   // These can always be expected to return a valid Value*.
   static Value* CreateNullValue();
-  static Value* CreateBooleanValue(bool in_value);
-  static Value* CreateIntegerValue(int in_value);
-  static Value* CreateRealValue(double in_value);
-  static Value* CreateStringValue(const std::string& in_value);
-  static Value* CreateStringValue(const std::wstring& in_value);
-  static Value* CreateStringValueFromUTF16(const string16& in_value);
+  static FundamentalValue* CreateBooleanValue(bool in_value);
+  static FundamentalValue* CreateIntegerValue(int in_value);
+  static FundamentalValue* CreateDoubleValue(double in_value);
+  static StringValue* CreateStringValue(const std::string& in_value);
+  static StringValue* CreateStringValue(const string16& in_value);
 
   // This one can return NULL if the input isn't valid.  If the return value
   // is non-null, the new object has taken ownership of the buffer pointer.
   static BinaryValue* CreateBinaryValue(char* buffer, size_t size);
-
-  typedef enum {
-    TYPE_NULL = 0,
-    TYPE_BOOLEAN,
-    TYPE_INTEGER,
-    TYPE_REAL,
-    TYPE_STRING,
-    TYPE_BINARY,
-    TYPE_DICTIONARY,
-    TYPE_LIST
-  } ValueType;
 
   // Returns the type of the value stored by the current Value object.
   // Each type will be implemented by only one subclass of Value, so it's
@@ -85,26 +86,33 @@ class Value {
 
   // These methods allow the convenient retrieval of settings.
   // If the current setting object can be converted into the given type,
-  // the value is returned through the "value" parameter and true is returned;
-  // otherwise, false is returned and "value" is unchanged.
+  // the value is returned through the |out_value| parameter and true is
+  // returned;  otherwise, false is returned and |out_value| is unchanged.
   virtual bool GetAsBoolean(bool* out_value) const;
   virtual bool GetAsInteger(int* out_value) const;
-  virtual bool GetAsReal(double* out_value) const;
+  virtual bool GetAsDouble(double* out_value) const;
   virtual bool GetAsString(std::string* out_value) const;
-  virtual bool GetAsString(std::wstring* out_value) const;
-  virtual bool GetAsUTF16(string16* out_value) const;
+  virtual bool GetAsString(string16* out_value) const;
+  virtual bool GetAsList(ListValue** out_value);
 
   // This creates a deep copy of the entire Value tree, and returns a pointer
   // to the copy.  The caller gets ownership of the copy, of course.
+  //
+  // Subclasses return their own type directly in their overrides;
+  // this works because C++ supports covariant return types.
   virtual Value* DeepCopy() const;
 
   // Compares if two Value objects have equal contents.
   virtual bool Equals(const Value* other) const;
 
+  // Compares if two Value objects have equal contents. Can handle NULLs.
+  // NULLs are considered equal but different from Value::CreateNullValue().
+  static bool Equals(const Value* a, const Value* b);
+
  protected:
   // This isn't safe for end-users (they should use the Create*Value()
   // static methods above), but it's useful for subclasses.
-  explicit Value(ValueType type) : type_(type) {}
+  explicit Value(ValueType type);
 
  private:
   Value();
@@ -115,53 +123,44 @@ class Value {
 };
 
 // FundamentalValue represents the simple fundamental types of values.
-class FundamentalValue : public Value {
+class BASE_API FundamentalValue : public Value {
  public:
-  explicit FundamentalValue(bool in_value)
-    : Value(TYPE_BOOLEAN), boolean_value_(in_value) {}
-  explicit FundamentalValue(int in_value)
-    : Value(TYPE_INTEGER), integer_value_(in_value) {}
-  explicit FundamentalValue(double in_value)
-    : Value(TYPE_REAL), real_value_(in_value) {}
-  ~FundamentalValue();
+  explicit FundamentalValue(bool in_value);
+  explicit FundamentalValue(int in_value);
+  explicit FundamentalValue(double in_value);
+  virtual ~FundamentalValue();
 
   // Subclassed methods
   virtual bool GetAsBoolean(bool* out_value) const;
   virtual bool GetAsInteger(int* out_value) const;
-  virtual bool GetAsReal(double* out_value) const;
-  virtual Value* DeepCopy() const;
+  virtual bool GetAsDouble(double* out_value) const;
+  virtual FundamentalValue* DeepCopy() const;
   virtual bool Equals(const Value* other) const;
 
  private:
   union {
     bool boolean_value_;
     int integer_value_;
-    double real_value_;
+    double double_value_;
   };
 
   DISALLOW_COPY_AND_ASSIGN(FundamentalValue);
 };
 
-class StringValue : public Value {
+class BASE_API StringValue : public Value {
  public:
   // Initializes a StringValue with a UTF-8 narrow character string.
   explicit StringValue(const std::string& in_value);
 
-  // Initializes a StringValue with a wide character string.
-  explicit StringValue(const std::wstring& in_value);
-
-#if !defined(WCHAR_T_IS_UTF16)
   // Initializes a StringValue with a string16.
   explicit StringValue(const string16& in_value);
-#endif
 
-  ~StringValue();
+  virtual ~StringValue();
 
   // Subclassed methods
-  bool GetAsString(std::string* out_value) const;
-  bool GetAsString(std::wstring* out_value) const;
-  bool GetAsUTF16(string16* out_value) const;
-  Value* DeepCopy() const;
+  virtual bool GetAsString(std::string* out_value) const;
+  virtual bool GetAsString(string16* out_value) const;
+  virtual StringValue* DeepCopy() const;
   virtual bool Equals(const Value* other) const;
 
  private:
@@ -170,8 +169,10 @@ class StringValue : public Value {
   DISALLOW_COPY_AND_ASSIGN(StringValue);
 };
 
-class BinaryValue: public Value {
+class BASE_API BinaryValue: public Value {
  public:
+  virtual ~BinaryValue();
+
   // Creates a Value to represent a binary buffer.  The new object takes
   // ownership of the pointer passed in, if successful.
   // Returns NULL if buffer is NULL.
@@ -183,15 +184,13 @@ class BinaryValue: public Value {
   // Returns NULL if buffer is NULL.
   static BinaryValue* CreateWithCopiedBuffer(const char* buffer, size_t size);
 
-  ~BinaryValue();
-
-  // Subclassed methods
-  Value* DeepCopy() const;
-  virtual bool Equals(const Value* other) const;
-
   size_t GetSize() const { return size_; }
   char* GetBuffer() { return buffer_; }
   const char* GetBuffer() const { return buffer_; }
+
+  // Overridden from Value:
+  virtual BinaryValue* DeepCopy() const;
+  virtual bool Equals(const Value* other) const;
 
  private:
   // Constructor is private so that only objects with valid buffer pointers
@@ -204,17 +203,16 @@ class BinaryValue: public Value {
   DISALLOW_COPY_AND_ASSIGN(BinaryValue);
 };
 
-class DictionaryValue : public Value {
+// DictionaryValue provides a key-value dictionary with (optional) "path"
+// parsing for recursive access; see the comment at the top of the file. Keys
+// are |std::string|s and should be UTF-8 encoded.
+class BASE_API DictionaryValue : public Value {
  public:
-  DictionaryValue() : Value(TYPE_DICTIONARY) {}
-  ~DictionaryValue();
-
-  // Subclassed methods
-  Value* DeepCopy() const;
-  virtual bool Equals(const Value* other) const;
+  DictionaryValue();
+  virtual ~DictionaryValue();
 
   // Returns true if the current dictionary has a value for the given key.
-  bool HasKey(const std::wstring& key) const;
+  bool HasKey(const std::string& key) const;
 
   // Returns the number of Values in this dictionary.
   size_t size() const { return dictionary_.size(); }
@@ -234,59 +232,58 @@ class DictionaryValue : public Value {
   // to the path in that location.
   // Note that the dictionary takes ownership of the value referenced by
   // |in_value|, and therefore |in_value| must be non-NULL.
-  void Set(const std::wstring& path, Value* in_value);
+  void Set(const std::string& path, Value* in_value);
 
   // Convenience forms of Set().  These methods will replace any existing
   // value at that path, even if it has a different type.
-  void SetBoolean(const std::wstring& path, bool in_value);
-  void SetInteger(const std::wstring& path, int in_value);
-  void SetReal(const std::wstring& path, double in_value);
-  void SetString(const std::wstring& path, const std::string& in_value);
-  void SetString(const std::wstring& path, const std::wstring& in_value);
-  void SetStringFromUTF16(const std::wstring& path, const string16& in_value);
+  void SetBoolean(const std::string& path, bool in_value);
+  void SetInteger(const std::string& path, int in_value);
+  void SetDouble(const std::string& path, double in_value);
+  void SetString(const std::string& path, const std::string& in_value);
+  void SetString(const std::string& path, const string16& in_value);
 
   // Like Set(), but without special treatment of '.'.  This allows e.g. URLs to
   // be used as paths.
-  void SetWithoutPathExpansion(const std::wstring& key, Value* in_value);
+  void SetWithoutPathExpansion(const std::string& key, Value* in_value);
 
   // Gets the Value associated with the given path starting from this object.
   // A path has the form "<key>" or "<key>.<key>.[...]", where "." indexes
   // into the next DictionaryValue down.  If the path can be resolved
   // successfully, the value for the last key in the path will be returned
-  // through the "value" parameter, and the function will return true.
-  // Otherwise, it will return false and "value" will be untouched.
+  // through the |out_value| parameter, and the function will return true.
+  // Otherwise, it will return false and |out_value| will be untouched.
   // Note that the dictionary always owns the value that's returned.
-  bool Get(const std::wstring& path, Value** out_value) const;
+  bool Get(const std::string& path, Value** out_value) const;
 
   // These are convenience forms of Get().  The value will be retrieved
   // and the return value will be true if the path is valid and the value at
   // the end of the path can be returned in the form specified.
-  bool GetBoolean(const std::wstring& path, bool* out_value) const;
-  bool GetInteger(const std::wstring& path, int* out_value) const;
-  bool GetReal(const std::wstring& path, double* out_value) const;
-  bool GetString(const std::wstring& path, std::string* out_value) const;
-  bool GetString(const std::wstring& path, std::wstring* out_value) const;
-  bool GetStringAsUTF16(const std::wstring& path, string16* out_value) const;
-  bool GetBinary(const std::wstring& path, BinaryValue** out_value) const;
-  bool GetDictionary(const std::wstring& path,
+  bool GetBoolean(const std::string& path, bool* out_value) const;
+  bool GetInteger(const std::string& path, int* out_value) const;
+  bool GetDouble(const std::string& path, double* out_value) const;
+  bool GetString(const std::string& path, std::string* out_value) const;
+  bool GetString(const std::string& path, string16* out_value) const;
+  bool GetStringASCII(const std::string& path, std::string* out_value) const;
+  bool GetBinary(const std::string& path, BinaryValue** out_value) const;
+  bool GetDictionary(const std::string& path,
                      DictionaryValue** out_value) const;
-  bool GetList(const std::wstring& path, ListValue** out_value) const;
+  bool GetList(const std::string& path, ListValue** out_value) const;
 
   // Like Get(), but without special treatment of '.'.  This allows e.g. URLs to
   // be used as paths.
-  bool GetWithoutPathExpansion(const std::wstring& key,
+  bool GetWithoutPathExpansion(const std::string& key,
                                Value** out_value) const;
-  bool GetIntegerWithoutPathExpansion(const std::wstring& path,
+  bool GetIntegerWithoutPathExpansion(const std::string& key,
                                       int* out_value) const;
-  bool GetStringWithoutPathExpansion(const std::wstring& path,
+  bool GetDoubleWithoutPathExpansion(const std::string& key,
+                                   double* out_value) const;
+  bool GetStringWithoutPathExpansion(const std::string& key,
                                      std::string* out_value) const;
-  bool GetStringWithoutPathExpansion(const std::wstring& path,
-                                     std::wstring* out_value) const;
-  bool GetStringAsUTF16WithoutPathExpansion(const std::wstring& path,
-                                            string16* out_value) const;
-  bool GetDictionaryWithoutPathExpansion(const std::wstring& path,
+  bool GetStringWithoutPathExpansion(const std::string& key,
+                                     string16* out_value) const;
+  bool GetDictionaryWithoutPathExpansion(const std::string& key,
                                          DictionaryValue** out_value) const;
-  bool GetListWithoutPathExpansion(const std::wstring& path,
+  bool GetListWithoutPathExpansion(const std::string& key,
                                    ListValue** out_value) const;
 
   // Removes the Value with the specified path from this dictionary (or one
@@ -295,15 +292,21 @@ class DictionaryValue : public Value {
   // passed out via out_value.  If |out_value| is NULL, the removed value will
   // be deleted.  This method returns true if |path| is a valid path; otherwise
   // it will return false and the DictionaryValue object will be unchanged.
-  bool Remove(const std::wstring& path, Value** out_value);
+  bool Remove(const std::string& path, Value** out_value);
 
   // Like Remove(), but without special treatment of '.'.  This allows e.g. URLs
   // to be used as paths.
-  bool RemoveWithoutPathExpansion(const std::wstring& key, Value** out_value);
+  bool RemoveWithoutPathExpansion(const std::string& key, Value** out_value);
 
   // Makes a copy of |this| but doesn't include empty dictionaries and lists in
   // the copy.  This never returns NULL, even if |this| itself is empty.
   DictionaryValue* DeepCopyWithoutEmptyChildren();
+
+  // Merge a given dictionary into this dictionary. This is done recursively,
+  // i.e. any subdictionaries will be merged as well. In case of key collisions,
+  // the passed in dictionary takes precedence and data already present will be
+  // replaced.
+  void MergeDictionary(const DictionaryValue* dictionary);
 
   // This class provides an iterator for the keys in the dictionary.
   // It can't be used to modify the dictionary.
@@ -311,15 +314,15 @@ class DictionaryValue : public Value {
   // YOU SHOULD ALWAYS USE THE XXXWithoutPathExpansion() APIs WITH THESE, NOT
   // THE NORMAL XXX() APIs.  This makes sure things will work correctly if any
   // keys have '.'s in them.
-  class key_iterator
-    : private std::iterator<std::input_iterator_tag, const std::wstring> {
+  class BASE_API key_iterator
+      : private std::iterator<std::input_iterator_tag, const std::string> {
    public:
     explicit key_iterator(ValueMap::const_iterator itr) { itr_ = itr; }
     key_iterator operator++() {
       ++itr_;
       return *this;
     }
-    const std::wstring& operator*() { return itr_->first; }
+    const std::string& operator*() { return itr_->first; }
     bool operator!=(const key_iterator& other) { return itr_ != other.itr_; }
     bool operator==(const key_iterator& other) { return itr_ == other.itr_; }
 
@@ -330,6 +333,10 @@ class DictionaryValue : public Value {
   key_iterator begin_keys() const { return key_iterator(dictionary_.begin()); }
   key_iterator end_keys() const { return key_iterator(dictionary_.end()); }
 
+  // Overridden from Value:
+  virtual DictionaryValue* DeepCopy() const;
+  virtual bool Equals(const Value* other) const;
+
  private:
   ValueMap dictionary_;
 
@@ -337,14 +344,13 @@ class DictionaryValue : public Value {
 };
 
 // This type of Value represents a list of other Value values.
-class ListValue : public Value {
+class BASE_API ListValue : public Value {
  public:
-  ListValue() : Value(TYPE_LIST) {}
-  ~ListValue();
+  typedef ValueVector::iterator iterator;
+  typedef ValueVector::const_iterator const_iterator;
 
-  // Subclassed methods
-  Value* DeepCopy() const;
-  virtual bool Equals(const Value* other) const;
+  ListValue();
+  ~ListValue();
 
   // Clears the contents of this ListValue
   void Clear();
@@ -362,20 +368,19 @@ class ListValue : public Value {
   // the value is a null pointer.
   bool Set(size_t index, Value* in_value);
 
-  // Gets the Value at the given index.  Modifies value (and returns true)
+  // Gets the Value at the given index.  Modifies |out_value| (and returns true)
   // only if the index falls within the current list range.
-  // Note that the list always owns the Value passed out via out_value.
+  // Note that the list always owns the Value passed out via |out_value|.
   bool Get(size_t index, Value** out_value) const;
 
-  // Convenience forms of Get().  Modifies value (and returns true) only if
-  // the index is valid and the Value at that index can be returned in
-  // the specified form.
+  // Convenience forms of Get().  Modifies |out_value| (and returns true)
+  // only if the index is valid and the Value at that index can be returned
+  // in the specified form.
   bool GetBoolean(size_t index, bool* out_value) const;
   bool GetInteger(size_t index, int* out_value) const;
-  bool GetReal(size_t index, double* out_value) const;
+  bool GetDouble(size_t index, double* out_value) const;
   bool GetString(size_t index, std::string* out_value) const;
-  bool GetString(size_t index, std::wstring* out_value) const;
-  bool GetStringAsUTF16(size_t index, string16* out_value) const;
+  bool GetString(size_t index, string16* out_value) const;
   bool GetBinary(size_t index, BinaryValue** out_value) const;
   bool GetDictionary(size_t index, DictionaryValue** out_value) const;
   bool GetList(size_t index, ListValue** out_value) const;
@@ -394,19 +399,31 @@ class ListValue : public Value {
   // Appends a Value to the end of the list.
   void Append(Value* in_value);
 
+  // Appends a Value if it's not already present. Takes ownership of the
+  // |in_value|. Returns true if successful, or false if the value was already
+  // present. If the value was already present the |in_value| is deleted.
+  bool AppendIfNotPresent(Value* in_value);
+
   // Insert a Value at index.
   // Returns true if successful, or false if the index was out of range.
   bool Insert(size_t index, Value* in_value);
 
-  // Iteration
-  typedef ValueVector::iterator iterator;
-  typedef ValueVector::const_iterator const_iterator;
+  // Swaps contents with the |other| list.
+  void Swap(ListValue* other) {
+    list_.swap(other->list_);
+  }
 
+  // Iteration
   ListValue::iterator begin() { return list_.begin(); }
   ListValue::iterator end() { return list_.end(); }
 
   ListValue::const_iterator begin() const { return list_.begin(); }
   ListValue::const_iterator end() const { return list_.end(); }
+
+  // Overridden from Value:
+  virtual bool GetAsList(ListValue** out_value);
+  virtual ListValue* DeepCopy() const;
+  virtual bool Equals(const Value* other) const;
 
  private:
   ValueVector list_;
@@ -416,17 +433,19 @@ class ListValue : public Value {
 
 // This interface is implemented by classes that know how to serialize and
 // deserialize Value objects.
-class ValueSerializer {
+class BASE_API ValueSerializer {
  public:
-  virtual ~ValueSerializer() {}
+  virtual ~ValueSerializer();
 
   virtual bool Serialize(const Value& root) = 0;
 
   // This method deserializes the subclass-specific format into a Value object.
   // If the return value is non-NULL, the caller takes ownership of returned
-  // Value. If the return value is NULL, and if error_message is non-NULL,
-  // error_message should be filled with a message describing the error.
-  virtual Value* Deserialize(std::string* error_message) = 0;
+  // Value. If the return value is NULL, and if error_code is non-NULL,
+  // error_code will be set with the underlying error.
+  // If |error_message| is non-null, it will be filled in with a formatted
+  // error message including the location of the error if appropriate.
+  virtual Value* Deserialize(int* error_code, std::string* error_str) = 0;
 };
 
 #endif  // BASE_VALUES_H_

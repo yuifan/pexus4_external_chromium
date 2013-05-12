@@ -11,6 +11,22 @@
 
 namespace base {
 
+// static
+GlobalDescriptors* GlobalDescriptors::GetInstance() {
+  typedef Singleton<base::GlobalDescriptors,
+                    LeakySingletonTraits<base::GlobalDescriptors> >
+      GlobalDescriptorsSingleton;
+  return GlobalDescriptorsSingleton::get();
+}
+
+int GlobalDescriptors::Get(Key key) const {
+  const int ret = MaybeGet(key);
+
+  if (ret == -1)
+    LOG(FATAL) << "Unknown global descriptor: " << key;
+  return ret;
+}
+
 int GlobalDescriptors::MaybeGet(Key key) const {
   for (Mapping::const_iterator
        i = descriptors_.begin(); i != descriptors_.end(); ++i) {
@@ -21,14 +37,6 @@ int GlobalDescriptors::MaybeGet(Key key) const {
   // In order to make unittests pass, we define a default mapping from keys to
   // descriptors by adding a fixed offset:
   return kBaseDescriptor + key;
-}
-
-int GlobalDescriptors::Get(Key key) const {
-  const int ret = MaybeGet(key);
-
-  if (ret == -1)
-    LOG(FATAL) << "Unknown global descriptor: " << key;
-  return ret;
 }
 
 void GlobalDescriptors::Set(Key key, int fd) {
@@ -42,5 +50,13 @@ void GlobalDescriptors::Set(Key key, int fd) {
 
   descriptors_.push_back(std::make_pair(key, fd));
 }
+
+void GlobalDescriptors::Reset(const Mapping& mapping) {
+  descriptors_ = mapping;
+}
+
+GlobalDescriptors::GlobalDescriptors() {}
+
+GlobalDescriptors::~GlobalDescriptors() {}
 
 }  // namespace base

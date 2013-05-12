@@ -1,9 +1,10 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_SOCKET_SSL_CLIENT_SOCKET_WIN_H_
 #define NET_SOCKET_SSL_CLIENT_SOCKET_WIN_H_
+#pragma once
 
 #define SECURITY_WIN32  // Needs to be defined before including security.h
 
@@ -13,27 +14,35 @@
 
 #include <string>
 
-#include "base/scoped_ptr.h"
+#include "base/memory/scoped_ptr.h"
 #include "net/base/cert_verify_result.h"
 #include "net/base/completion_callback.h"
+#include "net/base/host_port_pair.h"
+#include "net/base/net_log.h"
 #include "net/base/ssl_config_service.h"
 #include "net/socket/ssl_client_socket.h"
 
 namespace net {
 
+class BoundNetLog;
 class CertVerifier;
-class LoadLog;
+class ClientSocketHandle;
+class HostPortPair;
+class SingleRequestCertVerifier;
 
 // An SSL client socket implemented with the Windows Schannel.
 class SSLClientSocketWin : public SSLClientSocket {
  public:
-  // Takes ownership of the transport_socket, which may already be connected.
-  // The given hostname will be compared with the name(s) in the server's
-  // certificate during the SSL handshake.  ssl_config specifies the SSL
-  // settings.
-  SSLClientSocketWin(ClientSocket* transport_socket,
-                     const std::string& hostname,
-                     const SSLConfig& ssl_config);
+  // Takes ownership of the |transport_socket|, which must already be connected.
+  // The hostname specified in |host_and_port| will be compared with the name(s)
+  // in the server's certificate during the SSL handshake.  If SSL client
+  // authentication is requested, the host_and_port field of SSLCertRequestInfo
+  // will be populated with |host_and_port|.  |ssl_config| specifies
+  // the SSL settings.
+  SSLClientSocketWin(ClientSocketHandle* transport_socket,
+                     const HostPortPair& host_and_port,
+                     const SSLConfig& ssl_config,
+                     CertVerifier* cert_verifier);
   ~SSLClientSocketWin();
 
   // SSLClientSocket methods:
@@ -42,11 +51,21 @@ class SSLClientSocketWin : public SSLClientSocket {
   virtual NextProtoStatus GetNextProto(std::string* proto);
 
   // ClientSocket methods:
-  virtual int Connect(CompletionCallback* callback, LoadLog* load_log);
+  virtual int Connect(CompletionCallback* callback
+#ifdef ANDROID
+                      , bool wait_for_connect
+#endif
+                     );
   virtual void Disconnect();
   virtual bool IsConnected() const;
   virtual bool IsConnectedAndIdle() const;
-  virtual int GetPeerName(struct sockaddr* name, socklen_t* namelen);
+  virtual int GetPeerAddress(AddressList* address) const;
+  virtual int GetLocalAddress(IPEndPoint* address) const;
+  virtual const BoundNetLog& NetLog() const { return net_log_; }
+  virtual void SetSubresourceSpeculation();
+  virtual void SetOmniboxSpeculation();
+  virtual bool WasEverUsed() const;
+  virtual bool UsingTCPFastOpen() const;
 
   // Socket methods:
   virtual int Read(IOBuffer* buf, int buf_len, CompletionCallback* callback);
@@ -86,7 +105,7 @@ class SSLClientSocketWin : public SSLClientSocket {
   int DidCallInitializeSecurityContext();
   int DidCompleteHandshake();
   void DidCompleteRenegotiation();
-  void LogConnectionTypeMetrics(bool success) const;
+  void LogConnectionTypeMetrics() const;
   void FreeSendBuffer();
 
   // Internal callbacks as async operations complete.
@@ -94,8 +113,8 @@ class SSLClientSocketWin : public SSLClientSocket {
   CompletionCallbackImpl<SSLClientSocketWin> read_callback_;
   CompletionCallbackImpl<SSLClientSocketWin> write_callback_;
 
-  scoped_ptr<ClientSocket> transport_;
-  std::string hostname_;
+  scoped_ptr<ClientSocketHandle> transport_;
+  HostPortPair host_and_port_;
   SSLConfig ssl_config_;
 
   // User function to callback when the Connect() completes.
@@ -133,7 +152,8 @@ class SSLClientSocketWin : public SSLClientSocket {
 
   SecPkgContext_StreamSizes stream_sizes_;
   scoped_refptr<X509Certificate> server_cert_;
-  scoped_ptr<CertVerifier> verifier_;
+  CertVerifier* const cert_verifier_;
+  scoped_ptr<SingleRequestCertVerifier> verifier_;
   CertVerifyResult server_cert_verify_result_;
 
   CredHandle* creds_;
@@ -164,8 +184,6 @@ class SSLClientSocketWin : public SSLClientSocket {
   // state.
   bool writing_first_token_;
 
-  bool completed_handshake_;
-
   // Only used in the STATE_HANDSHAKE_READ_COMPLETE and
   // STATE_PAYLOAD_READ_COMPLETE states.  True if a 'result' argument of OK
   // should be ignored, to prevent it from being interpreted as EOF.
@@ -183,7 +201,7 @@ class SSLClientSocketWin : public SSLClientSocket {
   // True when the decrypter needs more data in order to decrypt.
   bool need_more_data_;
 
-  scoped_refptr<LoadLog> load_log_;
+  BoundNetLog net_log_;
 };
 
 }  // namespace net

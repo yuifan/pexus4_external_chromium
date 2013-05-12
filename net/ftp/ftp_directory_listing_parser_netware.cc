@@ -1,12 +1,16 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.  Use of this
-// source code is governed by a BSD-style license that can be found in the
-// LICENSE file.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #include "net/ftp/ftp_directory_listing_parser_netware.h"
 
 #include <vector>
 
+#include "base/string_number_conversions.h"
+#include "base/string_split.h"
 #include "base/string_util.h"
+#include "base/utf_string_conversions.h"
+#include "net/ftp/ftp_directory_listing_parser.h"
 #include "net/ftp/ftp_util.h"
 
 namespace {
@@ -31,72 +35,60 @@ bool LooksLikeNetwarePermissionsListing(const string16& text) {
 
 namespace net {
 
-FtpDirectoryListingParserNetware::FtpDirectoryListingParserNetware()
-    : received_first_line_(false) {
-}
+bool ParseFtpDirectoryListingNetware(
+    const std::vector<string16>& lines,
+    const base::Time& current_time,
+    std::vector<FtpDirectoryListingEntry>* entries) {
+  if (!lines.empty() && !StartsWith(lines[0], ASCIIToUTF16("total "), true))
+    return false;
 
-bool FtpDirectoryListingParserNetware::ConsumeLine(const string16& line) {
-  if (!received_first_line_) {
-    received_first_line_ = true;
+  for (size_t i = 1U; i < lines.size(); i++) {
+    if (lines[i].empty())
+      continue;
 
-    return StartsWith(line, ASCIIToUTF16("total "), true);
+    std::vector<string16> columns;
+    base::SplitString(CollapseWhitespace(lines[i], false), ' ', &columns);
+
+    if (columns.size() != 8)
+      return false;
+
+    FtpDirectoryListingEntry entry;
+
+    if (columns[0].length() != 1)
+      return false;
+    if (columns[0][0] == 'd') {
+      entry.type = FtpDirectoryListingEntry::DIRECTORY;
+    } else if (columns[0][0] == '-') {
+      entry.type = FtpDirectoryListingEntry::FILE;
+    } else {
+      return false;
+    }
+
+    // Note: on older Netware systems the permissions listing is in the same
+    // column as the entry type (just there is no space between them). We do not
+    // support the older format here for simplicity.
+    if (!LooksLikeNetwarePermissionsListing(columns[1]))
+      return false;
+
+    if (!base::StringToInt64(columns[3], &entry.size))
+      return false;
+    if (entry.size < 0)
+      return false;
+    if (entry.type != FtpDirectoryListingEntry::FILE)
+      entry.size = -1;
+
+    // Netware uses the same date listing format as Unix "ls -l".
+    if (!FtpUtil::LsDateListingToTime(columns[4], columns[5], columns[6],
+                                      current_time, &entry.last_modified)) {
+      return false;
+    }
+
+    entry.name = columns[7];
+
+    entries->push_back(entry);
   }
 
-  std::vector<string16> columns;
-  SplitString(CollapseWhitespace(line, false), ' ', &columns);
-
-  if (columns.size() != 8)
-    return false;
-
-  FtpDirectoryListingEntry entry;
-
-  if (columns[0].length() != 1)
-    return false;
-  if (columns[0][0] == 'd') {
-    entry.type = FtpDirectoryListingEntry::DIRECTORY;
-  } else if (columns[0][0] == '-') {
-    entry.type = FtpDirectoryListingEntry::FILE;
-  } else {
-    return false;
-  }
-
-  // Note: on older Netware systems the permissions listing is in the same
-  // column as the entry type (just there is no space between them). We do not
-  // support the older format here for simplicity.
-  if (!LooksLikeNetwarePermissionsListing(columns[1]))
-    return false;
-
-  if (!StringToInt64(columns[3], &entry.size))
-    return false;
-  if (entry.size < 0)
-    return false;
-  if (entry.type != FtpDirectoryListingEntry::FILE)
-    entry.size = -1;
-
-  // Netware uses the same date listing format as Unix "ls -l".
-  if (!FtpUtil::LsDateListingToTime(columns[4], columns[5], columns[6],
-                                    &entry.last_modified)) {
-    return false;
-  }
-
-  entry.name = columns[7];
-
-  entries_.push(entry);
   return true;
-}
-
-bool FtpDirectoryListingParserNetware::OnEndOfInput() {
-  return true;
-}
-
-bool FtpDirectoryListingParserNetware::EntryAvailable() const {
-  return !entries_.empty();
-}
-
-FtpDirectoryListingEntry FtpDirectoryListingParserNetware::PopEntry() {
-  FtpDirectoryListingEntry entry = entries_.front();
-  entries_.pop();
-  return entry;
 }
 
 }  // namespace net

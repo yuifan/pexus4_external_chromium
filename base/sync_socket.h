@@ -1,9 +1,10 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef BASE_SYNC_SOCKET_H_
 #define BASE_SYNC_SOCKET_H_
+#pragma once
 
 // A socket abstraction used for sending and receiving plain
 // data.  Because they are blocking, they can be used to perform
@@ -15,9 +16,11 @@
 #endif
 #include <sys/types.h>
 
+#include "base/base_api.h"
+
 namespace base {
 
-class SyncSocket {
+class BASE_API SyncSocket {
  public:
 #if defined(OS_WIN)
   typedef HANDLE Handle;

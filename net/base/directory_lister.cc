@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -10,15 +10,17 @@
 #include "base/file_util.h"
 #include "base/i18n/file_util_icu.h"
 #include "base/message_loop.h"
-#include "base/platform_thread.h"
+#include "base/threading/platform_thread.h"
+#include "base/threading/thread_restrictions.h"
 #include "net/base/net_errors.h"
 
 namespace net {
 
 static const int kFilesPerEvent = 8;
 
+// A task which is used to signal the delegate asynchronously.
 class DirectoryDataEvent : public Task {
- public:
+public:
   explicit DirectoryDataEvent(DirectoryLister* d) : lister(d), error(0) {
     // Allocations of the FindInfo aren't super cheap, so reserve space.
     data.reserve(64);
@@ -33,41 +35,32 @@ class DirectoryDataEvent : public Task {
   }
 
   scoped_refptr<DirectoryLister> lister;
-  std::vector<file_util::FileEnumerator::FindInfo> data;
+  std::vector<DirectoryLister::DirectoryListerData> data;
   int error;
 };
-
-// Comparator for sorting FindInfo's. This uses the locale aware filename
-// comparison function on the filenames for sorting in the user's locale.
-static bool CompareFindInfo(const file_util::FileEnumerator::FindInfo& a,
-                            const file_util::FileEnumerator::FindInfo& b) {
-  bool a_is_directory = file_util::FileEnumerator::IsDirectory(a);
-  bool b_is_directory = file_util::FileEnumerator::IsDirectory(b);
-  if (a_is_directory != b_is_directory)
-    return a_is_directory;
-
-#if defined(OS_WIN)
-  return file_util::LocaleAwareCompareFilenames(FilePath(a.cFileName),
-                                                FilePath(b.cFileName));
-#elif defined(OS_POSIX)
-  return file_util::LocaleAwareCompareFilenames(FilePath(a.filename),
-                                                FilePath(b.filename));
-#endif
-}
 
 DirectoryLister::DirectoryLister(const FilePath& dir,
                                  DirectoryListerDelegate* delegate)
     : dir_(dir),
+      recursive_(false),
       delegate_(delegate),
+      sort_(ALPHA_DIRS_FIRST),
       message_loop_(NULL),
-      thread_(kNullThreadHandle) {
+      thread_(base::kNullThreadHandle) {
   DCHECK(!dir.value().empty());
 }
 
-DirectoryLister::~DirectoryLister() {
-  if (thread_) {
-    PlatformThread::Join(thread_);
-  }
+DirectoryLister::DirectoryLister(const FilePath& dir,
+                                 bool recursive,
+                                 SORT_TYPE sort,
+                                 DirectoryListerDelegate* delegate)
+    : dir_(dir),
+      recursive_(recursive),
+      delegate_(delegate),
+      sort_(sort),
+      message_loop_(NULL),
+      thread_(base::kNullThreadHandle) {
+  DCHECK(!dir.value().empty());
 }
 
 bool DirectoryLister::Start() {
@@ -79,7 +72,7 @@ bool DirectoryLister::Start() {
 
   AddRef();  // the thread will release us when it is done
 
-  if (!PlatformThread::Create(0, this, &thread_)) {
+  if (!base::PlatformThread::Create(0, this, &thread_)) {
     Release();
     return false;
   }
@@ -91,8 +84,11 @@ void DirectoryLister::Cancel() {
   canceled_.Set();
 
   if (thread_) {
-    PlatformThread::Join(thread_);
-    thread_ = kNullThreadHandle;
+    // This is a bug and we should stop joining this thread.
+    // http://crbug.com/65331
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
+    base::PlatformThread::Join(thread_);
+    thread_ = base::kNullThreadHandle;
   }
 }
 
@@ -100,21 +96,26 @@ void DirectoryLister::ThreadMain() {
   DirectoryDataEvent* e = new DirectoryDataEvent(this);
 
   if (!file_util::DirectoryExists(dir_)) {
-    e->error = net::ERR_FILE_NOT_FOUND;
+    e->error = ERR_FILE_NOT_FOUND;
     message_loop_->PostTask(FROM_HERE, e);
     Release();
     return;
   }
 
-  file_util::FileEnumerator file_enum(dir_, false,
-      static_cast<file_util::FileEnumerator::FILE_TYPE>(
-          file_util::FileEnumerator::FILES |
-          file_util::FileEnumerator::DIRECTORIES |
-          file_util::FileEnumerator::INCLUDE_DOT_DOT));
+  int types = file_util::FileEnumerator::FILES |
+              file_util::FileEnumerator::DIRECTORIES;
+  if (!recursive_)
+    types |= file_util::FileEnumerator::INCLUDE_DOT_DOT;
 
-  while (!canceled_.IsSet() && !(file_enum.Next().value().empty())) {
-    e->data.push_back(file_util::FileEnumerator::FindInfo());
-    file_enum.GetFindInfo(&e->data[e->data.size() - 1]);
+  file_util::FileEnumerator file_enum(dir_, recursive_,
+      static_cast<file_util::FileEnumerator::FILE_TYPE>(types));
+
+  FilePath path;
+  while (!canceled_.IsSet() && !(path = file_enum.Next()).empty()) {
+    DirectoryListerData data;
+    file_enum.GetFindInfo(&data.info);
+    data.path = path;
+    e->data.push_back(data);
 
     /* TODO(brettw) bug 24107: It would be nice to send incremental updates.
        We gather them all so they can be sorted, but eventually the sorting
@@ -130,7 +131,14 @@ void DirectoryLister::ThreadMain() {
   if (!e->data.empty()) {
     // Sort the results. See the TODO above (this sort should be removed and we
     // should do it from JS).
-    std::sort(e->data.begin(), e->data.end(), CompareFindInfo);
+    if (sort_ == DATE)
+      std::sort(e->data.begin(), e->data.end(), CompareDate);
+    else if (sort_ == FULL_PATH)
+      std::sort(e->data.begin(), e->data.end(), CompareFullPath);
+    else if (sort_ == ALPHA_DIRS_FIRST)
+      std::sort(e->data.begin(), e->data.end(), CompareAlphaDirsFirst);
+    else
+      DCHECK_EQ(NO_SORT, sort_);
 
     message_loop_->PostTask(FROM_HERE, e);
     e = new DirectoryDataEvent(this);
@@ -141,8 +149,75 @@ void DirectoryLister::ThreadMain() {
   message_loop_->PostTask(FROM_HERE, e);
 }
 
-void DirectoryLister::OnReceivedData(
-    const file_util::FileEnumerator::FindInfo* data, int count) {
+DirectoryLister::~DirectoryLister() {
+  if (thread_) {
+    // This is a bug and we should stop joining this thread.
+    // http://crbug.com/65331
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
+    base::PlatformThread::Join(thread_);
+  }
+}
+
+// Comparator for sorting lister results. This uses the locale aware filename
+// comparison function on the filenames for sorting in the user's locale.
+// Static.
+bool DirectoryLister::CompareAlphaDirsFirst(const DirectoryListerData& a,
+                                            const DirectoryListerData& b) {
+  // Parent directory before all else.
+  if (file_util::IsDotDot(file_util::FileEnumerator::GetFilename(a.info)))
+    return true;
+  if (file_util::IsDotDot(file_util::FileEnumerator::GetFilename(b.info)))
+    return false;
+
+  // Directories before regular files.
+  bool a_is_directory = file_util::FileEnumerator::IsDirectory(a.info);
+  bool b_is_directory = file_util::FileEnumerator::IsDirectory(b.info);
+  if (a_is_directory != b_is_directory)
+    return a_is_directory;
+
+  return file_util::LocaleAwareCompareFilenames(
+      file_util::FileEnumerator::GetFilename(a.info),
+      file_util::FileEnumerator::GetFilename(b.info));
+}
+
+// Static.
+bool DirectoryLister::CompareDate(const DirectoryListerData& a,
+                                  const DirectoryListerData& b) {
+  // Parent directory before all else.
+  if (file_util::IsDotDot(file_util::FileEnumerator::GetFilename(a.info)))
+    return true;
+  if (file_util::IsDotDot(file_util::FileEnumerator::GetFilename(b.info)))
+    return false;
+
+  // Directories before regular files.
+  bool a_is_directory = file_util::FileEnumerator::IsDirectory(a.info);
+  bool b_is_directory = file_util::FileEnumerator::IsDirectory(b.info);
+  if (a_is_directory != b_is_directory)
+    return a_is_directory;
+#if defined(OS_POSIX)
+  return a.info.stat.st_mtime > b.info.stat.st_mtime;
+#elif defined(OS_WIN)
+  if (a.info.ftLastWriteTime.dwHighDateTime ==
+      b.info.ftLastWriteTime.dwHighDateTime) {
+    return a.info.ftLastWriteTime.dwLowDateTime >
+           b.info.ftLastWriteTime.dwLowDateTime;
+  } else {
+    return a.info.ftLastWriteTime.dwHighDateTime >
+           b.info.ftLastWriteTime.dwHighDateTime;
+  }
+#endif
+}
+
+// Comparator for sorting find result by paths. This uses the locale-aware
+// comparison function on the filenames for sorting in the user's locale.
+// Static.
+bool DirectoryLister::CompareFullPath(const DirectoryListerData& a,
+                                      const DirectoryListerData& b) {
+  return file_util::LocaleAwareCompareFilenames(a.path, b.path);
+}
+
+void DirectoryLister::OnReceivedData(const DirectoryListerData* data,
+                                     int count) {
   // Since the delegate can clear itself during the OnListFile callback, we
   // need to null check it during each iteration of the loop.  Similarly, it is
   // necessary to check the canceled_ flag to avoid sending data to a delegate
@@ -155,7 +230,7 @@ void DirectoryLister::OnDone(int error) {
   // If canceled is set, we need to report some kind of error,
   // but don't overwrite the error condition if it is already set.
   if (!error && canceled_.IsSet())
-    error = net::ERR_ABORTED;
+    error = ERR_ABORTED;
 
   if (delegate_)
     delegate_->OnListDone(error);

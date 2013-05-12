@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -9,25 +9,84 @@
 #include <ocsp.h>
 #include <nspr.h>
 #include <nss.h>
+#include <pthread.h>
 #include <secerr.h>
 
 #include <string>
 
+#include "base/basictypes.h"
 #include "base/compiler_specific.h"
-#include "base/condition_variable.h"
+#include "base/lazy_instance.h"
 #include "base/logging.h"
 #include "base/message_loop.h"
-#include "base/singleton.h"
-#include "base/thread.h"
+#include "base/metrics/histogram.h"
+#include "base/stl_util-inl.h"
+#include "base/string_util.h"
+#include "base/stringprintf.h"
+#include "base/synchronization/condition_variable.h"
+#include "base/synchronization/lock.h"
+#include "base/threading/thread_checker.h"
 #include "base/time.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/io_buffer.h"
 #include "net/base/load_flags.h"
+#include "net/http/http_request_headers.h"
 #include "net/http/http_response_headers.h"
 #include "net/url_request/url_request.h"
 #include "net/url_request/url_request_context.h"
 
 namespace {
+
+// Protects |g_request_context|.
+pthread_mutex_t g_request_context_lock = PTHREAD_MUTEX_INITIALIZER;
+static net::URLRequestContext* g_request_context = NULL;
+
+class OCSPRequestSession;
+
+class OCSPIOLoop {
+ public:
+  void StartUsing() {
+    base::AutoLock autolock(lock_);
+    used_ = true;
+  }
+
+  // Called on IO loop.
+  void Shutdown();
+
+  bool used() const {
+    base::AutoLock autolock(lock_);
+    return used_;
+  }
+
+  // Called from worker thread.
+  void PostTaskToIOLoop(const tracked_objects::Location& from_here, Task* task);
+
+  void EnsureIOLoop();
+
+  void AddRequest(OCSPRequestSession* request);
+  void RemoveRequest(OCSPRequestSession* request);
+
+ private:
+  friend struct base::DefaultLazyInstanceTraits<OCSPIOLoop>;
+
+  OCSPIOLoop();
+  ~OCSPIOLoop();
+
+  void CancelAllRequests();
+
+  mutable base::Lock lock_;
+  bool shutdown_;  // Protected by |lock_|.
+  std::set<OCSPRequestSession*> requests_;  // Protected by |lock_|.
+  bool used_;  // Protected by |lock_|.
+  // This should not be modified after |used_|.
+  MessageLoopForIO* io_loop_;  // Protected by |lock_|.
+  base::ThreadChecker thread_checker_;
+
+  DISALLOW_COPY_AND_ASSIGN(OCSPIOLoop);
+};
+
+base::LazyInstance<OCSPIOLoop, base::LeakyLazyInstanceTraits<OCSPIOLoop> >
+    g_ocsp_io_loop(base::LINKER_INITIALIZED);
 
 const int kRecvBufferSize = 4096;
 
@@ -63,88 +122,31 @@ SECStatus OCSPTrySendAndReceive(SEC_HTTP_REQUEST_SESSION request,
                                 PRUint32* http_response_data_len);
 SECStatus OCSPFree(SEC_HTTP_REQUEST_SESSION request);
 
-class OCSPInitSingleton : public MessageLoop::DestructionObserver {
- public:
-  // Called on IO thread.
-  virtual void WillDestroyCurrentMessageLoop() {
-    AutoLock autolock(lock_);
-    DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
-    io_loop_ = NULL;
-    request_context_ = NULL;
-  };
+char* GetAlternateOCSPAIAInfo(CERTCertificate *cert);
 
-  // Called from worker thread.
-  void PostTaskToIOLoop(
-      const tracked_objects::Location& from_here, Task* task) {
-    AutoLock autolock(lock_);
-    if (io_loop_)
-      io_loop_->PostTask(from_here, task);
-  }
-
-  // This is static method because it is called before NSS initialization,
-  // that is, before OCSPInitSingleton is initialized.
-  static void set_url_request_context(URLRequestContext* request_context) {
-    request_context_ = request_context;
-  }
-  static URLRequestContext* url_request_context() {
-    return request_context_;
-  }
-
+class OCSPNSSInitialization {
  private:
-  friend struct DefaultSingletonTraits<OCSPInitSingleton>;
+  friend struct base::DefaultLazyInstanceTraits<OCSPNSSInitialization>;
 
-  OCSPInitSingleton()
-      : io_loop_(MessageLoopForIO::current()) {
-    DCHECK(io_loop_);
-    io_loop_->AddDestructionObserver(this);
-    client_fcn_.version = 1;
-    SEC_HttpClientFcnV1Struct *ft = &client_fcn_.fcnTable.ftable1;
-    ft->createSessionFcn = OCSPCreateSession;
-    ft->keepAliveSessionFcn = OCSPKeepAliveSession;
-    ft->freeSessionFcn = OCSPFreeSession;
-    ft->createFcn = OCSPCreate;
-    ft->setPostDataFcn = OCSPSetPostData;
-    ft->addHeaderFcn = OCSPAddHeader;
-    ft->trySendAndReceiveFcn = OCSPTrySendAndReceive;
-    ft->cancelFcn = NULL;
-    ft->freeFcn = OCSPFree;
-    SECStatus status = SEC_RegisterDefaultHttpClient(&client_fcn_);
-    if (status != SECSuccess) {
-      NOTREACHED() << "Error initializing OCSP: " << PR_GetError();
-    }
-  }
-
-  virtual ~OCSPInitSingleton() {
-    // IO thread was already deleted before the singleton is deleted
-    // in AtExitManager.
-    AutoLock autolock(lock_);
-    DCHECK(!io_loop_);
-    DCHECK(!request_context_);
-  }
+  OCSPNSSInitialization();
+  ~OCSPNSSInitialization();
 
   SEC_HttpClientFcn client_fcn_;
 
-  // |lock_| protects |io_loop_|.
-  Lock lock_;
-  // I/O thread.
-  MessageLoop* io_loop_;  // I/O thread
-  // URLRequestContext for OCSP handlers.
-  static URLRequestContext* request_context_;
-
-  DISALLOW_COPY_AND_ASSIGN(OCSPInitSingleton);
+  DISALLOW_COPY_AND_ASSIGN(OCSPNSSInitialization);
 };
 
-URLRequestContext* OCSPInitSingleton::request_context_ = NULL;
+base::LazyInstance<OCSPNSSInitialization> g_ocsp_nss_initialization(
+    base::LINKER_INITIALIZED);
 
 // Concrete class for SEC_HTTP_REQUEST_SESSION.
-// Public methods except virtual methods of URLRequest::Delegate (On* methods)
-// run on certificate verifier thread (worker thread).
-// Virtual methods of URLRequest::Delegate and private methods run
+// Public methods except virtual methods of net::URLRequest::Delegate
+// (On* methods) run on certificate verifier thread (worker thread).
+// Virtual methods of net::URLRequest::Delegate and private methods run
 // on IO thread.
 class OCSPRequestSession
     : public base::RefCountedThreadSafe<OCSPRequestSession>,
-      public URLRequest::Delegate,
-      public MessageLoop::DestructionObserver {
+      public net::URLRequest::Delegate {
  public:
   OCSPRequestSession(const GURL& url,
                      const char* http_request_method,
@@ -166,10 +168,8 @@ class OCSPRequestSession
   }
 
   void AddHeader(const char* http_header_name, const char* http_header_value) {
-    if (!extra_request_headers_.empty())
-      extra_request_headers_ += "\r\n";
-    StringAppendF(&extra_request_headers_,
-                  "%s: %s", http_header_name, http_header_value);
+    extra_request_headers_.SetHeader(http_header_name,
+                                     http_header_value);
   }
 
   void Start() {
@@ -177,7 +177,7 @@ class OCSPRequestSession
     // |io_loop_| was initialized to be NULL in constructor, and
     // set only in StartURLRequest, so no need to lock |lock_| here.
     DCHECK(!io_loop_);
-    Singleton<OCSPInitSingleton>()->PostTaskToIOLoop(
+    g_ocsp_io_loop.Get().PostTaskToIOLoop(
         FROM_HERE,
         NewRunnableMethod(this, &OCSPRequestSession::StartURLRequest));
   }
@@ -188,18 +188,18 @@ class OCSPRequestSession
 
   void Cancel() {
     // IO thread may set |io_loop_| to NULL, so protect by |lock_|.
-    AutoLock autolock(lock_);
+    base::AutoLock autolock(lock_);
     CancelLocked();
   }
 
   bool Finished() const {
-    AutoLock autolock(lock_);
+    base::AutoLock autolock(lock_);
     return finished_;
   }
 
   bool Wait() {
     base::TimeDelta timeout = timeout_;
-    AutoLock autolock(lock_);
+    base::AutoLock autolock(lock_);
     while (!finished_) {
       base::TimeTicks last_time = base::TimeTicks::Now();
       cv_.TimedWait(timeout);
@@ -207,7 +207,7 @@ class OCSPRequestSession
       base::TimeDelta elapsed_time = base::TimeTicks::Now() - last_time;
       timeout -= elapsed_time;
       if (timeout < base::TimeDelta()) {
-        LOG(INFO) << "OCSP Timed out";
+        VLOG(1) << "OCSP Timed out";
         if (!finished_)
           CancelLocked();
         break;
@@ -248,7 +248,20 @@ class OCSPRequestSession
     return data_;
   }
 
-  virtual void OnResponseStarted(URLRequest* request) {
+  virtual void OnReceivedRedirect(net::URLRequest* request,
+                                  const GURL& new_url,
+                                  bool* defer_redirect) {
+    DCHECK_EQ(request, request_);
+    DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
+
+    if (!new_url.SchemeIs("http")) {
+      // Prevent redirects to non-HTTP schemes, including HTTPS. This matches
+      // the initial check in OCSPServerSession::CreateRequest().
+      CancelURLRequest();
+    }
+  }
+
+  virtual void OnResponseStarted(net::URLRequest* request) {
     DCHECK_EQ(request, request_);
     DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
 
@@ -262,7 +275,7 @@ class OCSPRequestSession
     OnReadCompleted(request_, bytes_read);
   }
 
-  virtual void OnReadCompleted(URLRequest* request, int bytes_read) {
+  virtual void OnReadCompleted(net::URLRequest* request, int bytes_read) {
     DCHECK_EQ(request, request_);
     DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
 
@@ -275,9 +288,9 @@ class OCSPRequestSession
     if (!request_->status().is_io_pending()) {
       delete request_;
       request_ = NULL;
-      io_loop_->RemoveDestructionObserver(this);
+      g_ocsp_io_loop.Get().RemoveRequest(this);
       {
-        AutoLock autolock(lock_);
+        base::AutoLock autolock(lock_);
         finished_ = true;
         io_loop_ = NULL;
       }
@@ -286,13 +299,28 @@ class OCSPRequestSession
     }
   }
 
-  virtual void WillDestroyCurrentMessageLoop() {
-    DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
+  // Must be called on the IO loop thread.
+  void CancelURLRequest() {
+#ifndef NDEBUG
     {
-      AutoLock autolock(lock_);
-      io_loop_ = NULL;
+      base::AutoLock autolock(lock_);
+      if (io_loop_)
+        DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
     }
-    CancelURLRequest();
+#endif
+    if (request_) {
+      request_->Cancel();
+      delete request_;
+      request_ = NULL;
+      g_ocsp_io_loop.Get().RemoveRequest(this);
+      {
+        base::AutoLock autolock(lock_);
+        finished_ = true;
+        io_loop_ = NULL;
+      }
+      cv_.Signal();
+      Release();  // Balanced with StartURLRequest().
+    }
   }
 
  private:
@@ -316,24 +344,27 @@ class OCSPRequestSession
     }
   }
 
+  // Runs on |g_ocsp_io_loop|'s IO loop.
   void StartURLRequest() {
     DCHECK(!request_);
 
-    URLRequestContext* url_request_context =
-        OCSPInitSingleton::url_request_context();
+    pthread_mutex_lock(&g_request_context_lock);
+    net::URLRequestContext* url_request_context = g_request_context;
+    pthread_mutex_unlock(&g_request_context_lock);
+
     if (url_request_context == NULL)
       return;
 
     {
-      AutoLock autolock(lock_);
+      base::AutoLock autolock(lock_);
       DCHECK(!io_loop_);
       io_loop_ = MessageLoopForIO::current();
-      io_loop_->AddDestructionObserver(this);
+      g_ocsp_io_loop.Get().AddRequest(this);
     }
 
-    request_ = new URLRequest(url_, this);
+    request_ = new net::URLRequest(url_, this);
     request_->set_context(url_request_context);
-    // To meet the privacy requirements of off-the-record mode.
+    // To meet the privacy requirements of incognito mode.
     request_->set_load_flags(
         net::LOAD_DISABLE_CACHE | net::LOAD_DO_NOT_SAVE_COOKIES |
         net::LOAD_DO_NOT_SEND_COOKIES);
@@ -343,52 +374,24 @@ class OCSPRequestSession
       DCHECK(!upload_content_type_.empty());
 
       request_->set_method("POST");
-      if (!extra_request_headers_.empty())
-        extra_request_headers_ += "\r\n";
-      StringAppendF(&extra_request_headers_,
-                    "Content-Type: %s", upload_content_type_.c_str());
+      extra_request_headers_.SetHeader(
+          net::HttpRequestHeaders::kContentType, upload_content_type_);
       request_->AppendBytesToUpload(upload_content_.data(),
                                     static_cast<int>(upload_content_.size()));
     }
-    if (!extra_request_headers_.empty())
+    if (!extra_request_headers_.IsEmpty())
       request_->SetExtraRequestHeaders(extra_request_headers_);
 
     request_->Start();
     AddRef();  // Release after |request_| deleted.
   }
 
-  void CancelURLRequest() {
-#ifndef NDEBUG
-    {
-      AutoLock autolock(lock_);
-      if (io_loop_)
-        DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
-    }
-#endif
-    if (request_) {
-      request_->Cancel();
-      delete request_;
-      request_ = NULL;
-      // |io_loop_| may be NULL here if it called from
-      // WillDestroyCurrentMessageLoop().
-      if (io_loop_)
-        io_loop_->RemoveDestructionObserver(this);
-      {
-        AutoLock autolock(lock_);
-        finished_ = true;
-        io_loop_ = NULL;
-      }
-      cv_.Signal();
-      Release();  // Balanced with StartURLRequest().
-    }
-  }
-
   GURL url_;                      // The URL we eventually wound up at
   std::string http_request_method_;
   base::TimeDelta timeout_;       // The timeout for OCSP
-  URLRequest* request_;           // The actual request this wraps
+  net::URLRequest* request_;           // The actual request this wraps
   scoped_refptr<net::IOBuffer> buffer_;  // Read buffer
-  std::string extra_request_headers_;  // Extra headers for the request, if any
+  net::HttpRequestHeaders extra_request_headers_;
   std::string upload_content_;    // HTTP POST payload
   std::string upload_content_type_;  // MIME type of POST payload
 
@@ -398,8 +401,8 @@ class OCSPRequestSession
   std::string data_;              // Results of the requst
 
   // |lock_| protects |finished_| and |io_loop_|.
-  mutable Lock lock_;
-  ConditionVariable cv_;
+  mutable base::Lock lock_;
+  base::ConditionVariable cv_;
 
   MessageLoop* io_loop_;          // Message loop of the IO thread
   bool finished_;
@@ -421,17 +424,19 @@ class OCSPServerSession {
     // We dont' support "https" because we haven't thought about
     // whether it's safe to re-enter this code from talking to an OCSP
     // responder over SSL.
-    if (strcmp(http_protocol_variant, "http") != 0)
+    if (strcmp(http_protocol_variant, "http") != 0) {
+      PORT_SetError(PR_NOT_IMPLEMENTED_ERROR);
       return NULL;
+    }
 
     // TODO(ukai): If |host| is an IPv6 literal, we need to quote it with
     //  square brackets [].
-    std::string url_string(StringPrintf("%s://%s:%d%s",
-                                        http_protocol_variant,
-                                        host_.c_str(),
-                                        port_,
-                                        path_and_query_string));
-    LOG(INFO) << "URL [" << url_string << "]";
+    std::string url_string(base::StringPrintf("%s://%s:%d%s",
+                                              http_protocol_variant,
+                                              host_.c_str(),
+                                              port_,
+                                              path_and_query_string));
+    VLOG(1) << "URL [" << url_string << "]";
     GURL url(url_string);
     return new OCSPRequestSession(
         url, http_request_method,
@@ -446,15 +451,138 @@ class OCSPServerSession {
   DISALLOW_COPY_AND_ASSIGN(OCSPServerSession);
 };
 
+OCSPIOLoop::OCSPIOLoop()
+    : shutdown_(false),
+      used_(false),
+      io_loop_(MessageLoopForIO::current()) {
+  DCHECK(io_loop_);
+}
+
+OCSPIOLoop::~OCSPIOLoop() {
+  // IO thread was already deleted before the singleton is deleted
+  // in AtExitManager.
+  {
+    base::AutoLock autolock(lock_);
+    DCHECK(!io_loop_);
+    DCHECK(!used_);
+    DCHECK(shutdown_);
+  }
+
+  pthread_mutex_lock(&g_request_context_lock);
+  DCHECK(!g_request_context);
+  pthread_mutex_unlock(&g_request_context_lock);
+}
+
+void OCSPIOLoop::Shutdown() {
+  // Safe to read outside lock since we only write on IO thread anyway.
+  DCHECK(thread_checker_.CalledOnValidThread());
+
+  // Prevent the worker thread from trying to access |io_loop_|.
+  {
+    base::AutoLock autolock(lock_);
+    io_loop_ = NULL;
+    used_ = false;
+    shutdown_ = true;
+  }
+
+  CancelAllRequests();
+
+  pthread_mutex_lock(&g_request_context_lock);
+  g_request_context = NULL;
+  pthread_mutex_unlock(&g_request_context_lock);
+}
+
+void OCSPIOLoop::PostTaskToIOLoop(
+    const tracked_objects::Location& from_here, Task* task) {
+  base::AutoLock autolock(lock_);
+  if (io_loop_)
+    io_loop_->PostTask(from_here, task);
+}
+
+void OCSPIOLoop::EnsureIOLoop() {
+  base::AutoLock autolock(lock_);
+  DCHECK_EQ(MessageLoopForIO::current(), io_loop_);
+}
+
+void OCSPIOLoop::AddRequest(OCSPRequestSession* request) {
+  DCHECK(!ContainsKey(requests_, request));
+  requests_.insert(request);
+}
+
+void OCSPIOLoop::RemoveRequest(OCSPRequestSession* request) {
+  {
+    // Ignore if we've already shutdown.
+    base::AutoLock auto_lock(lock_);
+    if (shutdown_)
+      return;
+  }
+
+  DCHECK(ContainsKey(requests_, request));
+  requests_.erase(request);
+}
+
+void OCSPIOLoop::CancelAllRequests() {
+  std::set<OCSPRequestSession*> requests;
+  requests.swap(requests_);
+
+  for (std::set<OCSPRequestSession*>::iterator it = requests.begin();
+       it != requests.end(); ++it)
+    (*it)->CancelURLRequest();
+}
+
+OCSPNSSInitialization::OCSPNSSInitialization() {
+  // NSS calls the functions in the function table to download certificates
+  // or CRLs or talk to OCSP responders over HTTP.  These functions must
+  // set an NSS/NSPR error code when they fail.  Otherwise NSS will get the
+  // residual error code from an earlier failed function call.
+  client_fcn_.version = 1;
+  SEC_HttpClientFcnV1Struct *ft = &client_fcn_.fcnTable.ftable1;
+  ft->createSessionFcn = OCSPCreateSession;
+  ft->keepAliveSessionFcn = OCSPKeepAliveSession;
+  ft->freeSessionFcn = OCSPFreeSession;
+  ft->createFcn = OCSPCreate;
+  ft->setPostDataFcn = OCSPSetPostData;
+  ft->addHeaderFcn = OCSPAddHeader;
+  ft->trySendAndReceiveFcn = OCSPTrySendAndReceive;
+  ft->cancelFcn = NULL;
+  ft->freeFcn = OCSPFree;
+  SECStatus status = SEC_RegisterDefaultHttpClient(&client_fcn_);
+  if (status != SECSuccess) {
+    NOTREACHED() << "Error initializing OCSP: " << PR_GetError();
+  }
+
+  // Work around NSS bugs 524013 and 564334.  NSS incorrectly thinks the
+  // CRLs for Network Solutions Certificate Authority have bad signatures,
+  // which causes certificates issued by that CA to be reported as revoked.
+  // By using OCSP for those certificates, which don't have AIA extensions,
+  // we can work around these bugs.  See http://crbug.com/41730.
+  CERT_StringFromCertFcn old_callback = NULL;
+  status = CERT_RegisterAlternateOCSPAIAInfoCallBack(
+      GetAlternateOCSPAIAInfo, &old_callback);
+  if (status == SECSuccess) {
+    DCHECK(!old_callback);
+  } else {
+    NOTREACHED() << "Error initializing OCSP: " << PR_GetError();
+  }
+}
+
+OCSPNSSInitialization::~OCSPNSSInitialization() {}
+
 
 // OCSP Http Client functions.
 // Our Http Client functions operate in blocking mode.
 SECStatus OCSPCreateSession(const char* host, PRUint16 portnum,
                             SEC_HTTP_SERVER_SESSION* pSession) {
-  LOG(INFO) << "OCSP create session: host=" << host << " port=" << portnum;
-  DCHECK(!MessageLoop::current());
-  if (OCSPInitSingleton::url_request_context() == NULL) {
+  VLOG(1) << "OCSP create session: host=" << host << " port=" << portnum;
+  pthread_mutex_lock(&g_request_context_lock);
+  net::URLRequestContext* request_context = g_request_context;
+  pthread_mutex_unlock(&g_request_context_lock);
+  if (request_context == NULL) {
     LOG(ERROR) << "No URLRequestContext for OCSP handler.";
+    // The application failed to call SetURLRequestContextForOCSP, so we
+    // can't create and use net::URLRequest.  PR_NOT_IMPLEMENTED_ERROR is not an
+    // accurate error code for this error condition, but is close enough.
+    PORT_SetError(PR_NOT_IMPLEMENTED_ERROR);
     return SECFailure;
   }
   *pSession = new OCSPServerSession(host, portnum);
@@ -463,16 +591,14 @@ SECStatus OCSPCreateSession(const char* host, PRUint16 portnum,
 
 SECStatus OCSPKeepAliveSession(SEC_HTTP_SERVER_SESSION session,
                                PRPollDesc **pPollDesc) {
-  LOG(INFO) << "OCSP keep alive";
-  DCHECK(!MessageLoop::current());
+  VLOG(1) << "OCSP keep alive";
   if (pPollDesc)
     *pPollDesc = NULL;
   return SECSuccess;
 }
 
 SECStatus OCSPFreeSession(SEC_HTTP_SERVER_SESSION session) {
-  LOG(INFO) << "OCSP free session";
-  DCHECK(!MessageLoop::current());
+  VLOG(1) << "OCSP free session";
   delete reinterpret_cast<OCSPServerSession*>(session);
   return SECSuccess;
 }
@@ -483,11 +609,10 @@ SECStatus OCSPCreate(SEC_HTTP_SERVER_SESSION session,
                      const char* http_request_method,
                      const PRIntervalTime timeout,
                      SEC_HTTP_REQUEST_SESSION* pRequest) {
-  LOG(INFO) << "OCSP create protocol=" << http_protocol_variant
-            << " path_and_query=" << path_and_query_string
-            << " http_request_method=" << http_request_method
-            << " timeout=" << timeout;
-  DCHECK(!MessageLoop::current());
+  VLOG(1) << "OCSP create protocol=" << http_protocol_variant
+          << " path_and_query=" << path_and_query_string
+          << " http_request_method=" << http_request_method
+          << " timeout=" << timeout;
   OCSPServerSession* ocsp_session =
       reinterpret_cast<OCSPServerSession*>(session);
 
@@ -508,8 +633,7 @@ SECStatus OCSPSetPostData(SEC_HTTP_REQUEST_SESSION request,
                           const char* http_data,
                           const PRUint32 http_data_len,
                           const char* http_content_type) {
-  LOG(INFO) << "OCSP set post data len=" << http_data_len;
-  DCHECK(!MessageLoop::current());
+  VLOG(1) << "OCSP set post data len=" << http_data_len;
   OCSPRequestSession* req = reinterpret_cast<OCSPRequestSession*>(request);
 
   req->SetPostData(http_data, http_data_len, http_content_type);
@@ -519,9 +643,8 @@ SECStatus OCSPSetPostData(SEC_HTTP_REQUEST_SESSION request,
 SECStatus OCSPAddHeader(SEC_HTTP_REQUEST_SESSION request,
                         const char* http_header_name,
                         const char* http_header_value) {
-  LOG(INFO) << "OCSP add header name=" << http_header_name
-            << " value=" << http_header_value;
-  DCHECK(!MessageLoop::current());
+  VLOG(1) << "OCSP add header name=" << http_header_name
+          << " value=" << http_header_value;
   OCSPRequestSession* req = reinterpret_cast<OCSPRequestSession*>(request);
 
   req->AddHeader(http_header_name, http_header_value);
@@ -532,27 +655,28 @@ SECStatus OCSPAddHeader(SEC_HTTP_REQUEST_SESSION request,
 // It is helper routine for OCSP trySendAndReceiveFcn.
 // |http_response_data_len| could be used as input parameter.  If it has
 // non-zero value, it is considered as maximum size of |http_response_data|.
-bool OCSPSetResponse(OCSPRequestSession* req,
-                     PRUint16* http_response_code,
-                     const char** http_response_content_type,
-                     const char** http_response_headers,
-                     const char** http_response_data,
-                     PRUint32* http_response_data_len) {
+SECStatus OCSPSetResponse(OCSPRequestSession* req,
+                          PRUint16* http_response_code,
+                          const char** http_response_content_type,
+                          const char** http_response_headers,
+                          const char** http_response_data,
+                          PRUint32* http_response_data_len) {
   DCHECK(req->Finished());
   const std::string& data = req->http_response_data();
   if (http_response_data_len && *http_response_data_len) {
     if (*http_response_data_len < data.size()) {
-      LOG(ERROR) << "data size too large: " << *http_response_data_len
+      LOG(ERROR) << "response body too large: " << *http_response_data_len
                  << " < " << data.size();
       *http_response_data_len = data.size();
-      return false;
+      PORT_SetError(SEC_ERROR_BAD_HTTP_RESPONSE);
+      return SECFailure;
     }
   }
-  LOG(INFO) << "OCSP response "
-            << " response_code=" << req->http_response_code()
-            << " content_type=" << req->http_response_content_type()
-            << " header=" << req->http_response_headers()
-            << " data_len=" << data.size();
+  VLOG(1) << "OCSP response "
+          << " response_code=" << req->http_response_code()
+          << " content_type=" << req->http_response_content_type()
+          << " header=" << req->http_response_headers()
+          << " data_len=" << data.size();
   if (http_response_code)
     *http_response_code = req->http_response_code();
   if (http_response_content_type)
@@ -563,7 +687,7 @@ bool OCSPSetResponse(OCSPRequestSession* req,
     *http_response_data = data.data();
   if (http_response_data_len)
     *http_response_data_len = data.size();
-  return true;
+  return SECSuccess;
 }
 
 SECStatus OCSPTrySendAndReceive(SEC_HTTP_REQUEST_SESSION request,
@@ -573,8 +697,13 @@ SECStatus OCSPTrySendAndReceive(SEC_HTTP_REQUEST_SESSION request,
                                 const char** http_response_headers,
                                 const char** http_response_data,
                                 PRUint32* http_response_data_len) {
-  LOG(INFO) << "OCSP try send and receive";
-  DCHECK(!MessageLoop::current());
+  if (http_response_data_len) {
+    // We must always set an output value, even on failure.  The output value 0
+    // means the failure was unrelated to the acceptable response data length.
+    *http_response_data_len = 0;
+  }
+
+  VLOG(1) << "OCSP try send and receive";
   OCSPRequestSession* req = reinterpret_cast<OCSPRequestSession*>(request);
   // We support blocking mode only.
   if (pPollDesc)
@@ -584,56 +713,206 @@ SECStatus OCSPTrySendAndReceive(SEC_HTTP_REQUEST_SESSION request,
     // We support blocking mode only, so this function shouldn't be called
     // again when req has stareted or finished.
     NOTREACHED();
-    goto failed;
+    PORT_SetError(SEC_ERROR_BAD_HTTP_RESPONSE);  // Simple approximation.
+    return SECFailure;
   }
-  req->Start();
-  if (!req->Wait())
-    goto failed;
 
-  // If the response code is -1, the request failed and there is no response.
-  if (req->http_response_code() == static_cast<PRUint16>(-1))
-    goto failed;
+  const base::Time start_time = base::Time::Now();
+  req->Start();
+  if (!req->Wait() || req->http_response_code() == static_cast<PRUint16>(-1)) {
+    // If the response code is -1, the request failed and there is no response.
+    PORT_SetError(SEC_ERROR_BAD_HTTP_RESPONSE);  // Simple approximation.
+    return SECFailure;
+  }
+  const base::TimeDelta duration = base::Time::Now() - start_time;
+
+  // We want to know if this was:
+  //   1) An OCSP request
+  //   2) A CRL request
+  //   3) A request for a missing intermediate certificate
+  // There's no sure way to do this, so we use heuristics like MIME type and
+  // URL.
+  const char* mime_type = req->http_response_content_type().c_str();
+  bool is_ocsp_resp =
+      strcasecmp(mime_type, "application/ocsp-response") == 0;
+  bool is_crl_resp = strcasecmp(mime_type, "application/x-pkcs7-crl") == 0 ||
+                     strcasecmp(mime_type, "application/x-x509-crl") == 0 ||
+                     strcasecmp(mime_type, "application/pkix-crl") == 0;
+  bool is_crt_resp =
+      strcasecmp(mime_type, "application/x-x509-ca-cert") == 0 ||
+      strcasecmp(mime_type, "application/x-x509-server-cert") == 0 ||
+      strcasecmp(mime_type, "application/pkix-cert") == 0 ||
+      strcasecmp(mime_type, "application/pkcs7-mime") == 0;
+  bool known_resp_type = is_crt_resp || is_crt_resp || is_ocsp_resp;
+
+  bool crl_in_url = false, crt_in_url = false, ocsp_in_url = false,
+       have_url_hint = false;
+  if (!known_resp_type) {
+    const std::string path = req->url().path();
+    const std::string host = req->url().host();
+    crl_in_url = strcasestr(path.c_str(), ".crl") != NULL;
+    crt_in_url = strcasestr(path.c_str(), ".crt") != NULL ||
+                 strcasestr(path.c_str(), ".p7c") != NULL ||
+                 strcasestr(path.c_str(), ".cer") != NULL;
+    ocsp_in_url = strcasestr(host.c_str(), "ocsp") != NULL;
+    have_url_hint = crl_in_url || crt_in_url || ocsp_in_url;
+  }
+
+  if (is_ocsp_resp ||
+      (!known_resp_type && (ocsp_in_url ||
+                            (!have_url_hint &&
+                             req->http_request_method() == "POST")))) {
+    UMA_HISTOGRAM_TIMES("Net.OCSPRequestTimeMs", duration);
+  } else if (is_crl_resp || (!known_resp_type && crl_in_url)) {
+    UMA_HISTOGRAM_TIMES("Net.CRLRequestTimeMs", duration);
+  } else if (is_crt_resp || (!known_resp_type && crt_in_url)) {
+    UMA_HISTOGRAM_TIMES("Net.CRTRequestTimeMs", duration);
+  } else {
+    UMA_HISTOGRAM_TIMES("Net.UnknownTypeRequestTimeMs", duration);
+  }
 
   return OCSPSetResponse(
       req, http_response_code,
       http_response_content_type,
       http_response_headers,
       http_response_data,
-      http_response_data_len) ? SECSuccess : SECFailure;
-
- failed:
-  if (http_response_data_len) {
-    // We must always set an output value, even on failure.  The output value 0
-    // means the failure was unrelated to the acceptable response data length.
-    *http_response_data_len = 0;
-  }
-  return SECFailure;
+      http_response_data_len);
 }
 
 SECStatus OCSPFree(SEC_HTTP_REQUEST_SESSION request) {
-  LOG(INFO) << "OCSP free";
-  DCHECK(!MessageLoop::current());
+  VLOG(1) << "OCSP free";
   OCSPRequestSession* req = reinterpret_cast<OCSPRequestSession*>(request);
   req->Cancel();
   req->Release();
   return SECSuccess;
 }
 
+// Data for GetAlternateOCSPAIAInfo.
+
+// CN=Network Solutions Certificate Authority,O=Network Solutions L.L.C.,C=US
+//
+// There are two CAs with this name.  Their key IDs are listed next.
+const unsigned char network_solutions_ca_name[] = {
+  0x30, 0x62, 0x31, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55, 0x04,
+  0x06, 0x13, 0x02, 0x55, 0x53, 0x31, 0x21, 0x30, 0x1f, 0x06,
+  0x03, 0x55, 0x04, 0x0a, 0x13, 0x18, 0x4e, 0x65, 0x74, 0x77,
+  0x6f, 0x72, 0x6b, 0x20, 0x53, 0x6f, 0x6c, 0x75, 0x74, 0x69,
+  0x6f, 0x6e, 0x73, 0x20, 0x4c, 0x2e, 0x4c, 0x2e, 0x43, 0x2e,
+  0x31, 0x30, 0x30, 0x2e, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13,
+  0x27, 0x4e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x20, 0x53,
+  0x6f, 0x6c, 0x75, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x20, 0x43,
+  0x65, 0x72, 0x74, 0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x65,
+  0x20, 0x41, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x74, 0x79
+};
+const unsigned int network_solutions_ca_name_len = 100;
+
+// This CA is an intermediate CA, subordinate to UTN-USERFirst-Hardware.
+const unsigned char network_solutions_ca_key_id[] = {
+  0x3c, 0x41, 0xe2, 0x8f, 0x08, 0x08, 0xa9, 0x4c, 0x25, 0x89,
+  0x8d, 0x6d, 0xc5, 0x38, 0xd0, 0xfc, 0x85, 0x8c, 0x62, 0x17
+};
+const unsigned int network_solutions_ca_key_id_len = 20;
+
+// This CA is a root CA.  It is also cross-certified by
+// UTN-USERFirst-Hardware.
+const unsigned char network_solutions_ca_key_id2[] = {
+  0x21, 0x30, 0xc9, 0xfb, 0x00, 0xd7, 0x4e, 0x98, 0xda, 0x87,
+  0xaa, 0x2a, 0xd0, 0xa7, 0x2e, 0xb1, 0x40, 0x31, 0xa7, 0x4c
+};
+const unsigned int network_solutions_ca_key_id2_len = 20;
+
+// An entry in our OCSP responder table.  |issuer| and |issuer_key_id| are
+// the key.  |ocsp_url| is the value.
+struct OCSPResponderTableEntry {
+  SECItem issuer;
+  SECItem issuer_key_id;
+  const char *ocsp_url;
+};
+
+const OCSPResponderTableEntry g_ocsp_responder_table[] = {
+  {
+    {
+      siBuffer,
+      const_cast<unsigned char*>(network_solutions_ca_name),
+      network_solutions_ca_name_len
+    },
+    {
+      siBuffer,
+      const_cast<unsigned char*>(network_solutions_ca_key_id),
+      network_solutions_ca_key_id_len
+    },
+    "http://ocsp.netsolssl.com"
+  },
+  {
+    {
+      siBuffer,
+      const_cast<unsigned char*>(network_solutions_ca_name),
+      network_solutions_ca_name_len
+    },
+    {
+      siBuffer,
+      const_cast<unsigned char*>(network_solutions_ca_key_id2),
+      network_solutions_ca_key_id2_len
+    },
+    "http://ocsp.netsolssl.com"
+  }
+};
+
+char* GetAlternateOCSPAIAInfo(CERTCertificate *cert) {
+  if (cert && !cert->isRoot && cert->authKeyID) {
+    for (unsigned int i=0; i < arraysize(g_ocsp_responder_table); i++) {
+      if (SECITEM_CompareItem(&g_ocsp_responder_table[i].issuer,
+                              &cert->derIssuer) == SECEqual &&
+          SECITEM_CompareItem(&g_ocsp_responder_table[i].issuer_key_id,
+                              &cert->authKeyID->keyID) == SECEqual) {
+        return PORT_Strdup(g_ocsp_responder_table[i].ocsp_url);
+      }
+    }
+  }
+
+  return NULL;
+}
+
 }  // anonymous namespace
 
 namespace net {
 
+void SetMessageLoopForOCSP() {
+  // Must have a MessageLoopForIO.
+  DCHECK(MessageLoopForIO::current());
+
+  bool used = g_ocsp_io_loop.Get().used();
+
+  // Should not be called when g_ocsp_io_loop has already been used.
+  DCHECK(!used);
+}
+
 void EnsureOCSPInit() {
-  Singleton<OCSPInitSingleton>::get();
+  g_ocsp_io_loop.Get().StartUsing();
+  g_ocsp_nss_initialization.Get();
+}
+
+void ShutdownOCSP() {
+  g_ocsp_io_loop.Get().Shutdown();
 }
 
 // This function would be called before NSS initialization.
 void SetURLRequestContextForOCSP(URLRequestContext* request_context) {
-  OCSPInitSingleton::set_url_request_context(request_context);
+  pthread_mutex_lock(&g_request_context_lock);
+  if (request_context) {
+    DCHECK(request_context->is_main());
+    DCHECK(!g_request_context);
+  }
+  g_request_context = request_context;
+  pthread_mutex_unlock(&g_request_context_lock);
 }
 
 URLRequestContext* GetURLRequestContextForOCSP() {
-  return OCSPInitSingleton::url_request_context();
+  pthread_mutex_lock(&g_request_context_lock);
+  URLRequestContext* request_context = g_request_context;
+  pthread_mutex_unlock(&g_request_context_lock);
+  DCHECK(!request_context || request_context->is_main());
+  return request_context;
 }
 
 }  // namespace net

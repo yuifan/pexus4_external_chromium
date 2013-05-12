@@ -1,45 +1,37 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_URL_REQUEST_URL_REQUEST_JOB_H_
 #define NET_URL_REQUEST_URL_REQUEST_JOB_H_
+#pragma once
 
 #include <string>
 #include <vector>
 
-#include "base/ref_counted.h"
-#include "base/scoped_ptr.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/scoped_ptr.h"
+#include "base/string16.h"
+#include "base/task.h"
 #include "base/time.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/filter.h"
+#include "net/base/host_port_pair.h"
 #include "net/base/load_states.h"
 
 namespace net {
+
 class AuthChallengeInfo;
+class HttpRequestHeaders;
 class HttpResponseInfo;
 class IOBuffer;
-class UploadData;
-class X509Certificate;
-}
-
 class URLRequest;
+class UploadData;
 class URLRequestStatus;
-class URLRequestJobMetrics;
+class X509Certificate;
 
-// The URLRequestJob is using RefCounterThreadSafe because some sub classes
-// can be destroyed on multiple threads. This is the case of the
-// UrlRequestFileJob.
-class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
-                      public FilterContext {
+class URLRequestJob : public base::RefCounted<URLRequestJob> {
  public:
-  // When histogramming results related to SDCH and/or an SDCH latency test, the
-  // number of packets for which we need to record arrival times so as to
-  // calculate interpacket latencies.  We currently are only looking at the
-  // first few packets, as we're monitoring the impact of the initial TCP
-  // congestion window on stalling of transmissions.
-  static const size_t kSdchPacketHistogramCount = 5;
-
   explicit URLRequestJob(URLRequest* request);
 
   // Returns the request that owns this job. THIS POINTER MAY BE NULL if the
@@ -50,10 +42,10 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
 
   // Sets the upload data, most requests have no upload data, so this is a NOP.
   // Job types supporting upload data will override this.
-  virtual void SetUpload(net::UploadData* upload) { }
+  virtual void SetUpload(UploadData* upload);
 
   // Sets extra request headers for Job types that support request headers.
-  virtual void SetExtraRequestHeaders(const std::string& headers) { }
+  virtual void SetExtraRequestHeaders(const HttpRequestHeaders& headers);
 
   // If any error occurs while starting the Job, NotifyStartError should be
   // called.
@@ -63,9 +55,9 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
 
   // This function MUST somehow call NotifyDone/NotifyCanceled or some requests
   // will get leaked. Certain callers use that message to know when they can
-  // delete their URLRequest object, even when doing a cancel. The default Kill
-  // implementation calls NotifyCanceled, so it is recommended that subclasses
-  // call URLRequestJob::Kill() after doing any additional work.
+  // delete their URLRequest object, even when doing a cancel. The default
+  // Kill implementation calls NotifyCanceled, so it is recommended that
+  // subclasses call URLRequestJob::Kill() after doing any additional work.
   //
   // The job should endeavor to stop working as soon as is convenient, but must
   // not send and complete notifications from inside this function. Instead,
@@ -88,57 +80,41 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
 
   // Called to read post-filtered data from this Job, returning the number of
   // bytes read, 0 when there is no more data, or -1 if there was an error.
-  // This is just the backend for URLRequest::Read, see that function for more
-  // info.
-  bool Read(net::IOBuffer* buf, int buf_size, int *bytes_read);
+  // This is just the backend for URLRequest::Read, see that function for
+  // more info.
+  bool Read(IOBuffer* buf, int buf_size, int* bytes_read);
+
+  // Stops further caching of this request, if any. For more info, see
+  // URLRequest::StopCaching().
+  virtual void StopCaching();
 
   // Called to fetch the current load state for the job.
-  virtual net::LoadState GetLoadState() const { return net::LOAD_STATE_IDLE; }
+  virtual LoadState GetLoadState() const;
 
   // Called to get the upload progress in bytes.
-  virtual uint64 GetUploadProgress() const { return 0; }
+  virtual uint64 GetUploadProgress() const;
 
   // Called to fetch the charset for this request.  Only makes sense for some
   // types of requests. Returns true on success.  Calling this on a type that
   // doesn't have a charset will return false.
-  virtual bool GetCharset(std::string* charset) { return false; }
+  virtual bool GetCharset(std::string* charset);
 
   // Called to get response info.
-  virtual void GetResponseInfo(net::HttpResponseInfo* info) {}
+  virtual void GetResponseInfo(HttpResponseInfo* info);
 
   // Returns the cookie values included in the response, if applicable.
   // Returns true if applicable.
   // NOTE: This removes the cookies from the job, so it will only return
   //       useful results once per job.
-  virtual bool GetResponseCookies(std::vector<std::string>* cookies) {
-    return false;
-  }
+  virtual bool GetResponseCookies(std::vector<std::string>* cookies);
 
-  // Called to fetch the encoding types for this request. Only makes sense for
-  // some types of requests. Returns true on success. Calling this on a request
-  // that doesn't have or specify an encoding type will return false.
-  // Returns a array of strings showing the sequential encodings used on the
-  // content.
-  // For example, encoding_types[0] = FILTER_TYPE_SDCH and encoding_types[1] =
-  // FILTER_TYPE_GZIP, means the content was first encoded by sdch, and then
-  // result was encoded by gzip.  To decode, a series of filters must be applied
-  // in the reverse order (in the above example, ungzip first, and then sdch
-  // expand).
-  virtual bool GetContentEncodings(
-      std::vector<Filter::FilterType>* encoding_types) {
-    return false;
-  }
-
-  // Find out if this is a download.
-  virtual bool IsDownload() const;
-
-  // Find out if this is a response to a request that advertised an SDCH
-  // dictionary.  Only makes sense for some types of requests.
-  virtual bool IsSdchResponse() const { return false; }
-
-  // Called to setup stream filter for this request. An example of filter is
+  // Called to setup a stream filter for this request. An example of filter is
   // content encoding/decoding.
-  void SetupFilter();
+  // Subclasses should return the appropriate Filter, or NULL for no Filter.
+  // This class takes ownership of the returned Filter.
+  //
+  // The default implementation returns NULL.
+  virtual Filter* SetupFilter() const;
 
   // Called to determine if this response is a redirect.  Only makes sense
   // for some types of requests.  This method returns true if the response
@@ -155,29 +131,27 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
 
   // Called to determine if it is okay to redirect this job to the specified
   // location.  This may be used to implement protocol-specific restrictions.
-  // If this function returns false, then the URLRequest will fail reporting
-  // net::ERR_UNSAFE_REDIRECT.
-  virtual bool IsSafeRedirect(const GURL& location) {
-    return true;
-  }
+  // If this function returns false, then the URLRequest will fail
+  // reporting ERR_UNSAFE_REDIRECT.
+  virtual bool IsSafeRedirect(const GURL& location);
 
   // Called to determine if this response is asking for authentication.  Only
   // makes sense for some types of requests.  The caller is responsible for
   // obtaining the credentials passing them to SetAuth.
-  virtual bool NeedsAuth() { return false; }
+  virtual bool NeedsAuth();
 
   // Fills the authentication info with the server's response.
   virtual void GetAuthChallengeInfo(
-      scoped_refptr<net::AuthChallengeInfo>* auth_info);
+      scoped_refptr<AuthChallengeInfo>* auth_info);
 
   // Resend the request with authentication credentials.
-  virtual void SetAuth(const std::wstring& username,
-                       const std::wstring& password);
+  virtual void SetAuth(const string16& username,
+                       const string16& password);
 
   // Display the error page without asking for credentials again.
   virtual void CancelAuth();
 
-  virtual void ContinueWithCertificate(net::X509Certificate* client_cert);
+  virtual void ContinueWithCertificate(X509Certificate* client_cert);
 
   // Continue processing the request ignoring the last error.
   virtual void ContinueDespiteLastError();
@@ -188,14 +162,6 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   // NotifyDone on the request.
   bool is_done() const { return done_; }
 
-  // Returns true if the job is doing performance profiling
-  bool is_profiling() const { return is_profiling_; }
-
-  // Retrieve the performance measurement of the job. The data is encapsulated
-  // with a URLRequestJobMetrics object. The caller owns this object from now
-  // on.
-  URLRequestJobMetrics* RetrieveMetrics();
-
   // Get/Set expected content size
   int64 expected_content_size() const { return expected_content_size_; }
   void set_expected_content_size(const int64& size) {
@@ -205,19 +171,16 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   // Whether we have processed the response for that request yet.
   bool has_response_started() const { return has_handled_response_; }
 
-  // FilterContext methods:
   // These methods are not applicable to all connections.
-  virtual bool GetMimeType(std::string* mime_type) const { return false; }
-  virtual bool GetURL(GURL* gurl) const;
-  virtual base::Time GetRequestTime() const;
-  virtual bool IsCachedContent() const { return false; }
-  virtual int64 GetByteReadCount() const;
-  virtual int GetResponseCode() const { return -1; }
-  virtual int GetInputStreamBufferSize() const { return kFilterBufSize; }
-  virtual void RecordPacketStats(StatisticSelector statistic) const;
+  virtual bool GetMimeType(std::string* mime_type) const;
+  virtual int GetResponseCode() const;
+
+  // Returns the socket address for the connection.
+  // See url_request.h for details.
+  virtual HostPortPair GetSocketAddress() const;
 
  protected:
-  friend class base::RefCountedThreadSafe<URLRequestJob>;
+  friend class base::RefCounted<URLRequestJob>;
   virtual ~URLRequestJob();
 
   // Notifies the job that headers have been received.
@@ -240,8 +203,8 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   // that work.
   void CompleteNotifyDone();
 
-  // Used as an asynchronous callback for Kill to notify the URLRequest that
-  // we were canceled.
+  // Used as an asynchronous callback for Kill to notify the URLRequest
+  // that we were canceled.
   void NotifyCanceled();
 
   // Notifies the job the request should be restarted.
@@ -256,8 +219,9 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   // If returning false, an error occurred or an async IO is now pending.
   // If async IO is pending, the status of the request will be
   // URLRequestStatus::IO_PENDING, and buf must remain available until the
-  // operation is completed.  See comments on URLRequest::Read for more info.
-  virtual bool ReadRawData(net::IOBuffer* buf, int buf_size, int *bytes_read);
+  // operation is completed.  See comments on URLRequest::Read for more
+  // info.
+  virtual bool ReadRawData(IOBuffer* buf, int buf_size, int *bytes_read);
 
   // Informs the filter that data has been read into its buffer
   void FilteredDataRead(int bytes_read);
@@ -268,9 +232,9 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   // the hood.
   bool ReadFilteredData(int *bytes_read);
 
-  // Facilitate histogramming by turning on packet counting.
-  // If called more than once, the largest value will be used.
-  void EnablePacketCounting(size_t max_packets_timed);
+  // Whether the response is being filtered in this job.
+  // Only valid after NotifyHeadersComplete() has been called.
+  bool HasFilter() { return filter_ != NULL; }
 
   // At or near destruction time, a derived class may request that the filters
   // be destroyed so that statistics can be gathered while the derived class is
@@ -278,54 +242,68 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   // to get SDCH to emit stats.
   void DestroyFilters() { filter_.reset(); }
 
-  // The request that initiated this job. This value MAY BE NULL if the
-  // request was released by DetachRequest().
-  URLRequest* request_;
-
   // The status of the job.
   const URLRequestStatus GetStatus();
 
   // Set the status of the job.
   void SetStatus(const URLRequestStatus& status);
 
-  // Whether the job is doing performance profiling
-  bool is_profiling_;
+  // The number of bytes read before passing to the filter.
+  int prefilter_bytes_read() const { return prefilter_bytes_read_; }
 
-  // Contains IO performance measurement when profiling is enabled.
-  scoped_ptr<URLRequestJobMetrics> metrics_;
+  // The number of bytes read after passing through the filter.
+  int postfilter_bytes_read() const { return postfilter_bytes_read_; }
+
+  // Total number of bytes read from network (or cache) and typically handed
+  // to filter to process.  Used to histogram compression ratios, and error
+  // recovery scenarios in filters.
+  int64 filter_input_byte_count() const { return filter_input_byte_count_; }
+
+  // The request that initiated this job. This value MAY BE NULL if the
+  // request was released by DetachRequest().
+  URLRequest* request_;
 
  private:
-  // Size of filter input buffers used by this class.
-  static const int kFilterBufSize;
-
   // When data filtering is enabled, this function is used to read data
   // for the filter.  Returns true if raw data was read.  Returns false if
   // an error occurred (or we are waiting for IO to complete).
   bool ReadRawDataForFilter(int *bytes_read);
+
+  // Invokes ReadRawData and records bytes read if the read completes
+  // synchronously.
+  bool ReadRawDataHelper(IOBuffer* buf, int buf_size, int* bytes_read);
 
   // Called in response to a redirect that was not canceled to follow the
   // redirect. The current job will be replaced with a new job loading the
   // given redirect destination.
   void FollowRedirect(const GURL& location, int http_status_code);
 
-  // Updates the profiling info and notifies observers that bytes_read bytes
-  // have been read.
+  // Called after every raw read. If |bytes_read| is > 0, this indicates
+  // a successful read of |bytes_read| unfiltered bytes. If |bytes_read|
+  // is 0, this indicates that there is no additional data to read. If
+  // |bytes_read| is < 0, an error occurred and no bytes were read.
+  void OnRawReadComplete(int bytes_read);
+
+  // Updates the profiling info and notifies observers that an additional
+  // |bytes_read| unfiltered bytes have been read for this job.
   void RecordBytesRead(int bytes_read);
 
   // Called to query whether there is data available in the filter to be read
   // out.
   bool FilterHasData();
 
-  // Record packet arrival times for possible use in histograms.
-  void UpdatePacketReadTimes();
+  // Subclasses may implement this method to record packet arrival times.
+  // The default implementation does nothing.
+  virtual void UpdatePacketReadTimes();
 
   // Indicates that the job is done producing data, either it has completed
   // all the data or an error has been encountered. Set exclusively by
   // NotifyDone so that it is kept in sync with the request.
   bool done_;
 
-  // Cache the load flags from request_ because it might go away.
-  int load_flags_;
+  int prefilter_bytes_read_;
+  int postfilter_bytes_read_;
+  int64 filter_input_byte_count_;
 
   // The data stream filter which is enabled on demand.
   scoped_ptr<Filter> filter_;
@@ -338,8 +316,12 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   // processing the filtered data, we return the data in the caller's buffer.
   // While the async IO is in progress, we save the user buffer here, and
   // when the IO completes, we fill this in.
-  net::IOBuffer *read_buffer_;
-  int read_buffer_len_;
+  scoped_refptr<IOBuffer> filtered_read_buffer_;
+  int filtered_read_buffer_len_;
+
+  // We keep a pointer to the read buffer while asynchronous reads are
+  // in progress, so we are able to pass those bytes to job observers.
+  scoped_refptr<IOBuffer> raw_read_buffer_;
 
   // Used by HandleResponseIfNecessary to track whether we've sent the
   // OnResponseStarted callback and potentially redirect callbacks as well.
@@ -352,49 +334,11 @@ class URLRequestJob : public base::RefCountedThreadSafe<URLRequestJob>,
   GURL deferred_redirect_url_;
   int deferred_redirect_status_code_;
 
-  //----------------------------------------------------------------------------
-  // Data used for statistics gathering in some instances.  This data is only
-  // used for histograms etc., and is not required.  It is optionally gathered
-  // based on the settings of several control variables.
-
-  // Enable recording of packet arrival times for histogramming.
-  bool packet_timing_enabled_;
-
-  // TODO(jar): improve the quality of the gathered info by gathering most times
-  // at a lower point in the network stack, assuring we have actual packet
-  // boundaries, rather than approximations.  Also note that input byte count
-  // as gathered here is post-SSL, and post-cache-fetch, and does not reflect
-  // true packet arrival times in such cases.
-
-  // Total number of bytes read from network (or cache) and and typically handed
-  // to filter to process.  Used to histogram compression ratios, and error
-  // recovery scenarios in filters.
-  int64 filter_input_byte_count_;
-
-  // The number of bytes that have been accounted for in packets (where some of
-  // those packets may possibly have had their time of arrival recorded).
-  int64 bytes_observed_in_packets_;
-
-  // Limit on the size of the array packet_times_.  This can be set to
-  // zero, and then no packet times will be gathered.
-  size_t max_packets_timed_;
-
-  // Arrival times for some of the first few packets.
-  std::vector<base::Time> packet_times_;
-
-  // The request time may not be available when we are being destroyed, so we
-  // snapshot it early on.
-  base::Time request_time_snapshot_;
-
-  // Since we don't save all packet times in packet_times_, we save the
-  // last time for use in histograms.
-  base::Time final_packet_time_;
-
-  // The count of the number of packets, some of which may not have been timed.
-  // We're ignoring overflow, as 1430 x 2^31 is a LOT of bytes.
-  int observed_packet_count_;
+  ScopedRunnableMethodFactory<URLRequestJob> method_factory_;
 
   DISALLOW_COPY_AND_ASSIGN(URLRequestJob);
 };
+
+}  // namespace net
 
 #endif  // NET_URL_REQUEST_URL_REQUEST_JOB_H_

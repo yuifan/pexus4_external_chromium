@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -9,10 +9,12 @@
 #include <pkcs11n.h>
 #include <secerr.h>
 #include <secoid.h>
+#elif defined(OS_WIN)
+#include <stdlib.h>
 #endif
 
+#include "base/lazy_instance.h"
 #include "base/logging.h"
-#include "base/singleton.h"
 
 namespace net {
 
@@ -20,7 +22,7 @@ namespace net {
 struct EVMetadata {
   // The SHA-1 fingerprint of the root CA certificate, used as a unique
   // identifier for a root CA certificate.
-  X509Certificate::Fingerprint fingerprint;
+  SHA1Fingerprint fingerprint;
 
   // The EV policy OID of the root CA.
   // Note: a root CA may have multiple EV policies.  When that actually
@@ -34,6 +36,36 @@ static const EVMetadata ev_root_ca_metadata[] = {
   { { { 0x02, 0xfa, 0xf3, 0xe2, 0x91, 0x43, 0x54, 0x68, 0x60, 0x78,
         0x57, 0x69, 0x4d, 0xf5, 0xe4, 0x5b, 0x68, 0x85, 0x18, 0x68 } },
     "1.3.6.1.4.1.6449.1.2.1.5.1"
+  },
+  // AffirmTrust Commercial
+  // https://commercial.affirmtrust.com/
+  { { { 0xf9, 0xb5, 0xb6, 0x32, 0x45, 0x5f, 0x9c, 0xbe, 0xec, 0x57,
+        0x5f, 0x80, 0xdc, 0xe9, 0x6e, 0x2c, 0xc7, 0xb2, 0x78, 0xb7 } },
+    "1.3.6.1.4.1.34697.2.1"
+  },
+  // AffirmTrust Networking
+  // https://networking.affirmtrust.com:4431
+  { { { 0x29, 0x36, 0x21, 0x02, 0x8b, 0x20, 0xed, 0x02, 0xf5, 0x66,
+        0xc5, 0x32, 0xd1, 0xd6, 0xed, 0x90, 0x9f, 0x45, 0x00, 0x2f } },
+    "1.3.6.1.4.1.34697.2.2"
+  },
+  // AffirmTrust Premium
+  // https://premium.affirmtrust.com:4432/
+  { { { 0xd8, 0xa6, 0x33, 0x2c, 0xe0, 0x03, 0x6f, 0xb1, 0x85, 0xf6,
+        0x63, 0x4f, 0x7d, 0x6a, 0x06, 0x65, 0x26, 0x32, 0x28, 0x27 } },
+    "1.3.6.1.4.1.34697.2.3"
+  },
+  // AffirmTrust Premium ECC
+  // https://premiumecc.affirmtrust.com:4433/
+  { { { 0xb8, 0x23, 0x6b, 0x00, 0x2f, 0x1d, 0x16, 0x86, 0x53, 0x01,
+        0x55, 0x6c, 0x11, 0xa4, 0x37, 0xca, 0xeb, 0xff, 0xc3, 0xbb } },
+    "1.3.6.1.4.1.34697.2.4"
+  },
+  // CertPlus Class 2 Primary CA (KEYNECTIS)
+  // https://www.keynectis.com/
+  { { { 0x74, 0x20, 0x74, 0x41, 0x72, 0x9c, 0xdd, 0x92, 0xec, 0x79,
+        0x31, 0xd8, 0x23, 0x10, 0x8d, 0xc2, 0x81, 0x92, 0xe2, 0xbb } },
+    "1.3.6.1.4.1.22234.2.5.2.3.1"
   },
   // COMODO Certification Authority
   // https://secure.comodo.com/
@@ -58,13 +90,6 @@ static const EVMetadata ev_root_ca_metadata[] = {
   { { { 0x5f, 0xb7, 0xee, 0x06, 0x33, 0xe2, 0x59, 0xdb, 0xad, 0x0c,
         0x4c, 0x9a, 0xe6, 0xd3, 0x8f, 0x1a, 0x61, 0xc7, 0xdc, 0x25 } },
     "2.16.840.1.114412.2.1"
-  },
-  // DigiNotar Root CA
-  // https://www.evssl.nl
-  // https://www.polisdirect.nl
-  { { { 0xc0, 0x60, 0xed, 0x44, 0xcb, 0xd8, 0x81, 0xbd, 0x0e, 0xf8,
-        0x6c, 0x0b, 0xa2, 0x87, 0xdd, 0xcf, 0x81, 0x67, 0x47, 0x8c } },
-    "2.16.528.1.1001.1.1.1.12.6.1.1.1"
   },
   // Entrust.net Secure Server Certification Authority
   // https://www.entrust.net/
@@ -149,6 +174,12 @@ static const EVMetadata ev_root_ca_metadata[] = {
         0x3d, 0xd8, 0x90, 0x8f, 0xfd, 0x28, 0x86, 0x65, 0x64, 0x7d } },
     "1.2.392.200091.100.721.1"
   },
+  // StartCom Certification Authority
+  // https://www.startssl.com/
+  { { { 0x3e, 0x2b, 0xf7, 0xf2, 0x03, 0x1b, 0x96, 0xf3, 0x8c, 0xe6,
+        0xc4, 0xd8, 0xa8, 0x5d, 0x3e, 0x2d, 0x58, 0x47, 0x6a, 0x0f } },
+    "1.3.6.1.4.1.23223.1.1.1"
+  },
   // Starfield Class 2 Certification Authority
   // https://www.starfieldtech.com/
   { { { 0xad, 0x7e, 0x1c, 0x28, 0xb0, 0x64, 0xef, 0x8f, 0x60, 0x03,
@@ -215,19 +246,81 @@ static const EVMetadata ev_root_ca_metadata[] = {
   }
 };
 
+#if defined(OS_WIN)
+// static
+const EVRootCAMetadata::PolicyOID EVRootCAMetadata::policy_oids_[] = {
+  // The OIDs must be sorted in ascending order.
+  "1.2.392.200091.100.721.1",
+  "1.3.6.1.4.1.14370.1.6",
+  "1.3.6.1.4.1.22234.2.5.2.3.1",
+  "1.3.6.1.4.1.23223.1.1.1",
+  "1.3.6.1.4.1.34697.2.1",
+  "1.3.6.1.4.1.34697.2.2",
+  "1.3.6.1.4.1.34697.2.3",
+  "1.3.6.1.4.1.34697.2.4",
+  "1.3.6.1.4.1.4146.1.1",
+  "1.3.6.1.4.1.6334.1.100.1",
+  "1.3.6.1.4.1.6449.1.2.1.5.1",
+  "1.3.6.1.4.1.782.1.2.1.8.1",
+  "1.3.6.1.4.1.8024.0.2.100.1.2",
+  "2.16.756.1.89.1.2.1.1",
+  "2.16.840.1.113733.1.7.23.6",
+  "2.16.840.1.113733.1.7.48.1",
+  "2.16.840.1.114028.10.1.2",
+  "2.16.840.1.114171.500.9",
+  "2.16.840.1.114404.1.1.2.4.1",
+  "2.16.840.1.114412.2.1",
+  "2.16.840.1.114413.1.7.23.3",
+  "2.16.840.1.114414.1.7.23.3",
+};
+#endif
+
+static base::LazyInstance<EVRootCAMetadata,
+                          base::LeakyLazyInstanceTraits<EVRootCAMetadata> >
+    g_ev_root_ca_metadata(base::LINKER_INITIALIZED);
+
 // static
 EVRootCAMetadata* EVRootCAMetadata::GetInstance() {
-  return Singleton<EVRootCAMetadata>::get();
+  return g_ev_root_ca_metadata.Pointer();
 }
 
 bool EVRootCAMetadata::GetPolicyOID(
-    const X509Certificate::Fingerprint& fingerprint,
+    const SHA1Fingerprint& fingerprint,
     PolicyOID* policy_oid) const {
   PolicyOidMap::const_iterator iter = ev_policy_.find(fingerprint);
   if (iter == ev_policy_.end())
     return false;
   *policy_oid = iter->second;
   return true;
+}
+
+#if defined(OS_WIN)
+static int PolicyOIDCmp(const void* keyval, const void* datum) {
+  const char* oid1 = reinterpret_cast<const char*>(keyval);
+  const char* const* oid2 = reinterpret_cast<const char* const*>(datum);
+  return strcmp(oid1, *oid2);
+}
+
+bool EVRootCAMetadata::IsEVPolicyOID(PolicyOID policy_oid) const {
+  return bsearch(policy_oid, &policy_oids_[0], num_policy_oids_,
+                 sizeof(PolicyOID), PolicyOIDCmp) != NULL;
+}
+#else
+bool EVRootCAMetadata::IsEVPolicyOID(PolicyOID policy_oid) const {
+  for (size_t i = 0; i < policy_oids_.size(); ++i) {
+    if (PolicyOIDsAreEqual(policy_oid, policy_oids_[i]))
+      return true;
+  }
+  return false;
+}
+#endif
+
+bool EVRootCAMetadata::HasEVPolicyOID(const SHA1Fingerprint& fingerprint,
+                                      PolicyOID policy_oid) const {
+  PolicyOID ev_policy_oid;
+  if (!GetPolicyOID(fingerprint, &ev_policy_oid))
+    return false;
+  return PolicyOIDsAreEqual(ev_policy_oid, policy_oid);
 }
 
 EVRootCAMetadata::EVRootCAMetadata() {
@@ -257,6 +350,18 @@ EVRootCAMetadata::EVRootCAMetadata() {
     ev_policy_[metadata.fingerprint] = policy;
     policy_oids_.push_back(policy);
   }
+#elif defined(OS_WIN)
+  num_policy_oids_ = arraysize(policy_oids_);
+  // Verify policy_oids_ is in ascending order.
+  for (int i = 0; i < num_policy_oids_ - 1; i++)
+    DCHECK(strcmp(policy_oids_[i], policy_oids_[i + 1]) < 0);
+
+  for (size_t i = 0; i < arraysize(ev_root_ca_metadata); i++) {
+    const EVMetadata& metadata = ev_root_ca_metadata[i];
+    ev_policy_[metadata.fingerprint] = metadata.policy_oid;
+    // Verify policy_oids_ contains every EV policy OID.
+    DCHECK(IsEVPolicyOID(metadata.policy_oid));
+  }
 #else
   for (size_t i = 0; i < arraysize(ev_root_ca_metadata); i++) {
     const EVMetadata& metadata = ev_root_ca_metadata[i];
@@ -266,6 +371,18 @@ EVRootCAMetadata::EVRootCAMetadata() {
     // bother detecting duplicates.
     policy_oids_.push_back(metadata.policy_oid);
   }
+#endif
+}
+
+EVRootCAMetadata::~EVRootCAMetadata() {
+}
+
+// static
+bool EVRootCAMetadata::PolicyOIDsAreEqual(PolicyOID a, PolicyOID b) {
+#if defined(USE_NSS)
+  return a == b;
+#else
+  return !strcmp(a, b);
 #endif
 }
 

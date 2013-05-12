@@ -1,10 +1,12 @@
-// Copyright (c) 2008 The Chromium Authors. All rights reserved.  Use of this
-// source code is governed by a BSD-style license that can be found in the
-// LICENSE file.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 #ifndef NET_FTP_FTP_TRANSACTION_H_
 #define NET_FTP_FTP_TRANSACTION_H_
+#pragma once
 
+#include "base/string16.h"
 #include "net/base/completion_callback.h"
 #include "net/base/io_buffer.h"
 #include "net/base/load_states.h"
@@ -13,7 +15,7 @@ namespace net {
 
 class FtpResponseInfo;
 class FtpRequestInfo;
-class LoadLog;
+class BoundNetLog;
 
 // Represents a single FTP transaction.
 class FtpTransaction {
@@ -35,14 +37,14 @@ class FtpTransaction {
   //
   // NOTE: The transaction is not responsible for deleting the callback object.
   //
-  // Profiling information for the request is saved to |load_log| if non-NULL.
+  // Profiling information for the request is saved to |net_log| if non-NULL.
   virtual int Start(const FtpRequestInfo* request_info,
                     CompletionCallback* callback,
-                    LoadLog* load_log) = 0;
+                    const BoundNetLog& net_log) = 0;
 
   // Restarts the FTP transaction with authentication credentials.
-  virtual int RestartWithAuth(const std::wstring& username,
-                              const std::wstring& password,
+  virtual int RestartWithAuth(const string16& username,
+                              const string16& password,
                               CompletionCallback* callback) = 0;
 
   // Once response info is available for the transaction, response data may be

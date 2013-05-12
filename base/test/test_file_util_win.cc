@@ -1,9 +1,10 @@
-// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include "base/test/test_file_util.h"
 
+#include <shlwapi.h>
 #include <windows.h>
 
 #include <vector>
@@ -11,8 +12,8 @@
 #include "base/file_path.h"
 #include "base/file_util.h"
 #include "base/logging.h"
-#include "base/platform_thread.h"
-#include "base/scoped_handle.h"
+#include "base/win/scoped_handle.h"
+#include "base/threading/platform_thread.h"
 
 namespace file_util {
 
@@ -31,14 +32,14 @@ bool DieFileDie(const FilePath& file, bool recurse) {
   for (int i = 0; i < 25; ++i) {
     if (file_util::Delete(file, recurse))
       return true;
-    PlatformThread::Sleep(kTimeoutMs / 25);
+    base::PlatformThread::Sleep(kTimeoutMs / 25);
   }
   return false;
 }
 
 bool EvictFileFromSystemCache(const FilePath& file) {
   // Request exclusive access to the file and overwrite it with no buffering.
-  ScopedHandle file_handle(
+  base::win::ScopedHandle file_handle(
       CreateFile(file.value().c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL,
                  OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL));
   if (!file_handle)
@@ -64,7 +65,7 @@ bool EvictFileFromSystemCache(const FilePath& file) {
   DWORD bytes_read, bytes_written;
   for (;;) {
     bytes_read = 0;
-    ReadFile(file_handle, buffer, kOneMB, &bytes_read, NULL);
+    ::ReadFile(file_handle, buffer, kOneMB, &bytes_read, NULL);
     if (bytes_read == 0)
       break;
 
@@ -82,7 +83,7 @@ bool EvictFileFromSystemCache(const FilePath& file) {
     // aligned, but that shouldn't happen here.
     DCHECK((total_bytes % kOneMB) == 0);
     SetFilePointer(file_handle, total_bytes, NULL, FILE_BEGIN);
-    if (!WriteFile(file_handle, buffer, kOneMB, &bytes_written, NULL) ||
+    if (!::WriteFile(file_handle, buffer, kOneMB, &bytes_written, NULL) ||
         bytes_written != kOneMB) {
       BOOL freed = VirtualFree(buffer, 0, MEM_RELEASE);
       DCHECK(freed);
@@ -107,8 +108,8 @@ bool EvictFileFromSystemCache(const FilePath& file) {
     file_handle.Set(NULL);
     file_handle.Set(CreateFile(file.value().c_str(), GENERIC_WRITE, 0, NULL,
                                OPEN_EXISTING, 0, NULL));
-    CHECK(SetFilePointer(file_handle, total_bytes, NULL, FILE_BEGIN) !=
-          INVALID_SET_FILE_POINTER);
+    CHECK_NE(SetFilePointer(file_handle, total_bytes, NULL, FILE_BEGIN),
+             INVALID_SET_FILE_POINTER);
     CHECK(::SetEndOfFile(file_handle));
   }
 
@@ -171,6 +172,56 @@ bool CopyRecursiveDirNoCache(const FilePath& source_dir,
 
   FindClose(fh);
   return true;
+}
+
+// Checks if the volume supports Alternate Data Streams. This is required for
+// the Zone Identifier implementation.
+bool VolumeSupportsADS(const FilePath& path) {
+  wchar_t drive[MAX_PATH] = {0};
+  wcscpy_s(drive, MAX_PATH, path.value().c_str());
+
+  if (!PathStripToRootW(drive))
+    return false;
+
+  DWORD fs_flags = 0;
+  if (!GetVolumeInformationW(drive, NULL, 0, 0, NULL, &fs_flags, NULL, 0))
+    return false;
+
+  if (fs_flags & FILE_NAMED_STREAMS)
+    return true;
+
+  return false;
+}
+
+// Return whether the ZoneIdentifier is correctly set to "Internet" (3)
+// Only returns a valid result when called from same process as the
+// one that (was supposed to have) set the zone identifier.
+bool HasInternetZoneIdentifier(const FilePath& full_path) {
+  FilePath zone_path(full_path.value() + L":Zone.Identifier");
+  std::string zone_path_contents;
+  if (!file_util::ReadFileToString(zone_path, &zone_path_contents))
+    return false;
+
+  static const char kInternetIdentifier[] = "[ZoneTransfer]\nZoneId=3";
+  static const size_t kInternetIdentifierSize =
+      // Don't include null byte in size of identifier.
+      arraysize(kInternetIdentifier) - 1;
+
+  // Our test is that the initial characters match the above, and that
+  // the character after the end of the string is eof, null, or newline; any
+  // of those three will invoke the Window Finder cautionary dialog.
+  return ((zone_path_contents.compare(0, kInternetIdentifierSize,
+                                      kInternetIdentifier) == 0) &&
+          (kInternetIdentifierSize == zone_path_contents.length() ||
+           zone_path_contents[kInternetIdentifierSize] == '\0' ||
+           zone_path_contents[kInternetIdentifierSize] == '\n'));
+}
+
+std::wstring FilePathAsWString(const FilePath& path) {
+  return path.value();
+}
+FilePath WStringAsFilePath(const std::wstring& path) {
+  return FilePath(path);
 }
 
 }  // namespace file_util

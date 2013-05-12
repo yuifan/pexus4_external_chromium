@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -8,20 +8,24 @@
 
 #include "base/logging.h"
 
+namespace net {
+
 URLRequestFilter* URLRequestFilter::shared_instance_ = NULL;
 
-/* static */
-URLRequestFilter* URLRequestFilter::GetInstance() {
-  if (!shared_instance_)
-    shared_instance_ = new URLRequestFilter;
-  return shared_instance_;
-}
+URLRequestFilter::~URLRequestFilter() {}
 
-/* static */
+// static
 URLRequestJob* URLRequestFilter::Factory(URLRequest* request,
                                          const std::string& scheme) {
   // Returning null here just means that the built-in handler will be used.
   return GetInstance()->FindRequestHandler(request, scheme);
+}
+
+// static
+URLRequestFilter* URLRequestFilter::GetInstance() {
+  if (!shared_instance_)
+    shared_instance_ = new URLRequestFilter;
+  return shared_instance_;
 }
 
 void URLRequestFilter::AddHostnameHandler(const std::string& scheme,
@@ -29,8 +33,7 @@ void URLRequestFilter::AddHostnameHandler(const std::string& scheme,
   hostname_handler_map_[make_pair(scheme, hostname)] = factory;
 
   // Register with the ProtocolFactory.
-  URLRequest::RegisterProtocolFactory(scheme,
-                                      &URLRequestFilter::Factory);
+  URLRequest::RegisterProtocolFactory(scheme, &URLRequestFilter::Factory);
 
 #ifndef NDEBUG
   // Check to see if we're masking URLs in the url_handler_map_.
@@ -52,20 +55,22 @@ void URLRequestFilter::RemoveHostnameHandler(const std::string& scheme,
   DCHECK(iter != hostname_handler_map_.end());
 
   hostname_handler_map_.erase(iter);
-  // Note that we don't unregister from the URLRequest ProtocolFactory as this
-  // would left no protocol factory for the scheme.  URLRequestFilter::Factory
-  // will keep forwarding the requests to the URLRequestInetJob.
+  // Note that we don't unregister from the URLRequest ProtocolFactory as
+  // this would left no protocol factory for the scheme.
+  // URLRequestFilter::Factory will keep forwarding the requests to the
+  // URLRequestInetJob.
 }
 
-bool URLRequestFilter::AddUrlHandler(const GURL& url,
-                                     URLRequest::ProtocolFactory* factory) {
+bool URLRequestFilter::AddUrlHandler(
+    const GURL& url,
+    URLRequest::ProtocolFactory* factory) {
   if (!url.is_valid())
     return false;
   url_handler_map_[url.spec()] = factory;
 
   // Register with the ProtocolFactory.
   URLRequest::RegisterProtocolFactory(url.scheme(),
-                                      &URLRequestFilter::Factory);
+                                           &URLRequestFilter::Factory);
 #ifndef NDEBUG
   // Check to see if this URL is masked by a hostname handler.
   HostnameHandlerMap::iterator host_it =
@@ -82,9 +87,10 @@ void URLRequestFilter::RemoveUrlHandler(const GURL& url) {
   DCHECK(iter != url_handler_map_.end());
 
   url_handler_map_.erase(iter);
-  // Note that we don't unregister from the URLRequest ProtocolFactory as this
-  // would left no protocol factory for the scheme.  URLRequestFilter::Factory
-  // will keep forwarding the requests to the URLRequestInetJob.
+  // Note that we don't unregister from the URLRequest ProtocolFactory as
+  // this would left no protocol factory for the scheme.
+  // URLRequestFilter::Factory will keep forwarding the requests to the
+  // URLRequestInetJob.
 }
 
 void URLRequestFilter::ClearHandlers() {
@@ -108,8 +114,11 @@ void URLRequestFilter::ClearHandlers() {
   hit_count_ = 0;
 }
 
-URLRequestJob* URLRequestFilter::FindRequestHandler(URLRequest* request,
-                                                    const std::string& scheme) {
+URLRequestFilter::URLRequestFilter() : hit_count_(0) { }
+
+URLRequestJob* URLRequestFilter::FindRequestHandler(
+    URLRequest* request,
+    const std::string& scheme) {
   URLRequestJob* job = NULL;
   if (request->url().is_valid()) {
     // Check the hostname map first.
@@ -129,8 +138,10 @@ URLRequestJob* URLRequestFilter::FindRequestHandler(URLRequest* request,
     }
   }
   if (job) {
-    DLOG(INFO) << "URLRequestFilter hit for " << request->url().spec();
+    DVLOG(1) << "URLRequestFilter hit for " << request->url().spec();
     hit_count_++;
   }
   return job;
 }
+
+}  // namespace net

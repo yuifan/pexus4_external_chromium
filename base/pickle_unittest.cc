@@ -1,12 +1,12 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #include <string>
 
 #include "base/basictypes.h"
+#include "base/memory/scoped_ptr.h"
 #include "base/pickle.h"
-#include "base/scoped_ptr.h"
 #include "base/string16.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
@@ -19,6 +19,7 @@ const char testdata[] = "AAA\0BBB\0";
 const int testdatalen = arraysize(testdata) - 1;
 const bool testbool1 = false;
 const bool testbool2 = true;
+const uint16 testuint16 = 32123;
 
 // checks that the result
 void VerifyResult(const Pickle& pickle) {
@@ -41,6 +42,10 @@ void VerifyResult(const Pickle& pickle) {
   EXPECT_EQ(testbool1, outbool);
   EXPECT_TRUE(pickle.ReadBool(&iter, &outbool));
   EXPECT_EQ(testbool2, outbool);
+
+  uint16 outuint16;
+  EXPECT_TRUE(pickle.ReadUInt16(&iter, &outuint16));
+  EXPECT_EQ(testuint16, outuint16);
 
   const char* outdata;
   int outdatalen;
@@ -66,6 +71,7 @@ TEST(PickleTest, EncodeDecode) {
   EXPECT_TRUE(pickle.WriteWString(testwstr));
   EXPECT_TRUE(pickle.WriteBool(testbool1));
   EXPECT_TRUE(pickle.WriteBool(testbool2));
+  EXPECT_TRUE(pickle.WriteUInt16(testuint16));
   EXPECT_TRUE(pickle.WriteData(testdata, testdatalen));
 
   // Over allocate BeginWriteData so we can test TrimWriteData.
@@ -85,6 +91,39 @@ TEST(PickleTest, EncodeDecode) {
   Pickle pickle3;
   pickle3 = pickle;
   VerifyResult(pickle3);
+}
+
+// Tests that we can handle really small buffers.
+TEST(PickleTest, SmallBuffer) {
+  scoped_array<char> buffer(new char[1]);
+
+  // We should not touch the buffer.
+  Pickle pickle(buffer.get(), 1);
+
+  void* iter = NULL;
+  int data;
+  EXPECT_FALSE(pickle.ReadInt(&iter, &data));
+}
+
+// Tests that we can handle improper headers.
+TEST(PickleTest, BigSize) {
+  int buffer[] = { 0x56035200, 25, 40, 50 };
+
+  Pickle pickle(reinterpret_cast<char*>(buffer), sizeof(buffer));
+
+  void* iter = NULL;
+  int data;
+  EXPECT_FALSE(pickle.ReadInt(&iter, &data));
+}
+
+TEST(PickleTest, UnalignedSize) {
+  int buffer[] = { 10, 25, 40, 50 };
+
+  Pickle pickle(reinterpret_cast<char*>(buffer), sizeof(buffer));
+
+  void* iter = NULL;
+  int data;
+  EXPECT_FALSE(pickle.ReadInt(&iter, &data));
 }
 
 TEST(PickleTest, ZeroLenStr) {
@@ -136,6 +175,17 @@ TEST(PickleTest, FindNext) {
   EXPECT_TRUE(end == Pickle::FindNext(pickle.header_size_, start, end));
   EXPECT_TRUE(NULL == Pickle::FindNext(pickle.header_size_, start, end - 1));
   EXPECT_TRUE(end == Pickle::FindNext(pickle.header_size_, start, end + 1));
+}
+
+TEST(PickleTest, FindNextWithIncompleteHeader) {
+  size_t header_size = sizeof(Pickle::Header);
+  scoped_array<char> buffer(new char[header_size - 1]);
+  memset(buffer.get(), 0x1, header_size - 1);
+
+  const char* start = buffer.get();
+  const char* end = start + header_size - 1;
+
+  EXPECT_TRUE(NULL == Pickle::FindNext(header_size, start, end));
 }
 
 TEST(PickleTest, IteratorHasRoom) {
@@ -259,3 +309,17 @@ TEST(PickleTest, ZeroLength) {
   // We can't assert that outdata is NULL.
 }
 
+// Check that ReadBytes works properly with an iterator initialized to NULL.
+TEST(PickleTest, ReadBytes) {
+  Pickle pickle;
+  int data = 0x7abcd;
+  EXPECT_TRUE(pickle.WriteBytes(&data, sizeof(data)));
+
+  void* iter = NULL;
+  const char* outdata_char;
+  EXPECT_TRUE(pickle.ReadBytes(&iter, &outdata_char, sizeof(data)));
+
+  int outdata;
+  memcpy(&outdata, outdata_char, sizeof(outdata));
+  EXPECT_EQ(data, outdata);
+}

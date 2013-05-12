@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -23,7 +23,10 @@
 #include "base/message_loop.h"
 #include "base/platform_file.h"
 #include "base/string_util.h"
-#include "base/worker_pool.h"
+#include "base/synchronization/lock.h"
+#include "base/threading/worker_pool.h"
+#include "base/threading/thread_restrictions.h"
+#include "build/build_config.h"
 #include "googleurl/src/gurl.h"
 #include "net/base/io_buffer.h"
 #include "net/base/load_flags.h"
@@ -32,20 +35,23 @@
 #include "net/base/net_util.h"
 #include "net/http/http_util.h"
 #include "net/url_request/url_request.h"
+#include "net/url_request/url_request_error_job.h"
 #include "net/url_request/url_request_file_dir_job.h"
 
+namespace net {
+
 #if defined(OS_WIN)
-class URLRequestFileJob::AsyncResolver :
-    public base::RefCountedThreadSafe<URLRequestFileJob::AsyncResolver> {
+class URLRequestFileJob::AsyncResolver
+    : public base::RefCountedThreadSafe<URLRequestFileJob::AsyncResolver> {
  public:
   explicit AsyncResolver(URLRequestFileJob* owner)
       : owner_(owner), owner_loop_(MessageLoop::current()) {
   }
 
   void Resolve(const FilePath& file_path) {
-    file_util::FileInfo file_info;
+    base::PlatformFileInfo file_info;
     bool exists = file_util::GetFileInfo(file_path, &file_info);
-    AutoLock locked(lock_);
+    base::AutoLock locked(lock_);
     if (owner_loop_) {
       owner_loop_->PostTask(FROM_HERE, NewRunnableMethod(
           this, &AsyncResolver::ReturnResults, exists, file_info));
@@ -55,7 +61,7 @@ class URLRequestFileJob::AsyncResolver :
   void Cancel() {
     owner_ = NULL;
 
-    AutoLock locked(lock_);
+    base::AutoLock locked(lock_);
     owner_loop_ = NULL;
   }
 
@@ -64,31 +70,17 @@ class URLRequestFileJob::AsyncResolver :
 
   ~AsyncResolver() {}
 
-  void ReturnResults(bool exists, const file_util::FileInfo& file_info) {
+  void ReturnResults(bool exists, const base::PlatformFileInfo& file_info) {
     if (owner_)
       owner_->DidResolve(exists, file_info);
   }
 
   URLRequestFileJob* owner_;
 
-  Lock lock_;
+  base::Lock lock_;
   MessageLoop* owner_loop_;
 };
 #endif
-
-// static
-URLRequestJob* URLRequestFileJob::Factory(
-    URLRequest* request, const std::string& scheme) {
-  FilePath file_path;
-  if (net::FileURLToFilePath(request->url(), &file_path) &&
-      file_util::EnsureEndsWithSeparator(&file_path) &&
-      file_path.IsAbsolute())
-    return new URLRequestFileDirJob(request, file_path);
-
-  // Use a regular file request job for all non-directories (including invalid
-  // file names).
-  return new URLRequestFileJob(request, file_path);
-}
 
 URLRequestFileJob::URLRequestFileJob(URLRequest* request,
                                      const FilePath& file_path)
@@ -97,14 +89,66 @@ URLRequestFileJob::URLRequestFileJob(URLRequest* request,
       ALLOW_THIS_IN_INITIALIZER_LIST(
           io_callback_(this, &URLRequestFileJob::DidRead)),
       is_directory_(false),
-      remaining_bytes_(0) {
+      remaining_bytes_(0),
+      ALLOW_THIS_IN_INITIALIZER_LIST(method_factory_(this)) {
 }
 
-URLRequestFileJob::~URLRequestFileJob() {
-#if defined(OS_WIN)
-  DCHECK(!async_resolver_);
+// static
+URLRequestJob* URLRequestFileJob::Factory(URLRequest* request,
+                                          const std::string& scheme) {
+
+  FilePath file_path;
+  const bool is_file = FileURLToFilePath(request->url(), &file_path);
+
+#if defined(OS_CHROMEOS)
+  // Check file access.
+  if (AccessDisabled(file_path))
+    return new URLRequestErrorJob(request, ERR_ACCESS_DENIED);
 #endif
+
+  // We need to decide whether to create URLRequestFileJob for file access or
+  // URLRequestFileDirJob for directory access. To avoid accessing the
+  // filesystem, we only look at the path string here.
+  // The code in the URLRequestFileJob::Start() method discovers that a path,
+  // which doesn't end with a slash, should really be treated as a directory,
+  // and it then redirects to the URLRequestFileDirJob.
+  if (is_file &&
+      file_util::EndsWithSeparator(file_path) &&
+      file_path.IsAbsolute())
+    return new URLRequestFileDirJob(request, file_path);
+
+  // Use a regular file request job for all non-directories (including invalid
+  // file names).
+  return new URLRequestFileJob(request, file_path);
 }
+
+#if defined(OS_CHROMEOS)
+static const char* const kLocalAccessWhiteList[] = {
+  "/home/chronos/user/Downloads",
+  "/media",
+  "/opt/oem",
+  "/usr/share/chromeos-assets",
+  "/tmp",
+  "/var/log",
+};
+
+// static
+bool URLRequestFileJob::AccessDisabled(const FilePath& file_path) {
+  if (URLRequest::IsFileAccessAllowed()) {  // for tests.
+    return false;
+  }
+
+  for (size_t i = 0; i < arraysize(kLocalAccessWhiteList); ++i) {
+    const FilePath white_listed_path(kLocalAccessWhiteList[i]);
+    // FilePath::operator== should probably handle trailing seperators.
+    if (white_listed_path == file_path.StripTrailingSeparators() ||
+        white_listed_path.IsParent(file_path)) {
+      return false;
+    }
+  }
+  return true;
+}
+#endif
 
 void URLRequestFileJob::Start() {
 #if defined(OS_WIN)
@@ -112,17 +156,26 @@ void URLRequestFileJob::Start() {
   if (!file_path_.value().compare(0, 2, L"\\\\")) {
     DCHECK(!async_resolver_);
     async_resolver_ = new AsyncResolver(this);
-    WorkerPool::PostTask(FROM_HERE, NewRunnableMethod(
+    base::WorkerPool::PostTask(FROM_HERE, NewRunnableMethod(
         async_resolver_.get(), &AsyncResolver::Resolve, file_path_), true);
     return;
   }
 #endif
-  file_util::FileInfo file_info;
-  bool exists = file_util::GetFileInfo(file_path_, &file_info);
+
+  // URL requests should not block on the disk!
+  //   http://code.google.com/p/chromium/issues/detail?id=59849
+  bool exists;
+  base::PlatformFileInfo file_info;
+  {
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
+    exists = file_util::GetFileInfo(file_path_, &file_info);
+  }
 
   // Continue asynchronously.
-  MessageLoop::current()->PostTask(FROM_HERE, NewRunnableMethod(
-      this, &URLRequestFileJob::DidResolve, exists, file_info));
+  MessageLoop::current()->PostTask(
+      FROM_HERE,
+      method_factory_.NewRunnableMethod(
+          &URLRequestFileJob::DidResolve, exists, file_info));
 }
 
 void URLRequestFileJob::Kill() {
@@ -136,9 +189,10 @@ void URLRequestFileJob::Kill() {
 #endif
 
   URLRequestJob::Kill();
+  method_factory_.RevokeAll();
 }
 
-bool URLRequestFileJob::ReadRawData(net::IOBuffer* dest, int dest_size,
+bool URLRequestFileJob::ReadRawData(IOBuffer* dest, int dest_size,
                                     int *bytes_read) {
   DCHECK_NE(dest_size, 0);
   DCHECK(bytes_read);
@@ -164,7 +218,7 @@ bool URLRequestFileJob::ReadRawData(net::IOBuffer* dest, int dest_size,
   }
 
   // Otherwise, a read error occured.  We may just need to wait...
-  if (rv == net::ERR_IO_PENDING) {
+  if (rv == ERR_IO_PENDING) {
     SetStatus(URLRequestStatus(URLRequestStatus::IO_PENDING, 0));
   } else {
     NotifyDone(URLRequestStatus(URLRequestStatus::FAILED, rv));
@@ -172,40 +226,87 @@ bool URLRequestFileJob::ReadRawData(net::IOBuffer* dest, int dest_size,
   return false;
 }
 
-bool URLRequestFileJob::GetContentEncodings(
-    std::vector<Filter::FilterType>* encoding_types) {
-  DCHECK(encoding_types->empty());
+bool URLRequestFileJob::IsRedirectResponse(GURL* location,
+                                           int* http_status_code) {
+  if (is_directory_) {
+    // This happens when we discovered the file is a directory, so needs a
+    // slash at the end of the path.
+    std::string new_path = request_->url().path();
+    new_path.push_back('/');
+    GURL::Replacements replacements;
+    replacements.SetPathStr(new_path);
 
+    *location = request_->url().ReplaceComponents(replacements);
+    *http_status_code = 301;  // simulate a permanent redirect
+    return true;
+  }
+
+#if defined(OS_WIN)
+  // Follow a Windows shortcut.
+  // We just resolve .lnk file, ignore others.
+  if (!LowerCaseEqualsASCII(file_path_.Extension(), ".lnk"))
+    return false;
+
+  FilePath new_path = file_path_;
+  bool resolved;
+  resolved = file_util::ResolveShortcut(&new_path);
+
+  // If shortcut is not resolved succesfully, do not redirect.
+  if (!resolved)
+    return false;
+
+  *location = FilePathToFileURL(new_path);
+  *http_status_code = 301;
+  return true;
+#else
+  return false;
+#endif
+}
+
+Filter* URLRequestFileJob::SetupFilter() const {
   // Bug 9936 - .svgz files needs to be decompressed.
-  if (LowerCaseEqualsASCII(file_path_.Extension(), ".svgz"))
-    encoding_types->push_back(Filter::FILTER_TYPE_GZIP);
-
-  return !encoding_types->empty();
+  return LowerCaseEqualsASCII(file_path_.Extension(), ".svgz")
+      ? Filter::GZipFactory() : NULL;
 }
 
 bool URLRequestFileJob::GetMimeType(std::string* mime_type) const {
+  // URL requests should not block on the disk!  On Windows this goes to the
+  // registry.
+  //   http://code.google.com/p/chromium/issues/detail?id=59849
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
   DCHECK(request_);
-  return net::GetMimeTypeFromFile(file_path_, mime_type);
+  return GetMimeTypeFromFile(file_path_, mime_type);
 }
 
-void URLRequestFileJob::SetExtraRequestHeaders(const std::string& headers) {
-  // We only care about "Range" header here.
-  std::vector<net::HttpByteRange> ranges;
-  if (net::HttpUtil::ParseRanges(headers, &ranges)) {
-    if (ranges.size() == 1) {
-      byte_range_ = ranges[0];
-    } else {
-      // We don't support multiple range requests in one single URL request,
-      // because we need to do multipart encoding here.
-      // TODO(hclam): decide whether we want to support multiple range requests.
-      NotifyDone(URLRequestStatus(URLRequestStatus::FAILED,
-                 net::ERR_REQUEST_RANGE_NOT_SATISFIABLE));
+void URLRequestFileJob::SetExtraRequestHeaders(
+    const HttpRequestHeaders& headers) {
+  std::string range_header;
+  if (headers.GetHeader(HttpRequestHeaders::kRange, &range_header)) {
+    // We only care about "Range" header here.
+    std::vector<HttpByteRange> ranges;
+    if (HttpUtil::ParseRangeHeader(range_header, &ranges)) {
+      if (ranges.size() == 1) {
+        byte_range_ = ranges[0];
+      } else {
+        // We don't support multiple range requests in one single URL request,
+        // because we need to do multipart encoding here.
+        // TODO(hclam): decide whether we want to support multiple range
+        // requests.
+        NotifyDone(URLRequestStatus(URLRequestStatus::FAILED,
+                                    ERR_REQUEST_RANGE_NOT_SATISFIABLE));
+      }
     }
   }
 }
 
+URLRequestFileJob::~URLRequestFileJob() {
+#if defined(OS_WIN)
+  DCHECK(!async_resolver_);
+#endif
+}
+
 void URLRequestFileJob::DidResolve(
-    bool exists, const file_util::FileInfo& file_info) {
+    bool exists, const base::PlatformFileInfo& file_info) {
 #if defined(OS_WIN)
   async_resolver_ = NULL;
 #endif
@@ -214,29 +315,38 @@ void URLRequestFileJob::DidResolve(
   if (!request_)
     return;
 
-  int rv = net::OK;
-  // We use URLRequestFileJob to handle valid and invalid files as well as
-  // invalid directories. For a directory to be invalid, it must either not
-  // exist, or be "\" on Windows. (Windows resolves "\" to "C:\", thus
-  // reporting it as existent.) On POSIX, we don't count any existent
-  // directory as invalid.
-  if (!exists || file_info.is_directory) {
-    rv = net::ERR_FILE_NOT_FOUND;
-  } else {
+  is_directory_ = file_info.is_directory;
+
+  int rv = OK;
+  // We use URLRequestFileJob to handle files as well as directories without
+  // trailing slash.
+  // If a directory does not exist, we return ERR_FILE_NOT_FOUND. Otherwise,
+  // we will append trailing slash and redirect to FileDirJob.
+  // A special case is "\" on Windows. We should resolve as invalid.
+  // However, Windows resolves "\" to "C:\", thus reports it as existent.
+  // So what happens is we append it with trailing slash and redirect it to
+  // FileDirJob where it is resolved as invalid.
+  if (!exists) {
+    rv = ERR_FILE_NOT_FOUND;
+  } else if (!is_directory_) {
+    // URL requests should not block on the disk!
+    //   http://code.google.com/p/chromium/issues/detail?id=59849
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
+
     int flags = base::PLATFORM_FILE_OPEN |
                 base::PLATFORM_FILE_READ |
                 base::PLATFORM_FILE_ASYNC;
     rv = stream_.Open(file_path_, flags);
   }
 
-  if (rv != net::OK) {
+  if (rv != OK) {
     NotifyDone(URLRequestStatus(URLRequestStatus::FAILED, rv));
     return;
   }
 
   if (!byte_range_.ComputeBounds(file_info.size)) {
     NotifyDone(URLRequestStatus(URLRequestStatus::FAILED,
-               net::ERR_REQUEST_RANGE_NOT_SATISFIABLE));
+               ERR_REQUEST_RANGE_NOT_SATISFIABLE));
     return;
   }
 
@@ -244,14 +354,19 @@ void URLRequestFileJob::DidResolve(
                      byte_range_.first_byte_position() + 1;
   DCHECK_GE(remaining_bytes_, 0);
 
-  // Do the seek at the beginning of the request.
-  if (remaining_bytes_ > 0 &&
-      byte_range_.first_byte_position() != 0 &&
-      byte_range_.first_byte_position() !=
-          stream_.Seek(net::FROM_BEGIN, byte_range_.first_byte_position())) {
-    NotifyDone(URLRequestStatus(URLRequestStatus::FAILED,
-               net::ERR_REQUEST_RANGE_NOT_SATISFIABLE));
-    return;
+  // URL requests should not block on the disk!
+  //   http://code.google.com/p/chromium/issues/detail?id=59849
+  {
+    base::ThreadRestrictions::ScopedAllowIO allow_io;
+    // Do the seek at the beginning of the request.
+    if (remaining_bytes_ > 0 &&
+        byte_range_.first_byte_position() != 0 &&
+        byte_range_.first_byte_position() !=
+        stream_.Seek(FROM_BEGIN, byte_range_.first_byte_position())) {
+      NotifyDone(URLRequestStatus(URLRequestStatus::FAILED,
+                                  ERR_REQUEST_RANGE_NOT_SATISFIABLE));
+      return;
+    }
   }
 
   set_expected_content_size(remaining_bytes_);
@@ -273,29 +388,4 @@ void URLRequestFileJob::DidRead(int result) {
   NotifyReadComplete(result);
 }
 
-bool URLRequestFileJob::IsRedirectResponse(
-    GURL* location, int* http_status_code) {
-#if defined(OS_WIN)
-  std::wstring extension =
-      file_util::GetFileExtensionFromPath(file_path_.value());
-
-  // Follow a Windows shortcut.
-  // We just resolve .lnk file, ignore others.
-  if (!LowerCaseEqualsASCII(extension, "lnk"))
-    return false;
-
-  FilePath new_path = file_path_;
-  bool resolved;
-  resolved = file_util::ResolveShortcut(&new_path);
-
-  // If shortcut is not resolved succesfully, do not redirect.
-  if (!resolved)
-    return false;
-
-  *location = net::FilePathToFileURL(new_path);
-  *http_status_code = 301;
-  return true;
-#else
-  return false;
-#endif
-}
+}  // namespace net

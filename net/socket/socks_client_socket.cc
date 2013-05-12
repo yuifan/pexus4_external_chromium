@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,11 +6,11 @@
 
 #include "base/basictypes.h"
 #include "base/compiler_specific.h"
-#include "base/trace_event.h"
 #include "net/base/io_buffer.h"
-#include "net/base/load_log.h"
+#include "net/base/net_log.h"
 #include "net/base/net_util.h"
 #include "net/base/sys_addrinfo.h"
+#include "net/socket/client_socket_handle.h"
 
 namespace net {
 
@@ -18,15 +18,10 @@ namespace net {
 // and we send an empty string.
 static const char kEmptyUserId[] = "";
 
-// The SOCKS4a implementation suggests to use an invalid IP in case the DNS
-// resolution at client fails.
-static const uint8 kInvalidIp[] = { 0, 0, 0, 127 };
-
 // For SOCKS4, the client sends 8 bytes  plus the size of the user-id.
-// For SOCKS4A, this increases to accomodate the unresolved hostname.
 static const unsigned int kWriteHeaderSize = 8;
 
-// For SOCKS4 and SOCKS4a, the server sends 8 bytes for acknowledgement.
+// For SOCKS4 the server sends 8 bytes for acknowledgement.
 static const unsigned int kReadHeaderSize = 8;
 
 // Server Response codes for SOCKS.
@@ -38,7 +33,7 @@ static const uint8 kServerResponseMismatchedUserId = 0x5D;
 static const uint8 kSOCKSVersion4 = 0x04;
 static const uint8 kSOCKSStreamRequest = 0x01;
 
-// A struct holding the essential details of the SOCKS4/4a Server Request.
+// A struct holding the essential details of the SOCKS4 Server Request.
 // The port in the header is stored in network byte order.
 struct SOCKS4ServerRequest {
   uint8 version;
@@ -49,7 +44,7 @@ struct SOCKS4ServerRequest {
 COMPILE_ASSERT(sizeof(SOCKS4ServerRequest) == kWriteHeaderSize,
                socks4_server_request_struct_wrong_size);
 
-// A struct holding details of the SOCKS4/4a Server Response.
+// A struct holding details of the SOCKS4 Server Response.
 struct SOCKS4ServerResponse {
   uint8 reserved_null;
   uint8 code;
@@ -59,30 +54,55 @@ struct SOCKS4ServerResponse {
 COMPILE_ASSERT(sizeof(SOCKS4ServerResponse) == kReadHeaderSize,
                socks4_server_response_struct_wrong_size);
 
-SOCKSClientSocket::SOCKSClientSocket(ClientSocket* transport_socket,
+SOCKSClientSocket::SOCKSClientSocket(ClientSocketHandle* transport_socket,
                                      const HostResolver::RequestInfo& req_info,
                                      HostResolver* host_resolver)
     : ALLOW_THIS_IN_INITIALIZER_LIST(
           io_callback_(this, &SOCKSClientSocket::OnIOComplete)),
       transport_(transport_socket),
       next_state_(STATE_NONE),
-      socks_version_(kSOCKS4Unresolved),
       user_callback_(NULL),
       completed_handshake_(false),
       bytes_sent_(0),
       bytes_received_(0),
       host_resolver_(host_resolver),
-      host_request_info_(req_info) {
+      host_request_info_(req_info),
+      net_log_(transport_socket->socket()->NetLog()) {
+}
+
+SOCKSClientSocket::SOCKSClientSocket(ClientSocket* transport_socket,
+                                     const HostResolver::RequestInfo& req_info,
+                                     HostResolver* host_resolver)
+    : ALLOW_THIS_IN_INITIALIZER_LIST(
+          io_callback_(this, &SOCKSClientSocket::OnIOComplete)),
+      transport_(new ClientSocketHandle()),
+      next_state_(STATE_NONE),
+      user_callback_(NULL),
+      completed_handshake_(false),
+      bytes_sent_(0),
+      bytes_received_(0),
+      host_resolver_(host_resolver),
+      host_request_info_(req_info),
+      net_log_(transport_socket->NetLog()) {
+  transport_->set_socket(transport_socket);
 }
 
 SOCKSClientSocket::~SOCKSClientSocket() {
   Disconnect();
 }
 
-int SOCKSClientSocket::Connect(CompletionCallback* callback,
-                               LoadLog* load_log) {
+#ifdef ANDROID
+// TODO(kristianm): find out if Connect should block
+#endif
+int SOCKSClientSocket::Connect(CompletionCallback* callback
+#ifdef ANDROID
+                               , bool wait_for_connect
+                               , bool valid_uid
+                               , uid_t calling_uid
+#endif
+                              ) {
   DCHECK(transport_.get());
-  DCHECK(transport_->IsConnected());
+  DCHECK(transport_->socket());
   DCHECK_EQ(STATE_NONE, next_state_);
   DCHECK(!user_callback_);
 
@@ -91,16 +111,14 @@ int SOCKSClientSocket::Connect(CompletionCallback* callback,
     return OK;
 
   next_state_ = STATE_RESOLVE_HOST;
-  load_log_ = load_log;
 
-  LoadLog::BeginEvent(load_log, LoadLog::TYPE_SOCKS_CONNECT);
+  net_log_.BeginEvent(NetLog::TYPE_SOCKS_CONNECT, NULL);
 
   int rv = DoLoop(OK);
   if (rv == ERR_IO_PENDING) {
     user_callback_ = callback;
   } else {
-    LoadLog::EndEvent(load_log, LoadLog::TYPE_SOCKS_CONNECT);
-    load_log_ = NULL;
+    net_log_.EndEventWithNetErrorCode(NetLog::TYPE_SOCKS_CONNECT, rv);
   }
   return rv;
 }
@@ -108,22 +126,58 @@ int SOCKSClientSocket::Connect(CompletionCallback* callback,
 void SOCKSClientSocket::Disconnect() {
   completed_handshake_ = false;
   host_resolver_.Cancel();
-  transport_->Disconnect();
+  transport_->socket()->Disconnect();
 
   // Reset other states to make sure they aren't mistakenly used later.
   // These are the states initialized by Connect().
   next_state_ = STATE_NONE;
   user_callback_ = NULL;
-  load_log_ = NULL;
 }
 
 bool SOCKSClientSocket::IsConnected() const {
-  return completed_handshake_ && transport_->IsConnected();
+  return completed_handshake_ && transport_->socket()->IsConnected();
 }
 
 bool SOCKSClientSocket::IsConnectedAndIdle() const {
-  return completed_handshake_ && transport_->IsConnectedAndIdle();
+  return completed_handshake_ && transport_->socket()->IsConnectedAndIdle();
 }
+
+const BoundNetLog& SOCKSClientSocket::NetLog() const {
+  return net_log_;
+}
+
+void SOCKSClientSocket::SetSubresourceSpeculation() {
+  if (transport_.get() && transport_->socket()) {
+    transport_->socket()->SetSubresourceSpeculation();
+  } else {
+    NOTREACHED();
+  }
+}
+
+void SOCKSClientSocket::SetOmniboxSpeculation() {
+  if (transport_.get() && transport_->socket()) {
+    transport_->socket()->SetOmniboxSpeculation();
+  } else {
+    NOTREACHED();
+  }
+}
+
+bool SOCKSClientSocket::WasEverUsed() const {
+  if (transport_.get() && transport_->socket()) {
+    return transport_->socket()->WasEverUsed();
+  }
+  NOTREACHED();
+  return false;
+}
+
+bool SOCKSClientSocket::UsingTCPFastOpen() const {
+  if (transport_.get() && transport_->socket()) {
+    return transport_->socket()->UsingTCPFastOpen();
+  }
+  NOTREACHED();
+  return false;
+}
+
 
 // Read is called by the transport layer above to read. This can only be done
 // if the SOCKS handshake is complete.
@@ -133,7 +187,7 @@ int SOCKSClientSocket::Read(IOBuffer* buf, int buf_len,
   DCHECK_EQ(STATE_NONE, next_state_);
   DCHECK(!user_callback_);
 
-  return transport_->Read(buf, buf_len, callback);
+  return transport_->socket()->Read(buf, buf_len, callback);
 }
 
 // Write is called by the transport layer. This can only be done if the
@@ -144,15 +198,15 @@ int SOCKSClientSocket::Write(IOBuffer* buf, int buf_len,
   DCHECK_EQ(STATE_NONE, next_state_);
   DCHECK(!user_callback_);
 
-  return transport_->Write(buf, buf_len, callback);
+  return transport_->socket()->Write(buf, buf_len, callback);
 }
 
 bool SOCKSClientSocket::SetReceiveBufferSize(int32 size) {
-  return transport_->SetReceiveBufferSize(size);
+  return transport_->socket()->SetReceiveBufferSize(size);
 }
 
 bool SOCKSClientSocket::SetSendBufferSize(int32 size) {
-  return transport_->SetSendBufferSize(size);
+  return transport_->socket()->SetSendBufferSize(size);
 }
 
 void SOCKSClientSocket::DoCallback(int result) {
@@ -163,7 +217,7 @@ void SOCKSClientSocket::DoCallback(int result) {
   // clear user_callback_ up front.
   CompletionCallback* c = user_callback_;
   user_callback_ = NULL;
-  DLOG(INFO) << "Finished setting up SOCKS handshake";
+  DVLOG(1) << "Finished setting up SOCKS handshake";
   c->Run(result);
 }
 
@@ -171,8 +225,7 @@ void SOCKSClientSocket::OnIOComplete(int result) {
   DCHECK_NE(STATE_NONE, next_state_);
   int rv = DoLoop(result);
   if (rv != ERR_IO_PENDING) {
-    LoadLog::EndEvent(load_log_, LoadLog::TYPE_SOCKS_CONNECT);
-    load_log_ = NULL;
+    net_log_.EndEventWithNetErrorCode(NetLog::TYPE_SOCKS_CONNECT, rv);
     DoCallback(rv);
   }
 }
@@ -215,79 +268,51 @@ int SOCKSClientSocket::DoLoop(int last_io_result) {
 }
 
 int SOCKSClientSocket::DoResolveHost() {
-  DCHECK_EQ(kSOCKS4Unresolved, socks_version_);
-
   next_state_ = STATE_RESOLVE_HOST_COMPLETE;
+  // SOCKS4 only supports IPv4 addresses, so only try getting the IPv4
+  // addresses for the target host.
+  host_request_info_.set_address_family(ADDRESS_FAMILY_IPV4);
   return host_resolver_.Resolve(
-      host_request_info_, &addresses_, &io_callback_, load_log_);
+      host_request_info_, &addresses_, &io_callback_, net_log_);
 }
 
 int SOCKSClientSocket::DoResolveHostComplete(int result) {
-  DCHECK_EQ(kSOCKS4Unresolved, socks_version_);
-
-  bool ok = (result == OK);
-  next_state_ = STATE_HANDSHAKE_WRITE;
-  if (ok) {
-    DCHECK(addresses_.head());
-
-    // If the host is resolved to an IPv6 address, we revert to SOCKS4a
-    // since IPv6 is unsupported by SOCKS4/4a protocol.
-    struct sockaddr *host_info = addresses_.head()->ai_addr;
-    if (host_info->sa_family == AF_INET) {
-      DLOG(INFO) << "Resolved host. Using SOCKS4 to communicate";
-      socks_version_ = kSOCKS4;
-    } else {
-      DLOG(INFO) << "Resolved host but to IPv6. Using SOCKS4a to communicate";
-      socks_version_ = kSOCKS4a;
-    }
-  } else {
-    DLOG(INFO) << "Could not resolve host. Using SOCKS4a to communicate";
-    socks_version_ = kSOCKS4a;
+  if (result != OK) {
+    // Resolving the hostname failed; fail the request rather than automatically
+    // falling back to SOCKS4a (since it can be confusing to see invalid IP
+    // addresses being sent to the SOCKS4 server when it doesn't support 4A.)
+    return result;
   }
 
-  // Even if DNS resolution fails, we send OK since the server
-  // resolves the domain.
+  next_state_ = STATE_HANDSHAKE_WRITE;
   return OK;
 }
 
 // Builds the buffer that is to be sent to the server.
-// We check whether the SOCKS proxy is 4 or 4A.
-// In case it is 4A, the record size increases by size of the hostname.
 const std::string SOCKSClientSocket::BuildHandshakeWriteBuffer() const {
-  DCHECK_NE(kSOCKS4Unresolved, socks_version_);
-
   SOCKS4ServerRequest request;
   request.version = kSOCKSVersion4;
   request.command = kSOCKSStreamRequest;
   request.nw_port = htons(host_request_info_.port());
 
-  if (socks_version_ == kSOCKS4) {
-    const struct addrinfo* ai = addresses_.head();
-    DCHECK(ai);
-    // If the sockaddr is IPv6, we have already marked the version to socks4a
-    // and so this step does not get hit.
-    struct sockaddr_in* ipv4_host =
-        reinterpret_cast<struct sockaddr_in*>(ai->ai_addr);
-    memcpy(&request.ip, &(ipv4_host->sin_addr), sizeof(ipv4_host->sin_addr));
+  const struct addrinfo* ai = addresses_.head();
+  DCHECK(ai);
 
-    DLOG(INFO) << "Resolved Host is : " << NetAddressToString(ai);
-  } else if (socks_version_ == kSOCKS4a) {
-    // invalid IP of the form 0.0.0.127
-    memcpy(&request.ip, kInvalidIp, arraysize(kInvalidIp));
-  } else {
-    NOTREACHED();
-  }
+  // We disabled IPv6 results when resolving the hostname, so none of the
+  // results in the list will be IPv6.
+  // TODO(eroman): we only ever use the first address in the list. It would be
+  //               more robust to try all the IP addresses we have before
+  //               failing the connect attempt.
+  CHECK_EQ(AF_INET, ai->ai_addr->sa_family);
+  struct sockaddr_in* ipv4_host =
+      reinterpret_cast<struct sockaddr_in*>(ai->ai_addr);
+  memcpy(&request.ip, &ipv4_host->sin_addr, sizeof(ipv4_host->sin_addr));
+
+  DVLOG(1) << "Resolved Host is : " << NetAddressToString(ai);
 
   std::string handshake_data(reinterpret_cast<char*>(&request),
                              sizeof(request));
   handshake_data.append(kEmptyUserId, arraysize(kEmptyUserId));
-
-  // In case we are passing the domain also, pass the hostname
-  // terminated with a null character.
-  if (socks_version_ == kSOCKS4a) {
-    handshake_data.append(host_request_info_.hostname());
-    handshake_data.push_back('\0');
-  }
 
   return handshake_data;
 }
@@ -306,12 +331,11 @@ int SOCKSClientSocket::DoHandshakeWrite() {
   handshake_buf_ = new IOBuffer(handshake_buf_len);
   memcpy(handshake_buf_->data(), &buffer_[bytes_sent_],
          handshake_buf_len);
-  return transport_->Write(handshake_buf_, handshake_buf_len, &io_callback_);
+  return transport_->socket()->Write(handshake_buf_, handshake_buf_len,
+                                     &io_callback_);
 }
 
 int SOCKSClientSocket::DoHandshakeWriteComplete(int result) {
-  DCHECK_NE(kSOCKS4Unresolved, socks_version_);
-
   if (result < 0)
     return result;
 
@@ -332,8 +356,6 @@ int SOCKSClientSocket::DoHandshakeWriteComplete(int result) {
 }
 
 int SOCKSClientSocket::DoHandshakeRead() {
-  DCHECK_NE(kSOCKS4Unresolved, socks_version_);
-
   next_state_ = STATE_HANDSHAKE_READ_COMPLETE;
 
   if (buffer_.empty()) {
@@ -342,12 +364,11 @@ int SOCKSClientSocket::DoHandshakeRead() {
 
   int handshake_buf_len = kReadHeaderSize - bytes_received_;
   handshake_buf_ = new IOBuffer(handshake_buf_len);
-  return transport_->Read(handshake_buf_, handshake_buf_len, &io_callback_);
+  return transport_->socket()->Read(handshake_buf_, handshake_buf_len,
+                                    &io_callback_);
 }
 
 int SOCKSClientSocket::DoHandshakeReadComplete(int result) {
-  DCHECK_NE(kSOCKS4Unresolved, socks_version_);
-
   if (result < 0)
     return result;
 
@@ -355,8 +376,10 @@ int SOCKSClientSocket::DoHandshakeReadComplete(int result) {
   if (result == 0)
     return ERR_CONNECTION_CLOSED;
 
-  if (bytes_received_ + result > kReadHeaderSize)
-    return ERR_INVALID_RESPONSE;
+  if (bytes_received_ + result > kReadHeaderSize) {
+    // TODO(eroman): Describe failure in NetLog.
+    return ERR_SOCKS_CONNECTION_FAILED;
+  }
 
   buffer_.append(handshake_buf_->data(), result);
   bytes_received_ += result;
@@ -370,36 +393,38 @@ int SOCKSClientSocket::DoHandshakeReadComplete(int result) {
 
   if (response->reserved_null != 0x00) {
     LOG(ERROR) << "Unknown response from SOCKS server.";
-    return ERR_INVALID_RESPONSE;
+    return ERR_SOCKS_CONNECTION_FAILED;
   }
 
-  // TODO(arindam): Add SOCKS specific failure codes in net_error_list.h
   switch (response->code) {
     case kServerResponseOk:
       completed_handshake_ = true;
       return OK;
     case kServerResponseRejected:
       LOG(ERROR) << "SOCKS request rejected or failed";
-      return ERR_FAILED;
+      return ERR_SOCKS_CONNECTION_FAILED;
     case kServerResponseNotReachable:
       LOG(ERROR) << "SOCKS request failed because client is not running "
                  << "identd (or not reachable from the server)";
-      return ERR_NAME_NOT_RESOLVED;
+      return ERR_SOCKS_CONNECTION_HOST_UNREACHABLE;
     case kServerResponseMismatchedUserId:
       LOG(ERROR) << "SOCKS request failed because client's identd could "
                  << "not confirm the user ID string in the request";
-      return ERR_FAILED;
+      return ERR_SOCKS_CONNECTION_FAILED;
     default:
       LOG(ERROR) << "SOCKS server sent unknown response";
-      return ERR_INVALID_RESPONSE;
+      return ERR_SOCKS_CONNECTION_FAILED;
   }
 
   // Note: we ignore the last 6 bytes as specified by the SOCKS protocol
 }
 
-int SOCKSClientSocket::GetPeerName(struct sockaddr* name,
-                                   socklen_t* namelen) {
-  return transport_->GetPeerName(name, namelen);
+int SOCKSClientSocket::GetPeerAddress(AddressList* address) const {
+  return transport_->socket()->GetPeerAddress(address);
+}
+
+int SOCKSClientSocket::GetLocalAddress(IPEndPoint* address) const {
+  return transport_->socket()->GetLocalAddress(address);
 }
 
 }  // namespace net

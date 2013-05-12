@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 //
@@ -18,6 +18,7 @@
 
 #ifndef NET_URL_REQUEST_URL_REQUEST_FILTER_H_
 #define NET_URL_REQUEST_URL_REQUEST_FILTER_H_
+#pragma once
 
 #include <map>
 #include <string>
@@ -26,6 +27,8 @@
 #include "net/url_request/url_request.h"
 
 class GURL;
+
+namespace net {
 class URLRequestJob;
 
 class URLRequestFilter {
@@ -36,10 +39,12 @@ class URLRequestFilter {
   typedef base::hash_map<std::string, URLRequest::ProtocolFactory*>
       UrlHandlerMap;
 
-  // Singleton instance for use.
-  static URLRequestFilter* GetInstance();
+  ~URLRequestFilter();
 
   static URLRequest::ProtocolFactory Factory;
+
+  // Singleton instance for use.
+  static URLRequestFilter* GetInstance();
 
   void AddHostnameHandler(const std::string& scheme,
                           const std::string& hostname,
@@ -49,7 +54,8 @@ class URLRequestFilter {
 
   // Returns true if we successfully added the URL handler.  This will replace
   // old handlers for the URL if one existed.
-  bool AddUrlHandler(const GURL& url, URLRequest::ProtocolFactory* factory);
+  bool AddUrlHandler(const GURL& url,
+                     URLRequest::ProtocolFactory* factory);
 
   void RemoveUrlHandler(const GURL& url);
 
@@ -61,7 +67,7 @@ class URLRequestFilter {
   int hit_count() const { return hit_count_; }
 
  protected:
-  URLRequestFilter() : hit_count_(0) { }
+  URLRequestFilter();
 
   // Helper method that looks up the request in the url_handler_map_.
   URLRequestJob* FindRequestHandler(URLRequest* request,
@@ -79,7 +85,9 @@ class URLRequestFilter {
   // Singleton instance.
   static URLRequestFilter* shared_instance_;
 
-  DISALLOW_EVIL_CONSTRUCTORS(URLRequestFilter);
+  DISALLOW_COPY_AND_ASSIGN(URLRequestFilter);
 };
+
+}  // namespace net
 
 #endif  // NET_URL_REQUEST_URL_REQUEST_FILTER_H_

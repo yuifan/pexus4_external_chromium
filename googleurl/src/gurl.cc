@@ -34,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <iostream>
 
 #include "googleurl/src/gurl.h"
 
@@ -146,6 +147,13 @@ GURL::GURL(const char* canonical_spec, size_t canonical_spec_len,
     DCHECK(test_url.parsed_.ref == parsed_.ref);
   }
 #endif
+}
+
+GURL& GURL::operator=(const GURL& other) {
+  spec_ = other.spec_;
+  is_valid_ = other.is_valid_;
+  parsed_ = other.parsed_;
+  return *this;
 }
 
 const std::string& GURL::spec() const {
@@ -304,8 +312,7 @@ GURL GURL::GetWithEmptyPath() const {
 }
 
 bool GURL::IsStandard() const {
-  return url_util::IsStandard(spec_.data(), static_cast<int>(spec_.length()),
-                              parsed_.scheme);
+  return url_util::IsStandard(spec_.data(), parsed_.scheme);
 }
 
 bool GURL::SchemeIs(const char* lower_ascii_scheme) const {
@@ -448,3 +455,6 @@ void GURL::Swap(GURL* other) {
   std::swap(parsed_, other->parsed_);
 }
 
+std::ostream& operator<<(std::ostream& out, const GURL& url) {
+  return out << url.possibly_invalid_spec();
+}

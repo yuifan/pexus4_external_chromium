@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,6 +7,7 @@
 #include "base/format_macros.h"
 #include "base/logging.h"
 #include "base/string_util.h"
+#include "base/stringprintf.h"
 #include "net/disk_cache/backend_impl.h"
 
 namespace {
@@ -19,6 +20,7 @@ struct OnDiskStats {
   int data_sizes[disk_cache::Stats::kDataSizesLength];
   int64 counters[disk_cache::Stats::MAX_COUNTER];
 };
+COMPILE_ASSERT(sizeof(OnDiskStats) < 512, needs_more_than_2_blocks);
 
 // Returns the "floor" (as opposed to "ceiling") of log base 2 of number.
 int LogBase2(int32 number) {
@@ -36,6 +38,7 @@ int LogBase2(int32 number) {
   return static_cast<int>(result);
 }
 
+// WARNING: Add new stats only at the end, or change LoadStats().
 static const char* kCounterNames[] = {
   "Open miss",
   "Open hit",
@@ -56,7 +59,8 @@ static const char* kCounterNames[] = {
   "Get rankings",
   "Fatal error",
   "Last report",
-  "Last report timer"
+  "Last report timer",
+  "Doom recent entries"
 };
 COMPILE_ASSERT(arraysize(kCounterNames) == disk_cache::Stats::MAX_COUNTER,
                update_the_names);
@@ -72,6 +76,7 @@ bool LoadStats(BackendImpl* backend, Addr address, OnDiskStats* stats) {
 
   size_t offset = address.start_block() * address.BlockSize() +
                   kBlockHeaderSize;
+  memset(stats, 0, sizeof(*stats));
   if (!file->Read(stats, sizeof(*stats), offset))
     return false;
 
@@ -79,9 +84,10 @@ bool LoadStats(BackendImpl* backend, Addr address, OnDiskStats* stats) {
     return false;
 
   // We don't want to discard the whole cache every time we have one extra
-  // counter; just reset them to zero.
-  if (stats->size != sizeof(*stats))
+  // counter; we keep old data if we can.
+  if (static_cast<unsigned int>(stats->size) > sizeof(*stats)) {
     memset(stats, 0, sizeof(*stats));
+  }
 
   return true;
 }
@@ -110,6 +116,12 @@ bool CreateStats(BackendImpl* backend, Addr* address, OnDiskStats* stats) {
   return StoreStats(backend, *address, stats);
 }
 
+Stats::Stats() : backend_(NULL), size_histogram_(NULL) {
+}
+
+Stats::~Stats() {
+}
+
 bool Stats::Init(BackendImpl* backend, uint32* storage_addr) {
   OnDiskStats stats;
   Addr address(*storage_addr);
@@ -134,7 +146,7 @@ bool Stats::Init(BackendImpl* backend, uint32* storage_addr) {
   if (first_time) {
     first_time = false;
     // ShouldReportAgain() will re-enter this object.
-    if (!size_histogram_.get() && backend->cache_type() == net::DISK_CACHE &&
+    if (!size_histogram_ && backend->cache_type() == net::DISK_CACHE &&
         backend->ShouldReportAgain()) {
       // Stats may be reused when the cache is re-created, but we want only one
       // histogram at any given time.
@@ -147,8 +159,119 @@ bool Stats::Init(BackendImpl* backend, uint32* storage_addr) {
   return true;
 }
 
-Stats::~Stats() {
-  Store();
+void Stats::ModifyStorageStats(int32 old_size, int32 new_size) {
+  // We keep a counter of the data block size on an array where each entry is
+  // the adjusted log base 2 of the size. The first entry counts blocks of 256
+  // bytes, the second blocks up to 512 bytes, etc. With 20 entries, the last
+  // one stores entries of more than 64 MB
+  int new_index = GetStatsBucket(new_size);
+  int old_index = GetStatsBucket(old_size);
+
+  if (new_size)
+    data_sizes_[new_index]++;
+
+  if (old_size)
+    data_sizes_[old_index]--;
+}
+
+void Stats::OnEvent(Counters an_event) {
+  DCHECK(an_event > MIN_COUNTER || an_event < MAX_COUNTER);
+  counters_[an_event]++;
+}
+
+void Stats::SetCounter(Counters counter, int64 value) {
+  DCHECK(counter > MIN_COUNTER || counter < MAX_COUNTER);
+  counters_[counter] = value;
+}
+
+int64 Stats::GetCounter(Counters counter) const {
+  DCHECK(counter > MIN_COUNTER || counter < MAX_COUNTER);
+  return counters_[counter];
+}
+
+void Stats::GetItems(StatsItems* items) {
+  std::pair<std::string, std::string> item;
+  for (int i = 0; i < kDataSizesLength; i++) {
+    item.first = base::StringPrintf("Size%02d", i);
+    item.second = base::StringPrintf("0x%08x", data_sizes_[i]);
+    items->push_back(item);
+  }
+
+  for (int i = MIN_COUNTER + 1; i < MAX_COUNTER; i++) {
+    item.first = kCounterNames[i];
+    item.second = base::StringPrintf("0x%" PRIx64, counters_[i]);
+    items->push_back(item);
+  }
+}
+
+int Stats::GetHitRatio() const {
+  return GetRatio(OPEN_HIT, OPEN_MISS);
+}
+
+int Stats::GetResurrectRatio() const {
+  return GetRatio(RESURRECT_HIT, CREATE_HIT);
+}
+
+void Stats::ResetRatios() {
+  SetCounter(OPEN_HIT, 0);
+  SetCounter(OPEN_MISS, 0);
+  SetCounter(RESURRECT_HIT, 0);
+  SetCounter(CREATE_HIT, 0);
+}
+
+int Stats::GetLargeEntriesSize() {
+  int total = 0;
+  // data_sizes_[20] stores values between 512 KB and 1 MB (see comment before
+  // GetStatsBucket()).
+  for (int bucket = 20; bucket < kDataSizesLength; bucket++)
+    total += data_sizes_[bucket] * GetBucketRange(bucket);
+
+  return total;
+}
+
+void Stats::Store() {
+  if (!backend_)
+    return;
+
+  OnDiskStats stats;
+  stats.signature = kDiskSignature;
+  stats.size = sizeof(stats);
+  memcpy(stats.data_sizes, data_sizes_, sizeof(data_sizes_));
+  memcpy(stats.counters, counters_, sizeof(counters_));
+
+  Addr address(storage_addr_);
+  StoreStats(backend_, address, &stats);
+}
+
+int Stats::GetBucketRange(size_t i) const {
+  if (i < 2)
+    return static_cast<int>(1024 * i);
+
+  if (i < 12)
+    return static_cast<int>(2048 * (i - 1));
+
+  if (i < 17)
+    return static_cast<int>(4096 * (i - 11)) + 20 * 1024;
+
+  int n = 64 * 1024;
+  if (i > static_cast<size_t>(kDataSizesLength)) {
+    NOTREACHED();
+    i = kDataSizesLength;
+  }
+
+  i -= 17;
+  n <<= i;
+  return n;
+}
+
+void Stats::Snapshot(StatsHistogram::StatsSamples* samples) const {
+  samples->GetCounts()->resize(kDataSizesLength);
+  for (int i = 0; i < kDataSizesLength; i++) {
+    int count = data_sizes_[i];
+    if (count < 0)
+      count = 0;
+    samples->GetCounts()->at(i) = count;
+  }
 }
 
 // The array will be filled this way:
@@ -194,90 +317,6 @@ int Stats::GetStatsBucket(int32 size) {
   return result;
 }
 
-int Stats::GetBucketRange(size_t i) const {
-  if (i < 2)
-    return static_cast<int>(1024 * i);
-
-  if (i < 12)
-    return static_cast<int>(2048 * (i - 1));
-
-  if (i < 17)
-    return static_cast<int>(4096 * (i - 11)) + 20 * 1024;
-
-  int n = 64 * 1024;
-  if (i > static_cast<size_t>(kDataSizesLength)) {
-    NOTREACHED();
-    i = kDataSizesLength;
-  }
-
-  i -= 17;
-  n <<= i;
-  return n;
-}
-
-void Stats::Snapshot(StatsHistogram::StatsSamples* samples) const {
-  samples->GetCounts()->resize(kDataSizesLength);
-  for (int i = 0; i < kDataSizesLength; i++) {
-    int count = data_sizes_[i];
-    if (count < 0)
-      count = 0;
-    samples->GetCounts()->at(i) = count;
-  }
-}
-
-void Stats::ModifyStorageStats(int32 old_size, int32 new_size) {
-  // We keep a counter of the data block size on an array where each entry is
-  // the adjusted log base 2 of the size. The first entry counts blocks of 256
-  // bytes, the second blocks up to 512 bytes, etc. With 20 entries, the last
-  // one stores entries of more than 64 MB
-  int new_index = GetStatsBucket(new_size);
-  int old_index = GetStatsBucket(old_size);
-
-  if (new_size)
-    data_sizes_[new_index]++;
-
-  if (old_size)
-    data_sizes_[old_index]--;
-}
-
-void Stats::OnEvent(Counters an_event) {
-  DCHECK(an_event > MIN_COUNTER || an_event < MAX_COUNTER);
-  counters_[an_event]++;
-}
-
-void Stats::SetCounter(Counters counter, int64 value) {
-  DCHECK(counter > MIN_COUNTER || counter < MAX_COUNTER);
-  counters_[counter] = value;
-}
-
-int64 Stats::GetCounter(Counters counter) const {
-  DCHECK(counter > MIN_COUNTER || counter < MAX_COUNTER);
-  return counters_[counter];
-}
-
-void Stats::GetItems(StatsItems* items) {
-  std::pair<std::string, std::string> item;
-  for (int i = 0; i < kDataSizesLength; i++) {
-    item.first = StringPrintf("Size%02d", i);
-    item.second = StringPrintf("0x%08x", data_sizes_[i]);
-    items->push_back(item);
-  }
-
-  for (int i = MIN_COUNTER + 1; i < MAX_COUNTER; i++) {
-    item.first = kCounterNames[i];
-    item.second = StringPrintf("0x%" PRIx64, counters_[i]);
-    items->push_back(item);
-  }
-}
-
-int Stats::GetHitRatio() const {
-  return GetRatio(OPEN_HIT, OPEN_MISS);
-}
-
-int Stats::GetResurrectRatio() const {
-  return GetRatio(RESURRECT_HIT, CREATE_HIT);
-}
-
 int Stats::GetRatio(Counters hit, Counters miss) const {
   int64 ratio = GetCounter(hit) * 100;
   if (!ratio)
@@ -285,37 +324,6 @@ int Stats::GetRatio(Counters hit, Counters miss) const {
 
   ratio /= (GetCounter(hit) + GetCounter(miss));
   return static_cast<int>(ratio);
-}
-
-void Stats::ResetRatios() {
-  SetCounter(OPEN_HIT, 0);
-  SetCounter(OPEN_MISS, 0);
-  SetCounter(RESURRECT_HIT, 0);
-  SetCounter(CREATE_HIT, 0);
-}
-
-int Stats::GetLargeEntriesSize() {
-  int total = 0;
-  // data_sizes_[20] stores values between 512 KB and 1 MB (see comment before
-  // GetStatsBucket()).
-  for (int bucket = 20; bucket < kDataSizesLength; bucket++)
-    total += data_sizes_[bucket] * GetBucketRange(bucket);
-
-  return total;
-}
-
-void Stats::Store() {
-  if (!backend_)
-    return;
-
-  OnDiskStats stats;
-  stats.signature = kDiskSignature;
-  stats.size = sizeof(stats);
-  memcpy(stats.data_sizes, data_sizes_, sizeof(data_sizes_));
-  memcpy(stats.counters, counters_, sizeof(counters_));
-
-  Addr address(storage_addr_);
-  StoreStats(backend_, address, &stats);
 }
 
 }  // namespace disk_cache

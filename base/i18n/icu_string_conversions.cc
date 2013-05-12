@@ -9,23 +9,16 @@
 #include "base/basictypes.h"
 #include "base/logging.h"
 #include "base/string_util.h"
+#include "base/utf_string_conversions.h"
 #include "unicode/ucnv.h"
 #include "unicode/ucnv_cb.h"
 #include "unicode/ucnv_err.h"
+#include "unicode/unorm.h"
 #include "unicode/ustring.h"
 
 namespace base {
 
 namespace {
-
-inline bool IsValidCodepoint(uint32 code_point) {
-  // Excludes the surrogate code points ([0xD800, 0xDFFF]) and
-  // codepoints larger than 0x10FFFF (the highest codepoint allowed).
-  // Non-characters and unassigned codepoints are allowed.
-  return code_point < 0xD800u ||
-         (code_point >= 0xE000u && code_point <= 0x10FFFFu);
-}
-
 // ToUnicodeCallbackSubstitute() is based on UCNV_TO_U_CALLBACK_SUSBSTITUTE
 // in source/common/ucnv_err.c.
 
@@ -228,8 +221,9 @@ bool WideToCodepage(const std::wstring& wide,
   // in case each code points translates to a UTF-16 surrogate pair,
   // and leave room for a NUL terminator.
   std::vector<UChar> utf16(wide.length() * 2 + 1);
-  u_strFromWCS(&utf16[0], utf16.size(), &utf16_len,
-               wide.c_str(), wide.length(), &status);
+  u_strFromUTF32(&utf16[0], utf16.size(), &utf16_len,
+                 reinterpret_cast<const UChar32*>(wide.c_str()),
+                 wide.length(), &status);
   DCHECK(U_SUCCESS(status)) << "failed to convert wstring to UChar*";
 
   return ConvertFromUTF16(converter, &utf16[0], utf16_len, on_error, encoded);
@@ -271,6 +265,30 @@ bool CodepageToWide(const std::string& encoded,
   wide->resize(actual_size / sizeof(wchar_t));
   return true;
 #endif  // defined(WCHAR_T_IS_UTF32)
+}
+
+bool ConvertToUtf8AndNormalize(const std::string& text,
+                               const std::string& charset,
+                               std::string* result) {
+  result->clear();
+  string16 utf16;
+  if (!CodepageToUTF16(
+      text, charset.c_str(), OnStringConversionError::FAIL, &utf16))
+    return false;
+
+  UErrorCode status = U_ZERO_ERROR;
+  size_t max_length = utf16.length() + 1;
+  string16 normalized_utf16;
+  int actual_length = unorm_normalize(
+      utf16.c_str(), utf16.length(), UNORM_NFC, 0,
+      WriteInto(&normalized_utf16, max_length),
+      static_cast<int>(max_length), &status);
+  if (!U_SUCCESS(status))
+    return false;
+  normalized_utf16.resize(actual_length);
+
+  return UTF16ToUTF8(normalized_utf16.data(),
+                     normalized_utf16.length(), result);
 }
 
 }  // namespace base

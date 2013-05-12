@@ -6,7 +6,7 @@
 
 #include <string.h>
 
-#include "base/histogram.h"
+#include "base/metrics/histogram.h"
 #include "base/time.h"
 #include "googleurl/src/gurl.h"
 
@@ -70,16 +70,18 @@ void SocketStreamMetrics::OnWrite(int len) {
 
 void SocketStreamMetrics::OnClose() {
   base::TimeTicks closed_time = base::TimeTicks::Now();
-  UMA_HISTOGRAM_LONG_TIMES("Net.SocketStream.Duration",
-                           closed_time - connect_establish_time_);
-  UMA_HISTOGRAM_COUNTS("Net.SocketStream.ReceivedBytes",
-                       received_bytes_);
-  UMA_HISTOGRAM_COUNTS("Net.SocketStream.ReceivedCounts",
-                       received_counts_);
-  UMA_HISTOGRAM_COUNTS("Net.SocketStream.SentBytes",
-                       sent_bytes_);
-  UMA_HISTOGRAM_COUNTS("Net.SocketStream.SentCounts",
-                       sent_counts_);
+  if (!connect_establish_time_.is_null()) {
+    UMA_HISTOGRAM_LONG_TIMES("Net.SocketStream.Duration",
+                             closed_time - connect_establish_time_);
+    UMA_HISTOGRAM_COUNTS("Net.SocketStream.ReceivedBytes",
+                         received_bytes_);
+    UMA_HISTOGRAM_COUNTS("Net.SocketStream.ReceivedCounts",
+                         received_counts_);
+    UMA_HISTOGRAM_COUNTS("Net.SocketStream.SentBytes",
+                         sent_bytes_);
+    UMA_HISTOGRAM_COUNTS("Net.SocketStream.SentCounts",
+                         sent_counts_);
+  }
 }
 
 void SocketStreamMetrics::CountProtocolType(ProtocolType protocol_type) {

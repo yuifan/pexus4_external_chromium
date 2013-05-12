@@ -1,12 +1,15 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_HTTP_HTTP_UTIL_H_
 #define NET_HTTP_HTTP_UTIL_H_
+#pragma once
 
+#include <string>
 #include <vector>
 
+#include "base/memory/ref_counted.h"
 #include "base/string_tokenizer.h"
 #include "googleurl/src/gurl.h"
 #include "net/http/http_byte_range.h"
@@ -17,16 +20,18 @@
 
 namespace net {
 
+class UploadDataStream;
+
 class HttpUtil {
  public:
-   // Returns the absolute path of the URL, to be used for the http request.
-   // The absolute path starts with a '/' and may contain a query.
-   static std::string PathForRequest(const GURL& url);
+  // Returns the absolute path of the URL, to be used for the http request.
+  // The absolute path starts with a '/' and may contain a query.
+  static std::string PathForRequest(const GURL& url);
 
-   // Returns the absolute URL, to be used for the http request. This url is
-   // made up of the protocol, host, [port], path, [query]. Everything else
-   // is stripped (username, password, reference).
-   static std::string SpecForRequest(const GURL& url);
+  // Returns the absolute URL, to be used for the http request. This url is
+  // made up of the protocol, host, [port], path, [query]. Everything else
+  // is stripped (username, password, reference).
+  static std::string SpecForRequest(const GURL& url);
 
   // Locates the next occurance of delimiter in line, skipping over quoted
   // strings (e.g., commas will not be treated as delimiters if they appear
@@ -53,6 +58,11 @@ class HttpUtil {
   // http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.35.1
   static bool ParseRanges(const std::string& headers,
                           std::vector<HttpByteRange>* ranges);
+
+  // Same thing as ParseRanges except the Range header is known and its value
+  // is directly passed in, rather than requiring searching through a string.
+  static bool ParseRangeHeader(const std::string& range_specifier,
+                               std::vector<HttpByteRange>* ranges);
 
   // Scans the '\r\n'-delimited headers for the given header name.  Returns
   // true if a match is found.  Input is assumed to be well-formed.
@@ -159,6 +169,7 @@ class HttpUtil {
     HeadersIterator(std::string::const_iterator headers_begin,
                     std::string::const_iterator headers_end,
                     const std::string& line_delimiter);
+    ~HeadersIterator();
 
     // Advances the iterator to the next header, if any.  Returns true if there
     // is a next header.  Use name* and values* methods to access the resultant
@@ -205,10 +216,10 @@ class HttpUtil {
     std::string::const_iterator values_end_;
   };
 
-  // Used to iterate over deliminated values in a HTTP header.  HTTP LWS is
+  // Iterates over delimited values in an HTTP header.  HTTP LWS is
   // automatically trimmed from the resulting values.
   //
-  // When using this class to iterate over response header values, beware that
+  // When using this class to iterate over response header values, be aware that
   // for some headers (e.g., Last-Modified), commas are not used as delimiters.
   // This iterator should be avoided for headers like that which are considered
   // non-coalescing (see IsNonCoalescingHeader).
@@ -221,6 +232,7 @@ class HttpUtil {
     ValuesIterator(std::string::const_iterator values_begin,
                    std::string::const_iterator values_end,
                    char delimiter);
+    ~ValuesIterator();
 
     // Advances the iterator to the next value, if any.  Returns true if there
     // is a next value.  Use value* methods to access the resultant value.
@@ -240,6 +252,66 @@ class HttpUtil {
     StringTokenizer values_;
     std::string::const_iterator value_begin_;
     std::string::const_iterator value_end_;
+  };
+
+  // Iterates over a delimited sequence of name-value pairs in an HTTP header.
+  // Each pair consists of a token (the name), an equals sign, and either a
+  // token or quoted-string (the value). Arbitrary HTTP LWS is permitted outside
+  // of and between names, values, and delimiters.
+  //
+  // String iterators returned from this class' methods may be invalidated upon
+  // calls to GetNext() or after the NameValuePairsIterator is destroyed.
+  class NameValuePairsIterator {
+   public:
+    NameValuePairsIterator(std::string::const_iterator begin,
+                           std::string::const_iterator end,
+                           char delimiter);
+    ~NameValuePairsIterator();
+
+    // Advances the iterator to the next pair, if any.  Returns true if there
+    // is a next pair.  Use name* and value* methods to access the resultant
+    // value.
+    bool GetNext();
+
+    // Returns false if there was a parse error.
+    bool valid() const { return valid_; }
+
+    // The name of the current name-value pair.
+    std::string::const_iterator name_begin() const { return name_begin_; }
+    std::string::const_iterator name_end() const { return name_end_; }
+    std::string name() const { return std::string(name_begin_, name_end_); }
+
+    // The value of the current name-value pair.
+    std::string::const_iterator value_begin() const {
+      return value_is_quoted_ ? unquoted_value_.begin() : value_begin_;
+    }
+    std::string::const_iterator value_end() const {
+      return value_is_quoted_ ? unquoted_value_.end() : value_end_;
+    }
+    std::string value() const {
+      return value_is_quoted_ ? unquoted_value_ : std::string(value_begin_,
+                                                               value_end_);
+    }
+
+   private:
+    HttpUtil::ValuesIterator props_;
+    bool valid_;
+
+    std::string::const_iterator begin_;
+    std::string::const_iterator end_;
+
+    std::string::const_iterator name_begin_;
+    std::string::const_iterator name_end_;
+
+    std::string::const_iterator value_begin_;
+    std::string::const_iterator value_end_;
+
+    // Do not store iterators into this string. The NameValuePairsIterator
+    // is copyable/assignable, and if copied the copy's iterators would point
+    // into the original's unquoted_value_ member.
+    std::string unquoted_value_;
+
+    bool value_is_quoted_;
   };
 };
 

@@ -1,22 +1,27 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <vector>
+
+#include "base/eintr_wrapper.h"
 #include "base/logging.h"
+#include "base/memory/ref_counted.h"
 #include "base/message_loop.h"
-#include "base/platform_thread.h"
-#include "base/ref_counted.h"
-#include "base/thread.h"
+#include "base/task.h"
+#include "base/threading/platform_thread.h"
+#include "base/threading/thread.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
 #if defined(OS_WIN)
 #include "base/message_pump_win.h"
-#include "base/scoped_handle.h"
+#include "base/win/scoped_handle.h"
 #endif
 #if defined(OS_POSIX)
 #include "base/message_pump_libevent.h"
 #endif
 
+using base::PlatformThread;
 using base::Thread;
 using base::Time;
 using base::TimeDelta;
@@ -91,7 +96,7 @@ void RunTest_PostTask(MessageLoop::Type message_loop_type) {
   MessageLoop loop(message_loop_type);
 
   // Add tests to message loop
-  scoped_refptr<Foo> foo = new Foo();
+  scoped_refptr<Foo> foo(new Foo());
   std::string a("a"), b("b"), c("c"), d("d");
   MessageLoop::current()->PostTask(FROM_HERE, NewRunnableMethod(
       foo.get(), &Foo::Test0));
@@ -107,7 +112,7 @@ void RunTest_PostTask(MessageLoop::Type message_loop_type) {
     foo.get(), &Foo::Test2Mixed, a, &d));
 
   // After all tests, post a message that will shut down the message loop
-  scoped_refptr<QuitMsgLoop> quit = new QuitMsgLoop();
+  scoped_refptr<QuitMsgLoop> quit(new QuitMsgLoop());
   MessageLoop::current()->PostTask(FROM_HERE, NewRunnableMethod(
       quit.get(), &QuitMsgLoop::QuitNow));
 
@@ -122,7 +127,7 @@ void RunTest_PostTask_SEH(MessageLoop::Type message_loop_type) {
   MessageLoop loop(message_loop_type);
 
   // Add tests to message loop
-  scoped_refptr<Foo> foo = new Foo();
+  scoped_refptr<Foo> foo(new Foo());
   std::string a("a"), b("b"), c("c"), d("d");
   MessageLoop::current()->PostTask(FROM_HERE, NewRunnableMethod(
       foo.get(), &Foo::Test0));
@@ -138,7 +143,7 @@ void RunTest_PostTask_SEH(MessageLoop::Type message_loop_type) {
       foo.get(), &Foo::Test2Mixed, a, &d));
 
   // After all tests, post a message that will shut down the message loop
-  scoped_refptr<QuitMsgLoop> quit = new QuitMsgLoop();
+  scoped_refptr<QuitMsgLoop> quit(new QuitMsgLoop());
   MessageLoop::current()->PostTask(FROM_HERE, NewRunnableMethod(
       quit.get(), &QuitMsgLoop::QuitNow));
 
@@ -665,12 +670,12 @@ class OrderedTasks : public Task {
 
   void RunStart() {
     TaskItem item(type_, cookie_, true);
-    DLOG(INFO) << item;
+    DVLOG(1) << item;
     order_->push_back(item);
   }
   void RunEnd() {
     TaskItem item(type_, cookie_, false);
-    DLOG(INFO) << item;
+    DVLOG(1) << item;
     order_->push_back(item);
   }
 
@@ -763,6 +768,18 @@ class RecursiveTask : public OrderedTasks {
   bool is_reentrant_;
 };
 
+class RecursiveSlowTask : public RecursiveTask {
+ public:
+  RecursiveSlowTask(int depth, TaskList* order, int cookie, bool is_reentrant)
+      : RecursiveTask(depth, order, cookie, is_reentrant) {
+  }
+
+  virtual void Run() {
+    RecursiveTask::Run();
+    PlatformThread::Sleep(10);  // milliseconds
+  }
+};
+
 class QuitTask : public OrderedTasks {
  public:
   QuitTask(TaskList* order, int cookie)
@@ -837,8 +854,8 @@ class Recursive2Tasks : public Task {
         for (;;) {
           HWND button = FindWindowEx(window, NULL, L"Button", NULL);
           if (button != NULL) {
-            EXPECT_TRUE(0 == SendMessage(button, WM_LBUTTONDOWN, 0, 0));
-            EXPECT_TRUE(0 == SendMessage(button, WM_LBUTTONUP, 0, 0));
+            EXPECT_EQ(0, SendMessage(button, WM_LBUTTONDOWN, 0, 0));
+            EXPECT_EQ(0, SendMessage(button, WM_LBUTTONUP, 0, 0));
             break;
           }
         }
@@ -888,6 +905,42 @@ void RunTest_RecursiveDenial1(MessageLoop::Type message_loop_type) {
   EXPECT_EQ(order[13], TaskItem(RECURSIVE, 2, false));
 }
 
+void RunTest_RecursiveDenial3(MessageLoop::Type message_loop_type) {
+  MessageLoop loop(message_loop_type);
+
+  EXPECT_TRUE(MessageLoop::current()->NestableTasksAllowed());
+  TaskList order;
+  MessageLoop::current()->PostTask(FROM_HERE,
+                                   new RecursiveSlowTask(2, &order, 1, false));
+  MessageLoop::current()->PostTask(FROM_HERE,
+                                   new RecursiveSlowTask(2, &order, 2, false));
+  MessageLoop::current()->PostDelayedTask(FROM_HERE,
+                                          new OrderedTasks(&order, 3), 5);
+  MessageLoop::current()->PostDelayedTask(FROM_HERE,
+                                          new QuitTask(&order, 4), 5);
+
+  MessageLoop::current()->Run();
+
+  // FIFO order.
+  ASSERT_EQ(16U, order.size());
+  EXPECT_EQ(order[ 0], TaskItem(RECURSIVE, 1, true));
+  EXPECT_EQ(order[ 1], TaskItem(RECURSIVE, 1, false));
+  EXPECT_EQ(order[ 2], TaskItem(RECURSIVE, 2, true));
+  EXPECT_EQ(order[ 3], TaskItem(RECURSIVE, 2, false));
+  EXPECT_EQ(order[ 4], TaskItem(RECURSIVE, 1, true));
+  EXPECT_EQ(order[ 5], TaskItem(RECURSIVE, 1, false));
+  EXPECT_EQ(order[ 6], TaskItem(ORDERERD, 3, true));
+  EXPECT_EQ(order[ 7], TaskItem(ORDERERD, 3, false));
+  EXPECT_EQ(order[ 8], TaskItem(RECURSIVE, 2, true));
+  EXPECT_EQ(order[ 9], TaskItem(RECURSIVE, 2, false));
+  EXPECT_EQ(order[10], TaskItem(QUITMESSAGELOOP, 4, true));
+  EXPECT_EQ(order[11], TaskItem(QUITMESSAGELOOP, 4, false));
+  EXPECT_EQ(order[12], TaskItem(RECURSIVE, 1, true));
+  EXPECT_EQ(order[13], TaskItem(RECURSIVE, 1, false));
+  EXPECT_EQ(order[14], TaskItem(RECURSIVE, 2, true));
+  EXPECT_EQ(order[15], TaskItem(RECURSIVE, 2, false));
+}
+
 void RunTest_RecursiveSupport1(MessageLoop::Type message_loop_type) {
   MessageLoop loop(message_loop_type);
 
@@ -932,7 +985,7 @@ void RunTest_RecursiveDenial2(MessageLoop::Type message_loop_type) {
   options.message_loop_type = message_loop_type;
   ASSERT_EQ(true, worker.StartWithOptions(options));
   TaskList order;
-  ScopedHandle event(CreateEvent(NULL, FALSE, FALSE, NULL));
+  base::win::ScopedHandle event(CreateEvent(NULL, FALSE, FALSE, NULL));
   worker.message_loop()->PostTask(FROM_HERE,
                                   new Recursive2Tasks(MessageLoop::current(),
                                                       event,
@@ -975,7 +1028,7 @@ void RunTest_RecursiveSupport2(MessageLoop::Type message_loop_type) {
   options.message_loop_type = message_loop_type;
   ASSERT_EQ(true, worker.StartWithOptions(options));
   TaskList order;
-  ScopedHandle event(CreateEvent(NULL, FALSE, FALSE, NULL));
+  base::win::ScopedHandle event(CreateEvent(NULL, FALSE, FALSE, NULL));
   worker.message_loop()->PostTask(FROM_HERE,
                                   new Recursive2Tasks(MessageLoop::current(),
                                                       event,
@@ -1182,7 +1235,7 @@ class TestIOHandler : public MessageLoopForIO::IOHandler {
   char buffer_[48];
   MessageLoopForIO::IOContext context_;
   HANDLE signal_;
-  ScopedHandle file_;
+  base::win::ScopedHandle file_;
   bool wait_;
 };
 
@@ -1230,12 +1283,12 @@ class IOHandlerTask : public Task {
 };
 
 void RunTest_IOHandler() {
-  ScopedHandle callback_called(CreateEvent(NULL, TRUE, FALSE, NULL));
+  base::win::ScopedHandle callback_called(CreateEvent(NULL, TRUE, FALSE, NULL));
   ASSERT_TRUE(callback_called.IsValid());
 
   const wchar_t* kPipeName = L"\\\\.\\pipe\\iohandler_pipe";
-  ScopedHandle server(CreateNamedPipe(kPipeName, PIPE_ACCESS_OUTBOUND, 0, 1,
-                                      0, 0, 0, NULL));
+  base::win::ScopedHandle server(
+      CreateNamedPipe(kPipeName, PIPE_ACCESS_OUTBOUND, 0, 1, 0, 0, 0, NULL));
   ASSERT_TRUE(server.IsValid());
 
   Thread thread("IOHandler test");
@@ -1262,17 +1315,19 @@ void RunTest_IOHandler() {
 }
 
 void RunTest_WaitForIO() {
-  ScopedHandle callback1_called(CreateEvent(NULL, TRUE, FALSE, NULL));
-  ScopedHandle callback2_called(CreateEvent(NULL, TRUE, FALSE, NULL));
+  base::win::ScopedHandle callback1_called(
+      CreateEvent(NULL, TRUE, FALSE, NULL));
+  base::win::ScopedHandle callback2_called(
+      CreateEvent(NULL, TRUE, FALSE, NULL));
   ASSERT_TRUE(callback1_called.IsValid());
   ASSERT_TRUE(callback2_called.IsValid());
 
   const wchar_t* kPipeName1 = L"\\\\.\\pipe\\iohandler_pipe1";
   const wchar_t* kPipeName2 = L"\\\\.\\pipe\\iohandler_pipe2";
-  ScopedHandle server1(CreateNamedPipe(kPipeName1, PIPE_ACCESS_OUTBOUND, 0, 1,
-                                       0, 0, 0, NULL));
-  ScopedHandle server2(CreateNamedPipe(kPipeName2, PIPE_ACCESS_OUTBOUND, 0, 1,
-                                       0, 0, 0, NULL));
+  base::win::ScopedHandle server1(
+      CreateNamedPipe(kPipeName1, PIPE_ACCESS_OUTBOUND, 0, 1, 0, 0, 0, NULL));
+  base::win::ScopedHandle server2(
+      CreateNamedPipe(kPipeName2, PIPE_ACCESS_OUTBOUND, 0, 1, 0, 0, 0, NULL));
   ASSERT_TRUE(server1.IsValid());
   ASSERT_TRUE(server2.IsValid());
 
@@ -1375,20 +1430,23 @@ TEST(MessageLoopTest, PostDelayedTask_SharedTimer_SubPump) {
 }
 #endif
 
-// TODO(darin): re-enable these tests once MessageLoop supports them again.
-#if 0
-TEST(MessageLoopTest, EnsureTaskDeletion) {
+// TODO(darin): MessageLoop does not support deleting all tasks in the
+// destructor.
+// Fails, http://crbug.com/50272.
+TEST(MessageLoopTest, FAILS_EnsureTaskDeletion) {
   RunTest_EnsureTaskDeletion(MessageLoop::TYPE_DEFAULT);
   RunTest_EnsureTaskDeletion(MessageLoop::TYPE_UI);
   RunTest_EnsureTaskDeletion(MessageLoop::TYPE_IO);
 }
 
-TEST(MessageLoopTest, EnsureTaskDeletion_Chain) {
+// TODO(darin): MessageLoop does not support deleting all tasks in the
+// destructor.
+// Fails, http://crbug.com/50272.
+TEST(MessageLoopTest, FAILS_EnsureTaskDeletion_Chain) {
   RunTest_EnsureTaskDeletion_Chain(MessageLoop::TYPE_DEFAULT);
   RunTest_EnsureTaskDeletion_Chain(MessageLoop::TYPE_UI);
   RunTest_EnsureTaskDeletion_Chain(MessageLoop::TYPE_IO);
 }
-#endif
 
 #if defined(OS_WIN)
 TEST(MessageLoopTest, Crasher) {
@@ -1416,6 +1474,12 @@ TEST(MessageLoopTest, RecursiveDenial1) {
   RunTest_RecursiveDenial1(MessageLoop::TYPE_IO);
 }
 
+TEST(MessageLoopTest, RecursiveDenial3) {
+  RunTest_RecursiveDenial3(MessageLoop::TYPE_DEFAULT);
+  RunTest_RecursiveDenial3(MessageLoop::TYPE_UI);
+  RunTest_RecursiveDenial3(MessageLoop::TYPE_IO);
+}
+
 TEST(MessageLoopTest, RecursiveSupport1) {
   RunTest_RecursiveSupport1(MessageLoop::TYPE_DEFAULT);
   RunTest_RecursiveSupport1(MessageLoop::TYPE_UI);
@@ -1423,7 +1487,8 @@ TEST(MessageLoopTest, RecursiveSupport1) {
 }
 
 #if defined(OS_WIN)
-TEST(MessageLoopTest, RecursiveDenial2) {
+// This test occasionally hangs http://crbug.com/44567
+TEST(MessageLoopTest, DISABLED_RecursiveDenial2) {
   RunTest_RecursiveDenial2(MessageLoop::TYPE_DEFAULT);
   RunTest_RecursiveDenial2(MessageLoop::TYPE_UI);
   RunTest_RecursiveDenial2(MessageLoop::TYPE_IO);
@@ -1453,6 +1518,72 @@ TEST(MessageLoopTest, NonNestableDelayedInNestedLoop) {
   RunTest_NonNestableInNestedLoop(MessageLoop::TYPE_IO, true);
 }
 
+class DummyTask : public Task {
+ public:
+  explicit DummyTask(int num_tasks) : num_tasks_(num_tasks) {}
+
+  virtual void Run() {
+    if (num_tasks_ > 1) {
+      MessageLoop::current()->PostTask(
+          FROM_HERE,
+          new DummyTask(num_tasks_ - 1));
+    } else {
+      MessageLoop::current()->Quit();
+    }
+  }
+
+ private:
+  const int num_tasks_;
+};
+
+class DummyTaskObserver : public MessageLoop::TaskObserver {
+ public:
+  explicit DummyTaskObserver(int num_tasks)
+      : num_tasks_started_(0),
+        num_tasks_processed_(0),
+        num_tasks_(num_tasks) {}
+
+  virtual ~DummyTaskObserver() {}
+
+  virtual void WillProcessTask(const Task* task) {
+    num_tasks_started_++;
+    EXPECT_TRUE(task != NULL);
+    EXPECT_LE(num_tasks_started_, num_tasks_);
+    EXPECT_EQ(num_tasks_started_, num_tasks_processed_ + 1);
+  }
+
+  virtual void DidProcessTask(const Task* task) {
+    num_tasks_processed_++;
+    EXPECT_TRUE(task != NULL);
+    EXPECT_LE(num_tasks_started_, num_tasks_);
+    EXPECT_EQ(num_tasks_started_, num_tasks_processed_);
+  }
+
+  int num_tasks_started() const { return num_tasks_started_; }
+  int num_tasks_processed() const { return num_tasks_processed_; }
+
+ private:
+  int num_tasks_started_;
+  int num_tasks_processed_;
+  const int num_tasks_;
+
+  DISALLOW_COPY_AND_ASSIGN(DummyTaskObserver);
+};
+
+TEST(MessageLoopTest, TaskObserver) {
+  const int kNumTasks = 6;
+  DummyTaskObserver observer(kNumTasks);
+
+  MessageLoop loop;
+  loop.AddTaskObserver(&observer);
+  loop.PostTask(FROM_HERE, new DummyTask(kNumTasks));
+  loop.Run();
+  loop.RemoveTaskObserver(&observer);
+
+  EXPECT_EQ(kNumTasks, observer.num_tasks_started());
+  EXPECT_EQ(kNumTasks, observer.num_tasks_processed());
+}
+
 #if defined(OS_WIN)
 TEST(MessageLoopTest, Dispatcher) {
   // This test requires a UI loop
@@ -1471,14 +1602,42 @@ TEST(MessageLoopTest, IOHandler) {
 TEST(MessageLoopTest, WaitForIO) {
   RunTest_WaitForIO();
 }
+
+TEST(MessageLoopTest, HighResolutionTimer) {
+  MessageLoop loop;
+
+  const int kFastTimerMs = 5;
+  const int kSlowTimerMs = 100;
+
+  EXPECT_FALSE(loop.high_resolution_timers_enabled());
+
+  // Post a fast task to enable the high resolution timers.
+  loop.PostDelayedTask(FROM_HERE, new DummyTask(1), kFastTimerMs);
+  loop.Run();
+  EXPECT_TRUE(loop.high_resolution_timers_enabled());
+
+  // Post a slow task and verify high resolution timers
+  // are still enabled.
+  loop.PostDelayedTask(FROM_HERE, new DummyTask(1), kSlowTimerMs);
+  loop.Run();
+  EXPECT_TRUE(loop.high_resolution_timers_enabled());
+
+  // Wait for a while so that high-resolution mode elapses.
+  Sleep(MessageLoop::kHighResolutionTimerModeLeaseTimeMs);
+
+  // Post a slow task to disable the high resolution timers.
+  loop.PostDelayedTask(FROM_HERE, new DummyTask(1), kSlowTimerMs);
+  loop.Run();
+  EXPECT_FALSE(loop.high_resolution_timers_enabled());
+}
+
 #endif  // defined(OS_WIN)
 
-#if defined(OS_POSIX)
+#if defined(OS_POSIX) && !defined(OS_NACL)
 
 namespace {
 
-class QuitDelegate : public
-    base::MessagePumpLibevent::Watcher {
+class QuitDelegate : public base::MessagePumpLibevent::Watcher {
  public:
   virtual void OnFileCanWriteWithoutBlocking(int fd) {
     MessageLoop::current()->Quit();
@@ -1488,21 +1647,16 @@ class QuitDelegate : public
   }
 };
 
-}  // namespace
-
-TEST(MessageLoopTest, DISABLED_FileDescriptorWatcherOutlivesMessageLoop) {
+TEST(MessageLoopTest, FileDescriptorWatcherOutlivesMessageLoop) {
   // Simulate a MessageLoop that dies before an FileDescriptorWatcher.
   // This could happen when people use the Singleton pattern or atexit.
-  // This is disabled for now because it fails (valgrind shows
-  // invalid reads), and it's not clear any code relies on this...
-  // TODO(dkegel): enable if it turns out we rely on this
 
   // Create a file descriptor.  Doesn't need to be readable or writable,
   // as we don't need to actually get any notifications.
   // pipe() is just the easiest way to do it.
   int pipefds[2];
   int err = pipe(pipefds);
-  ASSERT_TRUE(err == 0);
+  ASSERT_EQ(0, err);
   int fd = pipefds[1];
   {
     // Arrange for controller to live longer than message loop.
@@ -1516,8 +1670,10 @@ TEST(MessageLoopTest, DISABLED_FileDescriptorWatcherOutlivesMessageLoop) {
       // and don't run the message loop, just destroy it.
     }
   }
-  close(pipefds[0]);
-  close(pipefds[1]);
+  if (HANDLE_EINTR(close(pipefds[0])) < 0)
+    PLOG(ERROR) << "close";
+  if (HANDLE_EINTR(close(pipefds[1])) < 0)
+    PLOG(ERROR) << "close";
 }
 
 TEST(MessageLoopTest, FileDescriptorWatcherDoubleStop) {
@@ -1525,7 +1681,7 @@ TEST(MessageLoopTest, FileDescriptorWatcherDoubleStop) {
   // (Errors only showed up in valgrind.)
   int pipefds[2];
   int err = pipe(pipefds);
-  ASSERT_TRUE(err == 0);
+  ASSERT_EQ(0, err);
   int fd = pipefds[1];
   {
     // Arrange for message loop to live longer than controller.
@@ -1539,8 +1695,76 @@ TEST(MessageLoopTest, FileDescriptorWatcherDoubleStop) {
       controller.StopWatchingFileDescriptor();
     }
   }
-  close(pipefds[0]);
-  close(pipefds[1]);
+  if (HANDLE_EINTR(close(pipefds[0])) < 0)
+    PLOG(ERROR) << "close";
+  if (HANDLE_EINTR(close(pipefds[1])) < 0)
+    PLOG(ERROR) << "close";
 }
 
-#endif  // defined(OS_POSIX)
+}  // namespace
+
+#endif  // defined(OS_POSIX) && !defined(OS_NACL)
+
+namespace {
+class RunAtDestructionTask : public Task {
+ public:
+  RunAtDestructionTask(bool* task_destroyed, bool* destruction_observer_called)
+      : task_destroyed_(task_destroyed),
+        destruction_observer_called_(destruction_observer_called) {
+  }
+  ~RunAtDestructionTask() {
+    EXPECT_FALSE(*destruction_observer_called_);
+    *task_destroyed_ = true;
+  }
+  virtual void Run() {
+    // This task should never run.
+    ADD_FAILURE();
+  }
+ private:
+  bool* task_destroyed_;
+  bool* destruction_observer_called_;
+};
+
+class MLDestructionObserver : public MessageLoop::DestructionObserver {
+ public:
+  MLDestructionObserver(bool* task_destroyed, bool* destruction_observer_called)
+      : task_destroyed_(task_destroyed),
+        destruction_observer_called_(destruction_observer_called),
+        task_destroyed_before_message_loop_(false) {
+  }
+  virtual void WillDestroyCurrentMessageLoop() {
+    task_destroyed_before_message_loop_ = *task_destroyed_;
+    *destruction_observer_called_ = true;
+  }
+  bool task_destroyed_before_message_loop() const {
+    return task_destroyed_before_message_loop_;
+  }
+ private:
+  bool* task_destroyed_;
+  bool* destruction_observer_called_;
+  bool task_destroyed_before_message_loop_;
+};
+
+}  // namespace
+
+TEST(MessageLoopTest, DestructionObserverTest) {
+  // Verify that the destruction observer gets called at the very end (after
+  // all the pending tasks have been destroyed).
+  MessageLoop* loop = new MessageLoop;
+  const int kDelayMS = 100;
+
+  bool task_destroyed = false;
+  bool destruction_observer_called = false;
+
+  MLDestructionObserver observer(&task_destroyed, &destruction_observer_called);
+  loop->AddDestructionObserver(&observer);
+  loop->PostDelayedTask(
+      FROM_HERE,
+      new RunAtDestructionTask(&task_destroyed, &destruction_observer_called),
+      kDelayMS);
+  delete loop;
+  EXPECT_TRUE(observer.task_destroyed_before_message_loop());
+  // The task should have been destroyed when we deleted the loop.
+  EXPECT_TRUE(task_destroyed);
+  EXPECT_TRUE(destruction_observer_called);
+}

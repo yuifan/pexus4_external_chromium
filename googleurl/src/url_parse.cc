@@ -64,54 +64,6 @@ int FindNextAuthorityTerminator(const CHAR* spec,
   return spec_len;  // Not found.
 }
 
-// Fills in all members of the Parsed structure except for the scheme.
-//
-// |spec| is the full spec being parsed, of length |spec_len|.
-// |after_scheme| is the character immediately following the scheme (after the
-//   colon) where we'll begin parsing.
-//
-// Compatability data points. I list "host", "path" extracted:
-// Input                IE6             Firefox                Us
-// -----                --------------  --------------         --------------
-// http://foo.com/      "foo.com", "/"  "foo.com", "/"         "foo.com", "/"
-// http:foo.com/        "foo.com", "/"  "foo.com", "/"         "foo.com", "/"
-// http:/foo.com/       fail(*)         "foo.com", "/"         "foo.com", "/"
-// http:\foo.com/       fail(*)         "\foo.com", "/"(fail)  "foo.com", "/"
-// http:////foo.com/    "foo.com", "/"  "foo.com", "/"         "foo.com", "/"
-//
-// (*) Interestingly, although IE fails to load these URLs, its history
-// canonicalizer handles them, meaning if you've been to the corresponding
-// "http://foo.com/" link, it will be colored.
-template <typename CHAR>
-void DoParseAfterScheme(const CHAR* spec,
-                        int spec_len,
-                        int after_scheme,
-                        Parsed* parsed) {
-  int num_slashes = CountConsecutiveSlashes(spec, after_scheme, spec_len);
-  int after_slashes = after_scheme + num_slashes;
-
-  // First split into two main parts, the authority (username, password, host,
-  // and port) and the full path (path, query, and reference).
-  Component authority;
-  Component full_path;
-
-  // Found "//<some data>", looks like an authority section. Treat everything
-  // from there to the next slash (or end of spec) to be the authority. Note
-  // that we ignore the number of slashes and treat it as the authority.
-  int end_auth = FindNextAuthorityTerminator(spec, after_slashes, spec_len);
-  authority = Component(after_slashes, end_auth - after_slashes);
-
-  if (end_auth == spec_len)  // No beginning of path found.
-    full_path = Component();
-  else  // Everything starting from the slash to the end is the path.
-    full_path = Component(end_auth, spec_len - end_auth);
-
-  // Now parse those two sub-parts.
-  DoParseAuthority(spec, authority, &parsed->username, &parsed->password,
-                   &parsed->host, &parsed->port);
-  ParsePath(spec, full_path, &parsed->path, &parsed->query, &parsed->ref);
-}
-
 template<typename CHAR>
 void ParseUserInfo(const CHAR* spec,
                    const Component& user,
@@ -310,6 +262,54 @@ bool DoExtractScheme(const CHAR* url,
   return false;  // No colon found: no scheme
 }
 
+// Fills in all members of the Parsed structure except for the scheme.
+//
+// |spec| is the full spec being parsed, of length |spec_len|.
+// |after_scheme| is the character immediately following the scheme (after the
+//   colon) where we'll begin parsing.
+//
+// Compatability data points. I list "host", "path" extracted:
+// Input                IE6             Firefox                Us
+// -----                --------------  --------------         --------------
+// http://foo.com/      "foo.com", "/"  "foo.com", "/"         "foo.com", "/"
+// http:foo.com/        "foo.com", "/"  "foo.com", "/"         "foo.com", "/"
+// http:/foo.com/       fail(*)         "foo.com", "/"         "foo.com", "/"
+// http:\foo.com/       fail(*)         "\foo.com", "/"(fail)  "foo.com", "/"
+// http:////foo.com/    "foo.com", "/"  "foo.com", "/"         "foo.com", "/"
+//
+// (*) Interestingly, although IE fails to load these URLs, its history
+// canonicalizer handles them, meaning if you've been to the corresponding
+// "http://foo.com/" link, it will be colored.
+template <typename CHAR>
+void DoParseAfterScheme(const CHAR* spec,
+                        int spec_len,
+                        int after_scheme,
+                        Parsed* parsed) {
+  int num_slashes = CountConsecutiveSlashes(spec, after_scheme, spec_len);
+  int after_slashes = after_scheme + num_slashes;
+
+  // First split into two main parts, the authority (username, password, host,
+  // and port) and the full path (path, query, and reference).
+  Component authority;
+  Component full_path;
+
+  // Found "//<some data>", looks like an authority section. Treat everything
+  // from there to the next slash (or end of spec) to be the authority. Note
+  // that we ignore the number of slashes and treat it as the authority.
+  int end_auth = FindNextAuthorityTerminator(spec, after_slashes, spec_len);
+  authority = Component(after_slashes, end_auth - after_slashes);
+
+  if (end_auth == spec_len)  // No beginning of path found.
+    full_path = Component();
+  else  // Everything starting from the slash to the end is the path.
+    full_path = Component(end_auth, spec_len - end_auth);
+
+  // Now parse those two sub-parts.
+  DoParseAuthority(spec, authority, &parsed->username, &parsed->password,
+                   &parsed->host, &parsed->port);
+  ParsePath(spec, full_path, &parsed->path, &parsed->query, &parsed->ref);
+}
+
 // The main parsing function for standard URLs. Standard URLs have a scheme,
 // host, path, etc.
 template<typename CHAR>
@@ -324,7 +324,7 @@ void DoParseStandardURL(const CHAR* spec, int spec_len, Parsed* parsed) {
   if (DoExtractScheme(spec, spec_len, &parsed->scheme)) {
     after_scheme = parsed->scheme.end() + 1;  // Skip past the colon.
   } else {
-    // Say there's no scheme when there is a colon. We could also say that
+    // Say there's no scheme when there is no colon. We could also say that
     // everything is the scheme. Both would produce an invalid URL, but this way
     // seems less wrong in more cases.
     parsed->scheme.reset();
@@ -565,6 +565,9 @@ bool DoExtractQueryKeyValue(const CHAR* spec,
 
 }  // namespace
 
+Parsed::Parsed() {
+}
+
 int Parsed::Length() const {
   if (ref.is_valid())
     return ref.end();
@@ -645,7 +648,7 @@ bool ExtractScheme(const char16* url, int url_len, Component* scheme) {
 // This handles everything that may be an authority terminator, including
 // backslash. For special backslash handling see DoParseAfterScheme.
 bool IsAuthorityTerminator(char16 ch) {
-  return IsURLSlash(ch) || ch == '?' || ch == '#' || ch == ';';
+  return IsURLSlash(ch) || ch == '?' || ch == '#';
 }
 
 void ExtractFileName(const char* url,
@@ -683,7 +686,7 @@ void ParseAuthority(const char* spec,
   DoParseAuthority(spec, auth, username, password, hostname, port_num);
 }
 
-void ParseAuthority(char16* spec,
+void ParseAuthority(const char16* spec,
                     const Component& auth,
                     Component* username,
                     Component* password,

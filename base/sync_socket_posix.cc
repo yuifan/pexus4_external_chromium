@@ -11,7 +11,6 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 
-#include "base/atomicops.h"
 #include "base/file_util.h"
 #include "base/logging.h"
 
@@ -64,10 +63,14 @@ bool SyncSocket::CreatePair(SyncSocket* pair[2]) {
   return true;
 
  cleanup:
-  if (handles[0] != kInvalidHandle)
-    (void) close(handles[0]);
-  if (handles[1] != kInvalidHandle)
-    (void) close(handles[1]);
+  if (handles[0] != kInvalidHandle) {
+    if (HANDLE_EINTR(close(handles[0])) < 0)
+      PLOG(ERROR) << "close";
+  }
+  if (handles[1] != kInvalidHandle) {
+    if (HANDLE_EINTR(close(handles[1])) < 0)
+      PLOG(ERROR) << "close";
+  }
   delete tmp_sockets[0];
   delete tmp_sockets[1];
   return false;
@@ -77,7 +80,9 @@ bool SyncSocket::Close() {
   if (handle_ == kInvalidHandle) {
     return false;
   }
-  int retval = close(handle_);
+  int retval = HANDLE_EINTR(close(handle_));
+  if (retval < 0)
+    PLOG(ERROR) << "close";
   handle_ = kInvalidHandle;
   return (retval == 0);
 }

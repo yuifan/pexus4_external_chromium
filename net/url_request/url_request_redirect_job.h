@@ -1,13 +1,17 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_URL_REQUEST_URL_REQUEST_REDIRECT_JOB_H_
 #define NET_URL_REQUEST_URL_REQUEST_REDIRECT_JOB_H_
+#pragma once
 
+#include "base/task.h"
 #include "net/url_request/url_request_job.h"
 
 class GURL;
+
+namespace net {
 
 // A URLRequestJob that will redirect the request to the specified
 // URL.  This is useful to restart a request at a different URL based
@@ -15,18 +19,21 @@ class GURL;
 class URLRequestRedirectJob : public URLRequestJob {
  public:
   // Constructs a job that redirects to the specified URL.
-  URLRequestRedirectJob(URLRequest* request, GURL redirect_destination);
+  URLRequestRedirectJob(URLRequest* request, const GURL& redirect_destination);
 
   virtual void Start();
-  bool IsRedirectResponse(GURL* location, int* http_status_code);
+  virtual bool IsRedirectResponse(GURL* location, int* http_status_code);
 
  private:
-  ~URLRequestRedirectJob() {}
+  virtual ~URLRequestRedirectJob();
 
   void StartAsync();
 
   GURL redirect_destination_;
+
+  ScopedRunnableMethodFactory<URLRequestRedirectJob> method_factory_;
 };
 
-#endif  // NET_URL_REQUEST_URL_REQUEST_REDIRECT_JOB_H_
+}  // namespace net
 
+#endif  // NET_URL_REQUEST_URL_REQUEST_REDIRECT_JOB_H_

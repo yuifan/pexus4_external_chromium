@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -9,6 +9,30 @@
 #include "net/base/net_errors.h"
 
 namespace net {
+
+HostResolver::RequestInfo::RequestInfo(const HostPortPair& host_port_pair)
+    : host_port_pair_(host_port_pair),
+      address_family_(ADDRESS_FAMILY_UNSPECIFIED),
+      host_resolver_flags_(0),
+      allow_cached_response_(true),
+      only_use_cached_response_(false),
+      is_speculative_(false),
+      priority_(MEDIUM) {
+}
+
+HostResolver::~HostResolver() {
+}
+
+AddressFamily HostResolver::GetDefaultAddressFamily() const {
+  return ADDRESS_FAMILY_UNSPECIFIED;
+}
+
+HostResolverImpl* HostResolver::GetAsHostResolverImpl() {
+  return NULL;
+}
+
+HostResolver::HostResolver() {
+}
 
 SingleRequestHostResolver::SingleRequestHostResolver(HostResolver* resolver)
     : resolver_(resolver),
@@ -26,7 +50,7 @@ SingleRequestHostResolver::~SingleRequestHostResolver() {
 int SingleRequestHostResolver::Resolve(const HostResolver::RequestInfo& info,
                                        AddressList* addresses,
                                        CompletionCallback* callback,
-                                       LoadLog* load_log) {
+                                       const BoundNetLog& net_log) {
   DCHECK(!cur_request_ && !cur_request_callback_) << "resolver already in use";
 
   HostResolver::RequestHandle request = NULL;
@@ -36,7 +60,7 @@ int SingleRequestHostResolver::Resolve(const HostResolver::RequestInfo& info,
   CompletionCallback* transient_callback = callback ? &callback_ : NULL;
 
   int rv = resolver_->Resolve(
-      info, addresses, transient_callback, &request, load_log);
+      info, addresses, transient_callback, &request, net_log);
 
   if (rv == ERR_IO_PENDING) {
     // Cleared in OnResolveCompletion().

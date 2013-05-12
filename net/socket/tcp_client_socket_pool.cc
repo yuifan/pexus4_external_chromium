@@ -1,4 +1,4 @@
-// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,9 +7,10 @@
 #include "base/compiler_specific.h"
 #include "base/logging.h"
 #include "base/message_loop.h"
+#include "base/metrics/histogram.h"
 #include "base/string_util.h"
 #include "base/time.h"
-#include "net/base/load_log.h"
+#include "net/base/net_log.h"
 #include "net/base/net_errors.h"
 #include "net/socket/client_socket_factory.h"
 #include "net/socket/client_socket_handle.h"
@@ -20,6 +21,62 @@ using base::TimeDelta;
 
 namespace net {
 
+TCPSocketParams::TCPSocketParams(const HostPortPair& host_port_pair,
+                                 RequestPriority priority, const GURL& referrer,
+                                 bool disable_resolver_cache, bool ignore_limits)
+    : destination_(host_port_pair)
+#ifdef ANDROID
+      , ignore_limits_(ignore_limits),
+      valid_uid_(false),
+      calling_uid_(0)
+#endif
+    {
+  Initialize(priority, referrer, disable_resolver_cache);
+}
+
+// TODO(willchan): Update all unittests so we don't need this.
+TCPSocketParams::TCPSocketParams(const std::string& host, int port,
+                                 RequestPriority priority, const GURL& referrer,
+                                 bool disable_resolver_cache)
+    : destination_(HostPortPair(host, port))
+#ifdef ANDROID
+      , ignore_limits_(false),
+      valid_uid_(false),
+      calling_uid_(0)
+#endif
+    {
+  Initialize(priority, referrer, disable_resolver_cache);
+}
+
+TCPSocketParams::~TCPSocketParams() {}
+
+void TCPSocketParams::Initialize(RequestPriority priority,
+                                 const GURL& referrer,
+                                 bool disable_resolver_cache) {
+  // The referrer is used by the DNS prefetch system to correlate resolutions
+  // with the page that triggered them. It doesn't impact the actual addresses
+  // that we resolve to.
+  destination_.set_referrer(referrer);
+  destination_.set_priority(priority);
+  if (disable_resolver_cache)
+    destination_.set_allow_cached_response(false);
+}
+
+#ifdef ANDROID
+bool TCPSocketParams::getUID(uid_t *uid) const {
+  if (!valid_uid_) {
+    return false;
+  }
+  *uid = calling_uid_;
+  return true;
+}
+
+void TCPSocketParams::setUID(uid_t uid) {
+  valid_uid_ = true;
+  calling_uid_ = uid;
+}
+#endif
+
 // TCPConnectJobs will time out after this many seconds.  Note this is the total
 // time, including both host resolution and TCP connect() times.
 //
@@ -29,18 +86,19 @@ namespace net {
 // timeout. Even worse, the per-connect timeout threshold varies greatly
 // between systems (anywhere from 20 seconds to 190 seconds).
 // See comment #12 at http://crbug.com/23364 for specifics.
-static const int kTCPConnectJobTimeoutInSeconds = 240; // 4 minutes.
+static const int kTCPConnectJobTimeoutInSeconds = 240;  // 4 minutes.
 
 TCPConnectJob::TCPConnectJob(
     const std::string& group_name,
-    const HostResolver::RequestInfo& resolve_info,
+    const scoped_refptr<TCPSocketParams>& params,
     base::TimeDelta timeout_duration,
     ClientSocketFactory* client_socket_factory,
     HostResolver* host_resolver,
     Delegate* delegate,
-    LoadLog* load_log)
-    : ConnectJob(group_name, timeout_duration, delegate, load_log),
-      resolve_info_(resolve_info),
+    NetLog* net_log)
+    : ConnectJob(group_name, timeout_duration, delegate,
+                 BoundNetLog::Make(net_log, NetLog::SOURCE_CONNECT_JOB)),
+      params_(params),
       client_socket_factory_(client_socket_factory),
       ALLOW_THIS_IN_INITIALIZER_LIST(
           callback_(this,
@@ -54,22 +112,16 @@ TCPConnectJob::~TCPConnectJob() {
 
 LoadState TCPConnectJob::GetLoadState() const {
   switch (next_state_) {
-    case kStateResolveHost:
-    case kStateResolveHostComplete:
+    case STATE_RESOLVE_HOST:
+    case STATE_RESOLVE_HOST_COMPLETE:
       return LOAD_STATE_RESOLVING_HOST;
-    case kStateTCPConnect:
-    case kStateTCPConnectComplete:
+    case STATE_TCP_CONNECT:
+    case STATE_TCP_CONNECT_COMPLETE:
       return LOAD_STATE_CONNECTING;
     default:
       NOTREACHED();
       return LOAD_STATE_IDLE;
   }
-}
-
-int TCPConnectJob::ConnectInternal() {
-  next_state_ = kStateResolveHost;
-  start_time_ = base::TimeTicks::Now();
-  return DoLoop(OK);
 }
 
 void TCPConnectJob::OnIOComplete(int result) {
@@ -79,25 +131,25 @@ void TCPConnectJob::OnIOComplete(int result) {
 }
 
 int TCPConnectJob::DoLoop(int result) {
-  DCHECK_NE(next_state_, kStateNone);
+  DCHECK_NE(next_state_, STATE_NONE);
 
   int rv = result;
   do {
     State state = next_state_;
-    next_state_ = kStateNone;
+    next_state_ = STATE_NONE;
     switch (state) {
-      case kStateResolveHost:
+      case STATE_RESOLVE_HOST:
         DCHECK_EQ(OK, rv);
         rv = DoResolveHost();
         break;
-      case kStateResolveHostComplete:
+      case STATE_RESOLVE_HOST_COMPLETE:
         rv = DoResolveHostComplete(rv);
         break;
-      case kStateTCPConnect:
+      case STATE_TCP_CONNECT:
         DCHECK_EQ(OK, rv);
         rv = DoTCPConnect();
         break;
-      case kStateTCPConnectComplete:
+      case STATE_TCP_CONNECT_COMPLETE:
         rv = DoTCPConnectComplete(rv);
         break;
       default:
@@ -105,27 +157,41 @@ int TCPConnectJob::DoLoop(int result) {
         rv = ERR_FAILED;
         break;
     }
-  } while (rv != ERR_IO_PENDING && next_state_ != kStateNone);
+  } while (rv != ERR_IO_PENDING && next_state_ != STATE_NONE);
 
   return rv;
 }
 
 int TCPConnectJob::DoResolveHost() {
-  next_state_ = kStateResolveHostComplete;
-  return resolver_.Resolve(resolve_info_, &addresses_, &callback_, load_log());
+  next_state_ = STATE_RESOLVE_HOST_COMPLETE;
+  return resolver_.Resolve(params_->destination(), &addresses_, &callback_,
+                           net_log());
 }
 
 int TCPConnectJob::DoResolveHostComplete(int result) {
   if (result == OK)
-    next_state_ = kStateTCPConnect;
+    next_state_ = STATE_TCP_CONNECT;
   return result;
 }
 
 int TCPConnectJob::DoTCPConnect() {
-  next_state_ = kStateTCPConnectComplete;
-  set_socket(client_socket_factory_->CreateTCPClientSocket(addresses_));
+  next_state_ = STATE_TCP_CONNECT_COMPLETE;
+  set_socket(client_socket_factory_->CreateTCPClientSocket(
+        addresses_, net_log().net_log(), net_log().source()));
   connect_start_time_ = base::TimeTicks::Now();
-  return socket()->Connect(&callback_, load_log());
+
+#ifdef ANDROID
+  uid_t calling_uid = 0;
+  bool valid_uid = params_->getUID(&calling_uid);
+#endif
+
+  return socket()->Connect(&callback_,
+#ifdef ANDROID
+                           params_->ignore_limits(),
+                           valid_uid,
+                           calling_uid
+#endif
+                          );
 }
 
 int TCPConnectJob::DoTCPConnectComplete(int result) {
@@ -155,67 +221,110 @@ int TCPConnectJob::DoTCPConnectComplete(int result) {
   return result;
 }
 
+int TCPConnectJob::ConnectInternal() {
+  next_state_ = STATE_RESOLVE_HOST;
+  start_time_ = base::TimeTicks::Now();
+  return DoLoop(OK);
+}
+
 ConnectJob* TCPClientSocketPool::TCPConnectJobFactory::NewConnectJob(
     const std::string& group_name,
     const PoolBase::Request& request,
-    ConnectJob::Delegate* delegate,
-    LoadLog* load_log) const {
-  return new TCPConnectJob(
-      group_name, request.params(),
-      base::TimeDelta::FromSeconds(kTCPConnectJobTimeoutInSeconds),
-      client_socket_factory_, host_resolver_, delegate, load_log);
+    ConnectJob::Delegate* delegate) const {
+  return new TCPConnectJob(group_name, request.params(), ConnectionTimeout(),
+                           client_socket_factory_, host_resolver_, delegate,
+                           net_log_);
+}
+
+base::TimeDelta
+    TCPClientSocketPool::TCPConnectJobFactory::ConnectionTimeout() const {
+  return base::TimeDelta::FromSeconds(kTCPConnectJobTimeoutInSeconds);
 }
 
 TCPClientSocketPool::TCPClientSocketPool(
     int max_sockets,
     int max_sockets_per_group,
+    ClientSocketPoolHistograms* histograms,
     HostResolver* host_resolver,
     ClientSocketFactory* client_socket_factory,
-    NetworkChangeNotifier* network_change_notifier)
-    : base_(max_sockets, max_sockets_per_group,
-            base::TimeDelta::FromSeconds(kUnusedIdleSocketTimeout),
+    NetLog* net_log)
+    : base_(max_sockets, max_sockets_per_group, histograms,
+            base::TimeDelta::FromSeconds(
+                ClientSocketPool::unused_idle_socket_timeout()),
             base::TimeDelta::FromSeconds(kUsedIdleSocketTimeout),
-            new TCPConnectJobFactory(client_socket_factory, host_resolver),
-            network_change_notifier) {}
+            new TCPConnectJobFactory(client_socket_factory,
+                                     host_resolver, net_log)) {
+  base_.EnableConnectBackupJobs();
+}
 
 TCPClientSocketPool::~TCPClientSocketPool() {}
 
 int TCPClientSocketPool::RequestSocket(
     const std::string& group_name,
-    const void* resolve_info,
+    const void* params,
     RequestPriority priority,
     ClientSocketHandle* handle,
     CompletionCallback* callback,
-    LoadLog* load_log) {
-  const HostResolver::RequestInfo* casted_resolve_info =
-      static_cast<const HostResolver::RequestInfo*>(resolve_info);
+    const BoundNetLog& net_log) {
+  const scoped_refptr<TCPSocketParams>* casted_params =
+      static_cast<const scoped_refptr<TCPSocketParams>*>(params);
 
-  if (LoadLog::IsUnbounded(load_log)) {
-    LoadLog::AddString(
-        load_log,
-        StringPrintf("Requested TCP socket to: %s [port %d]",
-                     casted_resolve_info->hostname().c_str(),
-                     casted_resolve_info->port()));
+  if (net_log.IsLoggingAllEvents()) {
+    // TODO(eroman): Split out the host and port parameters.
+    net_log.AddEvent(
+        NetLog::TYPE_TCP_CLIENT_SOCKET_POOL_REQUESTED_SOCKET,
+        make_scoped_refptr(new NetLogStringParameter(
+            "host_and_port",
+            casted_params->get()->destination().host_port_pair().ToString())));
   }
 
-  return base_.RequestSocket(
-      group_name, *casted_resolve_info, priority, handle, callback, load_log);
+  return base_.RequestSocket(group_name, *casted_params, priority, handle,
+                             callback, net_log);
+}
+
+void TCPClientSocketPool::RequestSockets(
+    const std::string& group_name,
+    const void* params,
+    int num_sockets,
+    const BoundNetLog& net_log) {
+  const scoped_refptr<TCPSocketParams>* casted_params =
+      static_cast<const scoped_refptr<TCPSocketParams>*>(params);
+
+  if (net_log.IsLoggingAllEvents()) {
+    // TODO(eroman): Split out the host and port parameters.
+    net_log.AddEvent(
+        NetLog::TYPE_TCP_CLIENT_SOCKET_POOL_REQUESTED_SOCKETS,
+        make_scoped_refptr(new NetLogStringParameter(
+            "host_and_port",
+            casted_params->get()->destination().host_port_pair().ToString())));
+  }
+
+  base_.RequestSockets(group_name, *casted_params, num_sockets, net_log);
 }
 
 void TCPClientSocketPool::CancelRequest(
     const std::string& group_name,
-    const ClientSocketHandle* handle) {
+    ClientSocketHandle* handle) {
   base_.CancelRequest(group_name, handle);
 }
 
 void TCPClientSocketPool::ReleaseSocket(
     const std::string& group_name,
-    ClientSocket* socket) {
-  base_.ReleaseSocket(group_name, socket);
+    ClientSocket* socket,
+    int id) {
+  base_.ReleaseSocket(group_name, socket, id);
+}
+
+void TCPClientSocketPool::Flush() {
+  base_.Flush();
 }
 
 void TCPClientSocketPool::CloseIdleSockets() {
   base_.CloseIdleSockets();
+}
+
+int TCPClientSocketPool::IdleSocketCount() const {
+  return base_.idle_socket_count();
 }
 
 int TCPClientSocketPool::IdleSocketCountInGroup(
@@ -226,6 +335,21 @@ int TCPClientSocketPool::IdleSocketCountInGroup(
 LoadState TCPClientSocketPool::GetLoadState(
     const std::string& group_name, const ClientSocketHandle* handle) const {
   return base_.GetLoadState(group_name, handle);
+}
+
+DictionaryValue* TCPClientSocketPool::GetInfoAsValue(
+    const std::string& name,
+    const std::string& type,
+    bool include_nested_pools) const {
+  return base_.GetInfoAsValue(name, type);
+}
+
+base::TimeDelta TCPClientSocketPool::ConnectionTimeout() const {
+  return base_.ConnectionTimeout();
+}
+
+ClientSocketPoolHistograms* TCPClientSocketPool::histograms() const {
+  return base_.histograms();
 }
 
 }  // namespace net

@@ -1,89 +1,177 @@
-// Copyright (c) 2006-2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #ifndef NET_HTTP_HTTP_NETWORK_SESSION_H_
 #define NET_HTTP_HTTP_NETWORK_SESSION_H_
+#pragma once
 
-#include "base/ref_counted.h"
+#include <set>
+#include "base/memory/ref_counted.h"
+#include "base/threading/non_thread_safe.h"
+#include "net/base/host_port_pair.h"
 #include "net/base/host_resolver.h"
 #include "net/base/ssl_client_auth_cache.h"
-#include "net/base/ssl_config_service.h"
+#include "net/http/http_alternate_protocols.h"
 #include "net/http/http_auth_cache.h"
-#include "net/proxy/proxy_service.h"
-#include "net/socket/tcp_client_socket_pool.h"
+#include "net/http/http_stream_factory.h"
+#include "net/socket/client_socket_pool_manager.h"
+#include "net/spdy/spdy_session_pool.h"
+#include "net/spdy/spdy_settings_storage.h"
+
+class Value;
 
 namespace net {
 
+class CertVerifier;
 class ClientSocketFactory;
-class FlipSessionPool;
-class NetworkChangeNotifier;
+class DnsCertProvenanceChecker;
+class DnsRRResolver;
+class HostResolver;
+class HttpAuthHandlerFactory;
+class HttpNetworkSessionPeer;
+class HttpProxyClientSocketPool;
+class HttpResponseBodyDrainer;
+class NetLog;
+class NetworkDelegate;
+class ProxyService;
+class SSLConfigService;
+class SSLHostInfoFactory;
 
 // This class holds session objects used by HttpNetworkTransaction objects.
-class HttpNetworkSession : public base::RefCounted<HttpNetworkSession> {
+class HttpNetworkSession : public base::RefCounted<HttpNetworkSession>,
+                           public base::NonThreadSafe {
  public:
-  HttpNetworkSession(
-      NetworkChangeNotifier* network_change_notifier,
-      HostResolver* host_resolver,
-      ProxyService* proxy_service,
-      ClientSocketFactory* client_socket_factory,
-      SSLConfigService* ssl_config_service,
-      FlipSessionPool* flip_session_pool);
+  struct Params {
+    Params()
+        : client_socket_factory(NULL),
+          host_resolver(NULL),
+          cert_verifier(NULL),
+          dnsrr_resolver(NULL),
+          dns_cert_checker(NULL),
+          proxy_service(NULL),
+          ssl_host_info_factory(NULL),
+          ssl_config_service(NULL),
+          http_auth_handler_factory(NULL),
+          network_delegate(NULL),
+          net_log(NULL) {}
 
-  HttpAuthCache* auth_cache() { return &auth_cache_; }
+    ClientSocketFactory* client_socket_factory;
+    HostResolver* host_resolver;
+    CertVerifier* cert_verifier;
+    DnsRRResolver* dnsrr_resolver;
+    DnsCertProvenanceChecker* dns_cert_checker;
+    ProxyService* proxy_service;
+    SSLHostInfoFactory* ssl_host_info_factory;
+    SSLConfigService* ssl_config_service;
+    HttpAuthHandlerFactory* http_auth_handler_factory;
+    NetworkDelegate* network_delegate;
+    NetLog* net_log;
+  };
+
+  explicit HttpNetworkSession(const Params& params);
+
+  HttpAuthCache* http_auth_cache() { return &http_auth_cache_; }
   SSLClientAuthCache* ssl_client_auth_cache() {
     return &ssl_client_auth_cache_;
   }
 
-  // TCP sockets come from the tcp_socket_pool().
-  TCPClientSocketPool* tcp_socket_pool() { return tcp_socket_pool_; }
-  // SSL sockets come frmo the socket_factory().
-  ClientSocketFactory* socket_factory() { return socket_factory_; }
-  HostResolver* host_resolver() { return host_resolver_; }
-  ProxyService* proxy_service() { return proxy_service_; }
-  SSLConfigService* ssl_config_service() { return ssl_config_service_; }
-  const scoped_refptr<FlipSessionPool>& flip_session_pool() {
-    return flip_session_pool_;
+  void AddResponseDrainer(HttpResponseBodyDrainer* drainer);
+
+  void RemoveResponseDrainer(HttpResponseBodyDrainer* drainer);
+
+  const HttpAlternateProtocols& alternate_protocols() const {
+    return alternate_protocols_;
+  }
+  HttpAlternateProtocols* mutable_alternate_protocols() {
+    return &alternate_protocols_;
   }
 
-  // Replace the current socket pool with a new one.  This effectively
-  // abandons the current pool.  This is only used for debugging.
-  void ReplaceTCPSocketPool();
+  TransportClientSocketPool* transport_socket_pool() {
+    return socket_pool_manager_.transport_socket_pool();
+  }
 
-  static void set_max_sockets_per_group(int socket_count);
+  SSLClientSocketPool* ssl_socket_pool() {
+    return socket_pool_manager_.ssl_socket_pool();
+  }
 
-  static uint16 fixed_http_port() { return g_fixed_http_port; }
-  static void set_fixed_http_port(uint16 port) { g_fixed_http_port = port; }
+  SOCKSClientSocketPool* GetSocketPoolForSOCKSProxy(
+      const HostPortPair& socks_proxy) {
+    return socket_pool_manager_.GetSocketPoolForSOCKSProxy(socks_proxy);
+  }
 
-  static uint16 fixed_https_port() { return g_fixed_https_port; }
-  static void set_fixed_https_port(uint16 port) { g_fixed_https_port = port; }
+  HttpProxyClientSocketPool* GetSocketPoolForHTTPProxy(
+      const HostPortPair& http_proxy) {
+    return socket_pool_manager_.GetSocketPoolForHTTPProxy(http_proxy);
+  }
+
+  SSLClientSocketPool* GetSocketPoolForSSLWithProxy(
+      const HostPortPair& proxy_server) {
+    return socket_pool_manager_.GetSocketPoolForSSLWithProxy(proxy_server);
+  }
+
+  CertVerifier* cert_verifier() { return cert_verifier_; }
+  ProxyService* proxy_service() { return proxy_service_; }
+  SSLConfigService* ssl_config_service() { return ssl_config_service_; }
+  SpdySessionPool* spdy_session_pool() { return &spdy_session_pool_; }
+  HttpAuthHandlerFactory* http_auth_handler_factory() {
+    return http_auth_handler_factory_;
+  }
+  NetworkDelegate* network_delegate() {
+    return network_delegate_;
+  }
+
+  HttpStreamFactory* http_stream_factory() {
+    return http_stream_factory_.get();
+  }
+
+  NetLog* net_log() {
+    return net_log_;
+  }
+
+  // Creates a Value summary of the state of the socket pools. The caller is
+  // responsible for deleting the returned value.
+  Value* SocketPoolInfoToValue() const {
+    return socket_pool_manager_.SocketPoolInfoToValue();
+  }
+
+  // Creates a Value summary of the state of the SPDY sessions. The caller is
+  // responsible for deleting the returned value.
+  Value* SpdySessionPoolInfoToValue() const;
+
+  void CloseAllConnections() {
+    socket_pool_manager_.FlushSocketPools();
+    spdy_session_pool_.CloseCurrentSessions();
+  }
+
+  void CloseIdleConnections() {
+    socket_pool_manager_.CloseIdleSockets();
+    spdy_session_pool_.CloseIdleSessions();
+  }
+
 
  private:
   friend class base::RefCounted<HttpNetworkSession>;
-  FRIEND_TEST(HttpNetworkTransactionTest, GroupNameForProxyConnections);
+  friend class HttpNetworkSessionPeer;
 
   ~HttpNetworkSession();
 
-  // Total limit of sockets. Not a constant to allow experiments.
-  static int max_sockets_;
+  NetLog* const net_log_;
+  NetworkDelegate* const network_delegate_;
+  CertVerifier* const cert_verifier_;
+  HttpAuthHandlerFactory* const http_auth_handler_factory_;
 
-  // Default to allow up to 6 connections per host. Experiment and tuning may
-  // try other values (greater than 0).  Too large may cause many problems, such
-  // as home routers blocking the connections!?!?
-  static int max_sockets_per_group_;
-
-  static uint16 g_fixed_http_port;
-  static uint16 g_fixed_https_port;
-
-  HttpAuthCache auth_cache_;
-  SSLClientAuthCache ssl_client_auth_cache_;
-  NetworkChangeNotifier* const network_change_notifier_;
-  scoped_refptr<TCPClientSocketPool> tcp_socket_pool_;
-  ClientSocketFactory* socket_factory_;
-  scoped_refptr<HostResolver> host_resolver_;
+  // Not const since it's modified by HttpNetworkSessionPeer for testing.
   scoped_refptr<ProxyService> proxy_service_;
-  scoped_refptr<SSLConfigService> ssl_config_service_;
-  scoped_refptr<FlipSessionPool> flip_session_pool_;
+  const scoped_refptr<SSLConfigService> ssl_config_service_;
+
+  HttpAuthCache http_auth_cache_;
+  SSLClientAuthCache ssl_client_auth_cache_;
+  HttpAlternateProtocols alternate_protocols_;
+  ClientSocketPoolManager socket_pool_manager_;
+  SpdySessionPool spdy_session_pool_;
+  scoped_ptr<HttpStreamFactory> http_stream_factory_;
+  std::set<HttpResponseBodyDrainer*> response_drainers_;
 };
 
 }  // namespace net

@@ -1,4 +1,4 @@
-// Copyright (c) 2009 The Chromium Authors. All rights reserved.
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -16,6 +16,7 @@
 #include "base/rand_util.h"
 #include "base/string_util.h"
 #include "base/sys_string_conversions.h"
+#include "base/utf_string_conversions.h"
 #include "net/base/net_errors.h"
 #include "net/base/net_util.h"
 #include "net/http/des.h"
@@ -69,9 +70,13 @@ namespace net {
  * ***** END LICENSE BLOCK ***** */
 
 // Discover the endianness by testing processor architecture.
-#if defined(ARCH_CPU_X86) || defined(ARCH_CPU_X86_64) || defined(ARCH_CPU_ARMEL)
+#if defined(ARCH_CPU_X86) || defined(ARCH_CPU_X86_64)\
+ || defined(ARCH_CPU_ARMEL) || defined(ARCH_CPU_MIPSEL)
 #define IS_LITTLE_ENDIAN 1
 #undef  IS_BIG_ENDIAN
+#elif defined(ARCH_CPU_MIPSEB)
+#undef IS_LITTLE_ENDIAN
+#define  IS_BIG_ENDIAN 1
 #else
 #error "Unknown endianness"
 #endif
@@ -120,13 +125,12 @@ enum {
 
 // We send these flags with our type 1 message.
 enum {
-  NTLM_TYPE1_FLAGS =
-      NTLM_NegotiateUnicode |
-      NTLM_NegotiateOEM |
-      NTLM_RequestTarget |
-      NTLM_NegotiateNTLMKey |
-      NTLM_NegotiateAlwaysSign |
-      NTLM_NegotiateNTLM2Key
+  NTLM_TYPE1_FLAGS = (NTLM_NegotiateUnicode |
+                      NTLM_NegotiateOEM |
+                      NTLM_RequestTarget |
+                      NTLM_NegotiateNTLMKey |
+                      NTLM_NegotiateAlwaysSign |
+                      NTLM_NegotiateNTLM2Key)
 };
 
 static const char NTLM_SIGNATURE[] = "NTLMSSP";
@@ -643,18 +647,27 @@ HttpAuthHandlerNTLM::get_host_name_proc_ = GetHostName;
 HttpAuthHandlerNTLM::HttpAuthHandlerNTLM() {
 }
 
+bool HttpAuthHandlerNTLM::NeedsIdentity() {
+  // This gets called for each round-trip.  Only require identity on
+  // the first call (when auth_data_ is empty).  On subsequent calls,
+  // we use the initially established identity.
+  return auth_data_.empty();
+}
+
+bool HttpAuthHandlerNTLM::AllowsDefaultCredentials() {
+  // Default credentials are not supported in the portable implementation of
+  // NTLM, but are supported in the SSPI implementation.
+  return false;
+}
+
+int HttpAuthHandlerNTLM::InitializeBeforeFirstChallenge() {
+  return OK;
+}
+
 HttpAuthHandlerNTLM::~HttpAuthHandlerNTLM() {
   // Wipe our copy of the password from memory, to reduce the chance of being
   // written to the paging file on disk.
   ZapString(&password_);
-}
-
-bool HttpAuthHandlerNTLM::NeedsIdentity() {
-  return !auth_data_.empty();
-}
-
-bool HttpAuthHandlerNTLM::IsFinalRound() {
-  return !auth_data_.empty();
 }
 
 // static
@@ -672,6 +685,12 @@ HttpAuthHandlerNTLM::HostNameProc HttpAuthHandlerNTLM::SetHostNameProc(
   HostNameProc old_proc = get_host_name_proc_;
   get_host_name_proc_ = proc;
   return old_proc;
+}
+
+HttpAuthHandlerNTLM::Factory::Factory() {
+}
+
+HttpAuthHandlerNTLM::Factory::~Factory() {
 }
 
 int HttpAuthHandlerNTLM::GetNextToken(const void* in_token,
@@ -700,7 +719,24 @@ int HttpAuthHandlerNTLM::GetNextToken(const void* in_token,
   return rv;
 }
 
-int HttpAuthHandlerNTLM::InitializeBeforeFirstChallenge() {
+int HttpAuthHandlerNTLM::Factory::CreateAuthHandler(
+    HttpAuth::ChallengeTokenizer* challenge,
+    HttpAuth::Target target,
+    const GURL& origin,
+    CreateReason reason,
+    int digest_nonce_count,
+    const BoundNetLog& net_log,
+    scoped_ptr<HttpAuthHandler>* handler) {
+  if (reason == CREATE_PREEMPTIVE)
+    return ERR_UNSUPPORTED_AUTH_SCHEME;
+  // TODO(cbentzel): Move towards model of parsing in the factory
+  //                 method and only constructing when valid.
+  // NOTE: Default credentials are not supported for the portable implementation
+  // of NTLM.
+  scoped_ptr<HttpAuthHandler> tmp_handler(new HttpAuthHandlerNTLM);
+  if (!tmp_handler->InitFromChallenge(challenge, target, origin, net_log))
+    return ERR_INVALID_RESPONSE;
+  handler->swap(tmp_handler);
   return OK;
 }
 

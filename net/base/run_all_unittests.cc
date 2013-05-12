@@ -1,39 +1,28 @@
-// Copyright 2008, Google Inc.
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//    * Redistributions of source code must retain the above copyright
-// notice, this list of conditions and the following disclaimer.
-//    * Redistributions in binary form must reproduce the above
-// copyright notice, this list of conditions and the following disclaimer
-// in the documentation and/or other materials provided with the
-// distribution.
-//    * Neither the name of Google Inc. nor the names of its
-// contributors may be used to endorse or promote products derived from
-// this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// Copyright (c) 2011 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
-#include "base/histogram.h"
+#include "build/build_config.h"
+#include "base/metrics/histogram.h"
+#include "crypto/nss_util.h"
 #include "net/base/net_test_suite.h"
+#include "net/socket/client_socket_pool_base.h"
+#include "net/spdy/spdy_session.h"
+
+using net::internal::ClientSocketPoolBaseHelper;
+using net::SpdySession;
 
 int main(int argc, char** argv) {
   // Record histograms, so we can get histograms data in tests.
-  StatisticsRecorder recorder;
+  base::StatisticsRecorder recorder;
   NetTestSuite test_suite(argc, argv);
-  // TODO(phajdan.jr): Enforce test isolation, http://crbug.com/12710.
+  ClientSocketPoolBaseHelper::set_connect_backup_jobs_enabled(false);
+  SpdySession::set_enable_ping_based_connection_checking(false);
+
+#if defined(OS_WIN)
+  // We want to be sure to init NSPR on the main thread.
+  crypto::EnsureNSPRInit();
+#endif
+
   return test_suite.Run();
 }
